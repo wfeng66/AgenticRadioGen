@@ -38,7 +38,7 @@ def _loop(
     )
 
 
-def test_decide_reads_literature_not_statistical_significance(
+def test_unverified_literature_does_not_change_data_result(
     orchestrator: OrchestratorAgent,
     matcher: DataMatcherAgent,
     imaging: ImagingRadiomicsAgent,
@@ -52,7 +52,7 @@ def test_decide_reads_literature_not_statistical_significance(
         associations=[
             Association(
                 imaging_feature="made_up_wavelet",
-                genomic_feature="TP53_mut",
+                genomic_feature="ZZZFAKE_mut",
                 effect_size=0.99,
                 p_value=1e-8,
                 q_value=1e-8,
@@ -63,11 +63,11 @@ def test_decide_reads_literature_not_statistical_significance(
     context = literature.interpret(strong_stats, disease="lung")
     directive = loop.decide(context, request)
     assert context.unverified
+    assert directive.action == LoopAction.STOP
+    assert directive.new_data_request is None
     assert directive.auto_promoted == []
     assert directive.human_review_required is True
-    assert directive.action in {LoopAction.CHANGE_FEATURES, LoopAction.STOP}
-    if directive.new_data_request is not None:
-        assert directive.new_data_request.max_patients <= request.max_patients
+    assert "data-driven" in directive.reason.lower()
 
 
 def test_supported_literature_stops_without_auto_promote(
@@ -91,11 +91,12 @@ def test_supported_literature_stops_without_auto_promote(
     )
     directive = loop.decide(context, request)
     assert directive.action == LoopAction.STOP
+    assert directive.new_data_request is None
     assert directive.auto_promoted == []
     assert directive.human_review_required is True
 
 
-def test_contradiction_requests_a_narrower_fetch(
+def test_literature_contradiction_does_not_shrink_cohort(
     orchestrator: OrchestratorAgent,
     matcher: DataMatcherAgent,
     imaging: ImagingRadiomicsAgent,
@@ -116,55 +117,7 @@ def test_contradiction_requests_a_narrower_fetch(
     )
     context = LiteratureContext(
         contradictions=["original_firstorder_Mean ~ KRAS_mut: failed to replicate"],
-        proposed_refinements=["Drop or re-test contradicted finding"],
-        supports=[LiteratureSupport(finding="original_firstorder_Mean ~ KRAS_mut", supported=False)],
-    )
-    directive = loop.decide(context, request)
-    assert directive.action == LoopAction.FETCH_DIFFERENT_SUBSET
-    assert directive.new_data_request is not None
-    assert "KRAS" not in directive.new_data_request.genes
-    assert directive.new_data_request.max_patients < request.max_patients
-    assert directive.auto_promoted == []
-
-
-def test_iteration_cap_stops_the_loop(
-    orchestrator: OrchestratorAgent,
-    matcher: DataMatcherAgent,
-    imaging: ImagingRadiomicsAgent,
-    genomics: GenomicsAgent,
-    stats: StatisticalCriticalAgent,
-    literature: LiteratureAgent,
-) -> None:
-    loop = _loop(orchestrator, matcher, imaging, genomics, stats, literature, max_iterations=1)
-    state = loop.run(LUNG_QUESTION)
-    assert state.stopped is True
-    assert state.iterations == 1
-    assert state.literature is not None
-    assert state.directive is not None
-    assert state.directive.human_review_required is True
-
-
-def test_kras_only_contradiction_stops_instead_of_looping(
-    orchestrator: OrchestratorAgent,
-    matcher: DataMatcherAgent,
-    imaging: ImagingRadiomicsAgent,
-    genomics: GenomicsAgent,
-    stats: StatisticalCriticalAgent,
-    literature: LiteratureAgent,
-) -> None:
-    loop = _loop(orchestrator, matcher, imaging, genomics, stats, literature)
-    request = DataRequest(
-        question_id="q_kras",
-        disease="lung",
-        tcga_project="TCGA-LUAD",
-        tcia_collection="TCGA-LUAD",
-        modality="CT",
-        genes=["KRAS"],
-        max_patients=16,
-        filters={"full_archive": False},
-    )
-    context = LiteratureContext(
-        contradictions=["original_firstorder_Mean ~ KRAS_mut: failed to replicate"],
+        proposed_refinements=["Conflicts with prior report (kept for discovery)"],
         supports=[LiteratureSupport(finding="original_firstorder_Mean ~ KRAS_mut", supported=False)],
     )
     directive = loop.decide(context, request)
@@ -173,7 +126,28 @@ def test_kras_only_contradiction_stops_instead_of_looping(
     assert directive.auto_promoted == []
 
 
-def test_unverified_literature_triggers_a_second_narrower_iteration(
+def test_stage4_runs_single_data_pass(
+    orchestrator: OrchestratorAgent,
+    matcher: DataMatcherAgent,
+    imaging: ImagingRadiomicsAgent,
+    genomics: GenomicsAgent,
+    stats: StatisticalCriticalAgent,
+    literature: LiteratureAgent,
+) -> None:
+    loop = _loop(orchestrator, matcher, imaging, genomics, stats, literature, max_iterations=3)
+    state = loop.run(LUNG_QUESTION)
+    assert state.stopped is True
+    assert state.iterations == 1
+    assert len(state.request_history) == 1
+    assert state.literature is not None
+    assert state.directive is not None
+    assert state.directive.action == LoopAction.STOP
+    assert state.directive.new_data_request is None
+    assert state.directive.auto_promoted == []
+    assert state.directive.human_review_required is True
+
+
+def test_empty_corpus_still_keeps_full_cohort_once(
     orchestrator: OrchestratorAgent,
     matcher: DataMatcherAgent,
     imaging: ImagingRadiomicsAgent,
@@ -192,29 +166,6 @@ def test_unverified_literature_triggers_a_second_narrower_iteration(
     )
     state = loop.run(LUNG_QUESTION)
     assert state.stopped is True
-    assert state.iterations == 2
-    assert state.directive is not None
-    assert state.directive.auto_promoted == []
-    assert state.directive.human_review_required is True
-    assert len(state.request_history) == 2
-    assert state.request_history[1].max_patients < state.request_history[0].max_patients
-    assert state.request_history[1].filters.get("refined") is True
-
-
-def test_end_to_end_loop_uses_literature_as_feedback(
-    orchestrator: OrchestratorAgent,
-    matcher: DataMatcherAgent,
-    imaging: ImagingRadiomicsAgent,
-    genomics: GenomicsAgent,
-    stats: StatisticalCriticalAgent,
-    literature: LiteratureAgent,
-) -> None:
-    loop = _loop(orchestrator, matcher, imaging, genomics, stats, literature)
-    state = loop.run(LUNG_QUESTION)
-    assert state.stopped is True
-    assert state.literature is not None
-    assert state.history
-    assert state.history[-1] == state.literature
-    assert state.directive is not None
-    assert state.directive.auto_promoted == []
-    assert any(item.supported for item in state.literature.supports)
+    assert state.iterations == 1
+    assert len(state.request_history) == 1
+    assert state.request.max_patients == 16

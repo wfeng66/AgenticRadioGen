@@ -27,6 +27,8 @@ class DataRequest(BaseModel):
     immune_signatures: list[str] = Field(default_factory=list)
     filters: dict[str, Any] = Field(default_factory=dict)
     max_patients: int = 24
+    max_genes: int | None = None
+    min_altered: int = 1
     estimated_patient_count: int | None = None
 
 
@@ -126,6 +128,7 @@ class RefinementDirective(BaseModel):
 
 class MatchPreview(BaseModel):
     n_paired: int
+    n_available: int | None = None
     patient_ids: list[str]
     disease: str
     modality: str

@@ -35,6 +35,21 @@ class TciaClient:
         self._download = downloader or get_bytes
         self.cache_dir = Path(cache_dir or Path.cwd() / "data_cache" / "tcia")
 
+    def list_collections(self) -> list[str]:
+        """Return public TCIA collection names."""
+        rows = self._get(f"{self.base_url}/getCollectionValues", {})
+        if not isinstance(rows, list):
+            return []
+        names: list[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                name = str(row.get("Collection") or row.get("collection") or "").strip()
+            else:
+                name = str(row).strip()
+            if name:
+                names.append(name)
+        return sorted(set(names))
+
     def list_series(self, collection: str, modality: str) -> list[TciaSeries]:
         rows = self._get(
             f"{self.base_url}/getSeries",

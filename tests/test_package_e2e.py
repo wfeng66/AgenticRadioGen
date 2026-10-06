@@ -29,6 +29,7 @@ def test_all_stages_run_on_the_same_lung_question() -> None:
         item
         for item in stage3["stats"]["associations"]
         if item["imaging_feature"] == "original_glcm_Entropy"
+        and item["genomic_feature"] == "EGFR_mut"
     )
     assert entropy["q_value"] < 0.05
     assert stage3["stats"]["promoted_findings"] == []

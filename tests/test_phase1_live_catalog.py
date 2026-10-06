@@ -71,8 +71,20 @@ def _gdc_poster(_url: str, payload: dict) -> dict:
             }
         }
     wanted = _requested_ids(payload)
-    hits = [_GDC_CASES[pid] for pid in (wanted or _GDC_CASES) if pid in _GDC_CASES]
-    return {"data": {"hits": hits}}
+    # Full-project listing (no submitter_id filter): return all cases, with pagination.
+    if wanted is None:
+        all_hits = list(_GDC_CASES.values())
+        offset = int(payload.get("from") or 0)
+        size = int(payload.get("size") or len(all_hits))
+        page = all_hits[offset : offset + size]
+        return {
+            "data": {
+                "hits": page,
+                "pagination": {"from": offset, "size": size, "total": len(all_hits)},
+            }
+        }
+    hits = [_GDC_CASES[pid] for pid in wanted if pid in _GDC_CASES]
+    return {"data": {"hits": hits, "pagination": {"total": len(hits)}}}
 
 
 def _tcia_getter(_url: str, params: dict) -> list[dict]:
@@ -123,13 +135,27 @@ def test_live_preview_intersects_gdc_and_tcia_without_fetch() -> None:
     assert catalog.query_count == 1
     assert catalog.fetch_count == 0
     assert set(preview.patient_ids) == {"TCGA-05-4244", "TCGA-05-4249"}
+    assert preview.n_available == 2
     assert "TCGA-99-NOIMG" not in preview.patient_ids
     assert "TCGA-88-NOGDC" not in preview.patient_ids
-    assert catalog.last_source_counts == {
-        "tcia_only_dropped": 1,
-        "gdc_only_dropped": 0,
-        "paired_kept": 2,
-    }
+    assert catalog.last_source_counts["tcia_only_dropped"] == 1
+    assert catalog.last_source_counts["gdc_only_dropped"] == 1
+    assert catalog.last_source_counts["paired_available"] == 2
+    assert catalog.last_source_counts["paired_selected"] == 2
+    assert catalog.last_source_counts["tcia_series"] == 3
+    assert catalog.last_source_counts["tcia_patients"] == 3
+    assert catalog.last_source_counts["gdc_patients"] == 3
+
+
+def test_max_patients_applied_after_full_intersection() -> None:
+    catalog = _live_catalog()
+    request = OrchestratorAgent().parse_and_plan(LUNG_QUESTION)
+    request = request.model_copy(update={"max_patients": 1})
+    preview = DataMatcherAgent(catalog, gate=FlagGate(False)).preview(request)
+    assert preview.n_available == 2
+    assert preview.n_paired == 1
+    assert len(preview.patient_ids) == 1
+    assert preview.patient_ids[0] in {"TCGA-05-4244", "TCGA-05-4249"}
 
 
 def test_live_preview_keeps_pairs_without_os_time() -> None:

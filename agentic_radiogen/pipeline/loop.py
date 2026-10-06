@@ -22,6 +22,7 @@ from agentic_radiogen.schemas.contracts import (
     RefinementDirective,
     ResearchQuestion,
 )
+from agentic_radiogen.util.progress import log
 
 
 class LoopState(BaseModel):
@@ -44,7 +45,7 @@ class LoopState(BaseModel):
 
 
 class DiscoveryLoop:
-    """Self-correction consumes Literature, then may send a smaller DataRequest back."""
+    """Run specialists + stats once (data-driven); literature annotates but does not refine."""
 
     def __init__(
         self,
@@ -57,6 +58,8 @@ class DiscoveryLoop:
         literature: LiteratureAgent,
         max_iterations: int = 3,
         max_patients: int | None = None,
+        max_genes: int | None = None,
+        min_altered: int | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.matcher = matcher
@@ -66,12 +69,21 @@ class DiscoveryLoop:
         self.literature = literature
         self.max_iterations = max_iterations
         self.max_patients = max_patients
+        self.max_genes = max_genes
+        self.min_altered = min_altered
 
     def run(self, question_text: str, disease: str | None = None) -> LoopState:
         question = self.orchestrator.parse(question_text, disease=disease)
         request = self.orchestrator.plan(question)
+        updates: dict = {}
         if self.max_patients is not None:
-            request = request.model_copy(update={"max_patients": self.max_patients})
+            updates["max_patients"] = self.max_patients
+        if self.max_genes is not None:
+            updates["max_genes"] = self.max_genes
+        if self.min_altered is not None:
+            updates["min_altered"] = self.min_altered
+        if updates:
+            request = request.model_copy(update=updates)
         state = LoopState(question=question, request=request)
         while not state.stopped:
             state = self.step(state)
@@ -82,6 +94,11 @@ class DiscoveryLoop:
             return self._stop(state, "Iteration cap reached")
 
         state.request_history.append(state.request)
+        log(
+            f"[loop] Iteration {state.iterations + 1}/{self.max_iterations}: "
+            f"fetch {state.request.modality} from {state.request.tcia_collection} "
+            f"+ genomics from {state.request.tcga_project}"
+        )
         try:
             images, omics = self.matcher.fetch(state.request)
         except DownloadDeniedError:
@@ -89,6 +106,20 @@ class DiscoveryLoop:
 
         state.last_images = images
         state.last_omics = omics
+        if not images.series and not omics.patient_ids:
+            counts = getattr(self.matcher.catalog, "last_source_counts", {}) or {}
+            detail = (
+                f"tcia_only={counts.get('tcia_only_dropped', '?')}, "
+                f"gdc_only={counts.get('gdc_only_dropped', '?')}, "
+                f"paired={counts.get('paired_kept', 0)}"
+            )
+            return self._stop(
+                state,
+                "No paired imaging+genomics patients for "
+                f"{state.request.tcia_collection} ∩ {state.request.tcga_project} "
+                f"({state.request.modality}). {detail}",
+            )
+        log("[loop] Running imaging + genomics specialists in parallel")
         outputs = extract_parallel(
             images, omics, imaging=self.imaging, genomics=self.genomics
         )
@@ -96,7 +127,29 @@ class DiscoveryLoop:
         state.genomics = outputs.genomics
         state.imaging_error = outputs.imaging_error
         state.genomics_error = outputs.genomics_error
+        log(
+            f"[loop] Specialists done: radiomics="
+            f"{0 if outputs.radiomics is None else len(outputs.radiomics.patient_ids)}, "
+            f"genomics="
+            f"{0 if outputs.genomics is None else len(outputs.genomics.patient_ids)}"
+            + (
+                f" (imaging_err={outputs.imaging_error})"
+                if outputs.imaging_error
+                else ""
+            )
+            + (
+                f" (genomics_err={outputs.genomics_error})"
+                if outputs.genomics_error
+                else ""
+            )
+        )
+        log(
+            f"[loop] (5) Testing each gene in gen against radiomics on i&g "
+            f"(n_radio={0 if outputs.radiomics is None else len(outputs.radiomics.patient_ids)}, "
+            f"n_geno={0 if outputs.genomics is None else len(outputs.genomics.patient_ids)})"
+        )
         try:
+            log("[loop] Joining matrices + literature annotation (literature does not change results)")
             result = join_and_interpret(
                 outputs,
                 disease=state.question.disease,
@@ -106,6 +159,13 @@ class DiscoveryLoop:
         except Stage3Error as exc:
             return self._stop(state, str(exc))
 
+        n_assoc = len(result.stats.associations)
+        log(
+            f"[loop] Stats ready: {n_assoc} associations "
+            f"(sorted by |r| ascending; strongest last); "
+            f"literature supports={len(result.literature.supports)} "
+            f"unverified={len(result.literature.unverified)}"
+        )
         directive = self.decide(result.literature, state.request)
         state.iterations += 1
         state.stats = result.stats
@@ -124,44 +184,24 @@ class DiscoveryLoop:
         return state
 
     def decide(self, context: LiteratureContext, request: DataRequest) -> RefinementDirective:
-        """Loop input is literature, not the raw statistical result."""
-        supported = [item.finding for item in context.supports if item.supported]
-        weak = bool(context.unverified or context.contradictions) or not supported
-        if not weak:
-            return RefinementDirective(
-                action=LoopAction.STOP,
-                reason="Literature supports the top findings; stop for human review",
-                human_review_required=True,
-                auto_promoted=[],
-            )
-        if context.contradictions:
-            narrowed = self._narrow_request(request, drop_gene_substrings=("kras",))
-            if narrowed is None:
-                return RefinementDirective(
-                    action=LoopAction.STOP,
-                    reason="Literature contradiction cannot be refined further; human review required",
-                    human_review_required=True,
-                    auto_promoted=[],
-                )
-            return RefinementDirective(
-                action=LoopAction.FETCH_DIFFERENT_SUBSET,
-                reason="; ".join(context.proposed_refinements) or "Literature contradiction",
-                new_data_request=narrowed,
-                human_review_required=True,
-                auto_promoted=[],
-            )
-        if context.unverified:
-            narrowed = self._narrow_request(request)
-            return RefinementDirective(
-                action=LoopAction.CHANGE_FEATURES,
-                reason="Unverified findings must not be auto-promoted",
-                new_data_request=narrowed,
-                human_review_required=True,
-                auto_promoted=[],
-            )
+        """Literature annotates findings only; it never changes the data-driven result.
+
+        Novel / rare / literature-contradicting associations are kept. The cohort is not
+        shrunk to chase paper agreement.
+        """
+        _ = request
+        n_supported = sum(1 for item in context.supports if item.supported)
+        n_unverified = len(context.unverified)
+        n_contra = len(context.contradictions)
         return RefinementDirective(
             action=LoopAction.STOP,
-            reason="Weak literature support; human review required",
+            reason=(
+                "Data-driven stop: keep full-cohort statistical findings. "
+                f"Literature is contextual only "
+                f"(supported={n_supported}, unverified={n_unverified}, "
+                f"contradictions={n_contra}); contradictions are allowed for discovery."
+            ),
+            new_data_request=None,
             human_review_required=True,
             auto_promoted=[],
         )

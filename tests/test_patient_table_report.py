@@ -111,7 +111,9 @@ def test_mutation_prevalence_and_associations_by_gene() -> None:
         ]
     )
     assert list(grouped["EGFR_mut"][0].keys())
-    assert grouped["EGFR_mut"][0]["imaging_feature"] == "f1"
+    # Ascending |r| among strongest (top_per_gene=3): f2=0.4 then f1=0.5.
+    assert grouped["EGFR_mut"][0]["imaging_feature"] == "f2"
+    assert grouped["EGFR_mut"][-1]["imaging_feature"] == "f1"
     assert "TP53_mut" in grouped
 
 
@@ -132,3 +134,42 @@ def test_stage4_demo_report_includes_patient_table() -> None:
     assert first["patient_id"].startswith("TCGA-LUNG-")
     assert "EGFR" in first["genomic_alterations"]["mutations"]
     assert "original_glcm_Entropy" in first["radiomic_features"]
+
+
+def test_write_associations_csv_one_row_per_feature(tmp_path) -> None:
+    from agentic_radiogen.pipeline.report_table import write_associations_csv
+
+    path = tmp_path / "assoc.csv"
+    n = write_associations_csv(
+        path,
+        [
+            {
+                "imaging_feature": "original_glcm_Entropy",
+                "genomic_feature": "EGFR_mut",
+                "effect_size": 0.254,
+                "p_value": 3.81e-2,
+                "q_value": 4.29e-1,
+                "n": 67,
+            },
+            {
+                "imaging_feature": "original_firstorder_Mean",
+                "genomic_feature": "KRAS_mut",
+                "effect_size": 0.4,
+                "p_value": 0.01,
+                "q_value": 0.02,
+                "n": 67,
+            },
+        ],
+        disease="lung",
+        mutation_prevalence={
+            "EGFR": {"altered": 10, "wildtype": 57},
+            "KRAS": {"altered": 5, "wildtype": 62},
+        },
+    )
+    assert n == 2
+    text = path.read_text(encoding="utf-8")
+    assert "category" in text
+    assert "EGFR_mut" in text
+    assert "supported" in text or "unverified" in text
+    assert "contradicted" in text  # KRAS intensity conflict in default corpus
+    assert "[mut: altered=10, wildtype=57]" in text

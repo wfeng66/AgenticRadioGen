@@ -21,7 +21,7 @@ class CatalogRecord:
 
 
 def is_paired_record(record: CatalogRecord) -> bool:
-    """Keep a patient only when both imaging and genomics/clinical sides exist."""
+    """Keep a patient only when both imaging and genomics sides exist."""
     has_image = bool(record.series_uid or record.radiomic_features or record.volume_summary)
     has_omics = bool(record.mutations or record.expression or record.clinical)
     return has_image and has_omics
@@ -37,6 +37,8 @@ class CatalogClient(Protocol):
         modality: str,
         genes: list[str],
         require_endpoint: str | None = None,
+        disease_query: str | None = None,
+        keyword_match: bool = False,
     ) -> list[CatalogRecord]: ...
 
     def fetch_records(self, patient_ids: list[str]) -> list[CatalogRecord]: ...
@@ -136,12 +138,18 @@ class DemoCatalog:
         modality: str,
         genes: list[str],
         require_endpoint: str | None = None,
+        disease_query: str | None = None,
+        keyword_match: bool = False,
     ) -> list[CatalogRecord]:
         self.query_count += 1
+        _ = disease_query
+        _ = keyword_match
         profile = get_profile(disease)
+        # Demo catalog only has lung/breast rows; map nsclc keyword disease onto lung.
+        wanted = "lung" if profile.name == "nsclc" else profile.name
         hits: list[CatalogRecord] = []
         for rec in self._records.values():
-            if rec.disease != profile.name:
+            if rec.disease != wanted:
                 continue
             if rec.modality != modality:
                 continue

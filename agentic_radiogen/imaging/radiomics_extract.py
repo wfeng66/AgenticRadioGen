@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,15 +9,48 @@ import numpy as np
 from agentic_radiogen.imaging.dicom_io import load_dicom_series
 from agentic_radiogen.imaging.segment import make_roi_mask
 
+_RADIOMICS_CACHE = "radiomics_features.json"
 
-def extract_series_features(series_dir: str | Path) -> dict[str, Any]:
-    volume = load_dicom_series(series_dir)
+
+def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -> dict[str, Any]:
+    root = Path(series_dir)
+    cache_path = root / _RADIOMICS_CACHE
+    if use_cache and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and cached.get("features"):
+                return {
+                    "features": {k: float(v) for k, v in cached["features"].items()},
+                    "volume_summary": {
+                        k: float(v)
+                        for k, v in (cached.get("volume_summary") or {}).items()
+                        if isinstance(v, (int, float))
+                    },
+                    "local_path": str(root.resolve()),
+                    "from_cache": True,
+                }
+        except Exception:
+            pass
+    volume = load_dicom_series(root)
     features, summary = extract_radiomics_from_volume(volume)
-    return {
+    payload = {
         "features": features,
         "volume_summary": summary,
-        "local_path": str(Path(series_dir).resolve()),
+        "local_path": str(root.resolve()),
+        "from_cache": False,
     }
+    if use_cache:
+        try:
+            cache_path.write_text(
+                json.dumps(
+                    {"features": features, "volume_summary": summary},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+    return payload
 
 
 def extract_radiomics_from_volume(volume: np.ndarray) -> tuple[dict[str, float], dict[str, float]]:

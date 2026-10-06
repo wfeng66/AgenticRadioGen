@@ -9,7 +9,7 @@ from agentic_radiogen.schemas.contracts import (
     MatchPreview,
     OmicsBundle,
 )
-from agentic_radiogen.schemas.profiles import get_profile
+from agentic_radiogen.util.progress import log
 
 
 class DownloadDeniedError(RuntimeError):
@@ -39,12 +39,38 @@ class DataMatcherAgent:
                 modality=request.modality,
                 genes=request.genes,
                 require_endpoint=None,
+                disease_query=str(request.filters.get("disease_query") or request.disease),
+                keyword_match=bool(request.filters.get("keyword_match")),
             )
             if is_paired_record(record)
         ]
-        patient_ids = [r.patient_id for r in hits[: request.max_patients]]
+        # Full intersection first; only then apply --max-patients.
+        available = len(hits)
+        selected = hits[: request.max_patients]
+        patient_ids = [r.patient_id for r in selected]
+        coll = request.tcia_collection
+        proj = request.tcga_project
+        intermediate = getattr(self.catalog, "last_intermediate", None)
+        if isinstance(intermediate, dict):
+            coll = intermediate.get("tcia_collection") or coll
+            proj = intermediate.get("gdc_project") or proj
+        log(
+            f"[match] Available paired (full TCIA ∩ GDC)={available}; "
+            f"selecting {len(patient_ids)} after --max-patients={request.max_patients} "
+            f"for {coll} ∩ {proj}"
+        )
+        counts = getattr(self.catalog, "last_source_counts", None)
+        if isinstance(counts, dict):
+            counts["paired_available"] = available
+            counts["paired_selected"] = len(patient_ids)
+            counts["max_patients"] = request.max_patients
+        if isinstance(intermediate, dict):
+            intermediate["paired_available"] = available
+            intermediate["paired_selected"] = len(patient_ids)
+            intermediate["max_patients"] = request.max_patients
         return MatchPreview(
             n_paired=len(patient_ids),
+            n_available=available,
             patient_ids=patient_ids,
             disease=request.disease,
             modality=request.modality,
@@ -55,18 +81,35 @@ class DataMatcherAgent:
         preview = self.preview(request)
         cache_key = self._cache_key(request, preview.patient_ids)
         if cache_key in self._cache:
+            log("[fetch] Using cached ImageBundle / OmicsBundle")
             return self._cache[cache_key]
         if not self.gate.approve(preview):
             raise DownloadDeniedError("Download gate denied the question-scoped fetch")
-        records = [
-            record
-            for record in self.catalog.fetch_records(preview.patient_ids)
-            if is_paired_record(record)
-        ]
-        if {record.patient_id for record in records} != set(preview.patient_ids):
-            raise ValueError("Fetch returned unpaired or missing patients; both TCIA and GDC are required")
+        log(f"[fetch] Starting question-scoped fetch for {preview.n_paired} patients")
+        apply = getattr(self.catalog, "apply_request_options", None)
+        if callable(apply):
+            apply(
+                max_genes=request.max_genes,
+                min_altered=request.min_altered,
+                disease_query=str(request.filters.get("disease_query") or request.disease),
+                keyword_match=bool(request.filters.get("keyword_match")),
+            )
+        # Preview already selected TCIA ∩ GDC IDs; do not drop them again after fetch.
+        records = list(self.catalog.fetch_records(preview.patient_ids))
+        fetched_ids = {record.patient_id for record in records}
+        if fetched_ids != set(preview.patient_ids):
+            missing = sorted(set(preview.patient_ids) - fetched_ids)
+            raise ValueError(
+                "Fetch returned missing patients from the paired preview; "
+                f"both TCIA and GDC are required. missing={missing[:8]}"
+            )
         image_bundle, omics_bundle = self._split_payloads(request, records)
         self._cache[cache_key] = (image_bundle, omics_bundle)
+        with_radio = sum(1 for s in image_bundle.series if s.precomputed_features)
+        log(
+            f"[fetch] Bundles ready: imaging={len(image_bundle.patient_ids)} "
+            f"(radiomics={with_radio}), genomics={len(omics_bundle.patient_ids)}"
+        )
         return image_bundle, omics_bundle
 
     @staticmethod
@@ -77,8 +120,10 @@ class DataMatcherAgent:
     def _split_payloads(
         request: DataRequest, records: list[CatalogRecord]
     ) -> tuple[ImageBundle, OmicsBundle]:
-        profile = get_profile(request.disease)
-        genes = request.genes or list(profile.candidate_genes)
+        if request.genes:
+            genes = list(request.genes)
+        else:
+            genes = sorted({gene for rec in records for gene in rec.mutations})
         series = [
             ImageSeriesRef(
                 patient_id=rec.patient_id,
@@ -105,6 +150,11 @@ class DataMatcherAgent:
                 rec.patient_id: {k: rec.clinical[k] for k in request.clinical_fields if k in rec.clinical}
                 for rec in records
             },
-            metadata={"source": "question_scoped", "project": request.tcga_project, "genes": genes},
+            metadata={
+                "source": "question_scoped",
+                "project": request.tcga_project,
+                "genes": genes,
+                "discover_genes": bool(request.filters.get("discover_genes")),
+            },
         )
         return image_bundle, omics_bundle

@@ -129,7 +129,8 @@ class StatisticalCriticalAgent:
             )
 
         return ModelResult(
-            associations=sorted(associations, key=lambda a: a.q_value),
+            # Ascending |correlation|: weaker first, stronger last ("more correlation, show later").
+            associations=sorted(associations, key=lambda a: (abs(a.effect_size), a.q_value)),
             metrics=metrics,
             diagnostics=diagnostics,
         )
@@ -168,12 +169,29 @@ class StatisticalCriticalAgent:
         radio_df: pd.DataFrame, geno_df: pd.DataFrame, target: str
     ) -> ModelMetrics:
         y = geno_df[target].to_numpy(dtype=float)
-        if len(np.unique(y[np.isfinite(y)])) < 2:
+        mask = np.isfinite(y)
+        y = y[mask]
+        if len(y) < 4:
             return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
-        X = radio_df.to_numpy(dtype=float)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.35, random_state=0, stratify=y.astype(int)
-        )
+        classes, counts = np.unique(y.astype(int), return_counts=True)
+        if len(classes) < 2 or int(counts.min()) < 2:
+            # Rare / single-mutant cohorts cannot support a stratified holdout AUROC.
+            return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
+        X = radio_df.to_numpy(dtype=float)[mask]
+        # Stratify only when every class can appear in both train and test.
+        can_stratify = int(counts.min()) >= 2 and len(y) >= 6
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=0.35,
+                random_state=0,
+                stratify=y.astype(int) if can_stratify else None,
+            )
+        except ValueError:
+            return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            return ModelMetrics(auroc=None, n_train=len(y_train), n_test=len(y_test), target=target)
         scaler = StandardScaler()
         clf = LogisticRegression(max_iter=200)
         clf.fit(scaler.fit_transform(X_train), y_train)

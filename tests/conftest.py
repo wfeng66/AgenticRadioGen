@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from agentic_radiogen.agents.data_matcher import DataMatcherAgent
@@ -10,6 +12,9 @@ from agentic_radiogen.agents.orchestrator import OrchestratorAgent
 from agentic_radiogen.agents.statistics import StatisticalCriticalAgent
 from agentic_radiogen.data.catalog import DemoCatalog
 from agentic_radiogen.data.gate import AlwaysAllowGate
+
+# Keep unit-test output quiet unless a test explicitly enables progress.
+os.environ.setdefault("AGENTIC_RADIOGEN_QUIET", "1")
 
 
 LUNG_QUESTION = (

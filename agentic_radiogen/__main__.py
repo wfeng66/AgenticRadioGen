@@ -23,7 +23,9 @@ from agentic_radiogen.pipeline.report_table import (
     mutation_prevalence,
     print_patient_table,
     resolve_patient_table,
+    write_associations_csv,
 )
+from agentic_radiogen.data.disease_match import format_dataset_extraction_note
 from agentic_radiogen.pipeline.stage2 import extract_parallel
 from agentic_radiogen.pipeline.stage3 import Stage3Error, join_and_interpret
 from agentic_radiogen.schemas.contracts import ImageBundle, OmicsBundle
@@ -37,7 +39,22 @@ def print_summary(payload: dict[str, Any]) -> None:
     print(f"Stage {stage} summary")
     print("=" * 60)
     print(f"Disease : {question.get('disease')}")
-    print(f"Genes   : {', '.join(question.get('genes') or []) or '(profile default)'}")
+    genes = question.get("genes") or []
+    request = payload.get("request") or {}
+    gene_source = (request.get("filters") or {}).get("gene_source")
+    intermediate = payload.get("intermediate") or {}
+    discovered = intermediate.get("genes") or request.get("genes") or []
+    if gene_source == "literature" or request.get("genes"):
+        panel = request.get("genes") or discovered
+        print(f"Genes   : literature panel ({len(panel)}): {', '.join(panel[:12])}"
+              f"{'...' if len(panel) > 12 else ''}")
+    elif discovered:
+        print(
+            f"Genes   : cohort mutations ({len(discovered)}): {', '.join(discovered[:12])}"
+            f"{'...' if len(discovered) > 12 else ''}"
+        )
+    else:
+        print("Genes   : all mutations in paired genomics cohort (resolved at fetch)")
     print(f"Catalog : {payload.get('catalog')}")
 
     preview = payload.get("preview") or {}
@@ -51,6 +68,39 @@ def print_summary(payload: dict[str, Any]) -> None:
             print(f"  imaging: {note}")
     for note in (payload.get("imaging_notes") or [])[:8]:
         print(f"  imaging: {note}")
+    intermediate = payload.get("intermediate") or {}
+    if intermediate:
+        print("-" * 60)
+        print("Intermediate dataset / extraction progress")
+        if intermediate.get("tcia_collection") or intermediate.get("gdc_project"):
+            print(
+                f"  Sources : TCIA {intermediate.get('tcia_collection')} "
+                f"({intermediate.get('modality')}) ∩ GDC {intermediate.get('gdc_project')}"
+            )
+        if "tcia_series" in intermediate:
+            print(
+                f"  TCIA    : {intermediate.get('tcia_series')} series / "
+                f"{intermediate.get('tcia_patients')} patients"
+            )
+        if "paired_patients" in intermediate or "paired_available" in intermediate:
+            print(
+                f"  Paired  : available={intermediate.get('paired_available', intermediate.get('paired_patients'))}, "
+                f"selected={intermediate.get('paired_selected', '?')} "
+                f"(max_patients={intermediate.get('max_patients', '?')}; "
+                f"tcia-only dropped={intermediate.get('tcia_only_dropped', '?')}, "
+                f"gdc-only dropped={intermediate.get('gdc_only_dropped', '?')})"
+            )
+        if "gdc_patients" in intermediate:
+            print(f"  GDC project patients: {intermediate.get('gdc_patients')}")
+        elif "gdc_overlapping" in intermediate:
+            print(f"  GDC overlap with TCIA IDs: {intermediate.get('gdc_overlapping')}")
+        if "fetch_requested" in intermediate:
+            print(
+                f"  Extract : requested={intermediate.get('fetch_requested')}, "
+                f"radiomics_ok={intermediate.get('radiomics_ok')}, "
+                f"failed={intermediate.get('radiomics_failed')}, "
+                f"skipped={intermediate.get('imaging_skipped')}"
+            )
     seg = payload.get("segmentation")
     if seg:
         print(f"Segmentation backend: {seg.get('backend')} (cuda={seg.get('cuda')})")
@@ -73,33 +123,81 @@ def print_summary(payload: dict[str, Any]) -> None:
             print(f"  Genomics features : {', '.join(specialists['genomics_features'][:8])}")
 
     stats = payload.get("stats") or {}
-    associations = stats.get("associations") or payload.get("top_associations") or []
-    by_gene = payload.get("associations_by_gene") or associations_by_gene(associations)
+    associations = list(stats.get("associations") or payload.get("associations") or [])
+    if not associations:
+        associations = list(payload.get("top_associations") or [])
+    associations = sorted(
+        associations,
+        key=lambda a: (abs(float(a.get("effect_size", 0.0))), float(a.get("q_value", 1.0))),
+    )
     metrics = stats.get("metrics") or payload.get("metrics") or []
-    if associations or by_gene or metrics:
+    prevalence = payload.get("mutation_prevalence") or {}
+
+    def _fmt_r(r: float) -> str:
+        if r < 0:
+            return f"r={r:.3f} (|r|={abs(r):.3f})"
+        return f"r={r:.3f}"
+
+    def _gene_of(item: dict[str, Any]) -> str:
+        g = str(item.get("genomic_feature") or "")
+        if g.endswith("_mut") or g.endswith("_expr"):
+            return g.rsplit("_", 1)[0]
+        return g
+
+    def _fmt_assoc(item: dict[str, Any]) -> str:
+        r = float(item.get("effect_size", 0.0))
+        gene = _gene_of(item)
+        counts = prevalence.get(gene)
+        mut = ""
+        if counts:
+            mut = (
+                f"  [mut: altered={counts.get('altered', 0)}, "
+                f"wildtype={counts.get('wildtype', 0)}]"
+            )
+        p = item.get("p_value")
+        p_bit = f", p={float(p):.2e}" if p is not None else ""
+        return (
+            f"{item['imaging_feature']} ~ {item['genomic_feature']}: "
+            f"{_fmt_r(r)}{p_bit}, q={float(item.get('q_value', 1.0)):.2e}, "
+            f"n={item.get('n')}{mut}"
+        )
+
+    if associations or metrics:
         print("-" * 60)
-        print("Imaging feature ~ genomic alteration (top per gene)")
-        if not by_gene:
+        print(
+            f"Associations ({len(associations)} total). "
+            "CLI shows strongest 8 by |r| (ascending); full list in JSON."
+        )
+        print(
+            "  Stats: r=Pearson correlation of radiomic feature vs mutation (0/1); "
+            "|r| shown only if r<0; "
+            "p=raw p-value; q=Benjamini–Hochberg FDR-adjusted p; "
+            "n=patients in that test"
+        )
+        if not associations:
             print("  (none)")
-        for gene in sorted(by_gene):
-            print(f"  [{gene}]")
-            for item in by_gene[gene]:
-                print(
-                    f"    {item['imaging_feature']}: "
-                    f"r={item['effect_size']:.3f}, q={item['q_value']:.2e}, n={item['n']}"
-                )
-        print("Metrics (per genomic target)")
-        if not metrics:
-            print("  (none)")
-        for item in metrics:
-            bits = [f"target={item.get('target')}"]
-            if item.get("auroc") is not None:
-                bits.append(f"AUROC={item['auroc']:.3f}")
-            if item.get("c_index") is not None:
-                bits.append(f"C-index={item['c_index']:.3f}")
-            bits.append(f"n_train={item.get('n_train')}")
-            bits.append(f"n_test={item.get('n_test')}")
-            print(f"  {', '.join(bits)}")
+        else:
+            for item in associations[-8:]:
+                print(f"  {_fmt_assoc(item)}")
+        printable_metrics = [
+            m for m in metrics if m.get("auroc") is not None or m.get("c_index") is not None
+        ]
+        if printable_metrics:
+            print(
+                "Metrics (genes with computable AUROC/C-index only)\n"
+                "  AUROC=mutation prediction from radiomics; "
+                "C-index=survival concordance if OS present; "
+                "n_train/n_test=split sizes"
+            )
+            for item in printable_metrics:
+                bits = [f"target={item.get('target')}"]
+                if item.get("auroc") is not None:
+                    bits.append(f"AUROC={item['auroc']:.3f}")
+                if item.get("c_index") is not None:
+                    bits.append(f"C-index={item['c_index']:.3f}")
+                bits.append(f"n_train={item.get('n_train')}")
+                bits.append(f"n_test={item.get('n_test')}")
+                print(f"  {', '.join(bits)}")
         diagnostics = stats.get("diagnostics")
         if diagnostics and diagnostics.get("caveats"):
             print("Caveats")
@@ -109,18 +207,50 @@ def print_summary(payload: dict[str, Any]) -> None:
     literature = payload.get("literature") or {}
     if literature:
         print("-" * 60)
-        print("Literature")
-        for item in literature.get("supports") or []:
-            mark = "supported" if item.get("supported") else "not supported"
-            print(f"  [{mark}] {item.get('finding')}")
-            for paper in item.get("papers") or []:
-                print(f"           - {paper}")
-        for item in literature.get("unverified") or []:
-            print(f"  [unverified] {item}")
-        for item in literature.get("contradictions") or []:
-            print(f"  [contradiction] {item}")
+        print("Literature (annotation only; does not change associations)")
+        print(
+            "  Top 8 by |r| within each category (ascending |r|):\n"
+            "    [supported]    disease-matched corpus paper agrees\n"
+            "    [unverified]   no disease-matched paper in corpus\n"
+            "    [contradicted] corpus paper argues against this pair\n"
+            "    [note]         process reminder (not a finding class)"
+        )
+
+        def _with_mut_counts(text: str) -> str:
+            if "_mut" not in text or not prevalence:
+                return text
+            try:
+                right = text.split("~", 1)[1].strip()
+                gene = right.split("_mut", 1)[0].strip().split()[0]
+            except (IndexError, ValueError):
+                return text
+            counts = prevalence.get(gene)
+            if not counts:
+                return text
+            return (
+                f"{text}  [mut: altered={counts.get('altered', 0)}, "
+                f"wildtype={counts.get('wildtype', 0)}]"
+            )
+
+        supported_items = [s for s in (literature.get("supports") or []) if s.get("supported")]
+        if supported_items:
+            print("  [supported]")
+            for item in supported_items:
+                print(f"    {_with_mut_counts(item.get('finding') or '')}")
+                for paper in item.get("papers") or []:
+                    print(f"             - {paper}")
+        unverified_items = list(literature.get("unverified") or [])
+        if unverified_items:
+            print("  [unverified]")
+            for item in unverified_items:
+                print(f"    {_with_mut_counts(str(item))}")
+        contra_items = list(literature.get("contradictions") or [])
+        if contra_items:
+            print("  [contradicted]")
+            for item in contra_items:
+                print(f"    {_with_mut_counts(str(item))}")
         for item in literature.get("proposed_refinements") or []:
-            print(f"  [refinement] {item}")
+            print(f"  [note] {item}")
 
     directive = payload.get("directive") or {}
     if directive or payload.get("looped"):
@@ -132,6 +262,9 @@ def print_summary(payload: dict[str, Any]) -> None:
         print(f"  Reason     : {directive.get('reason')}")
         print(f"  Human review required: {payload.get('human_review_required', directive.get('human_review_required'))}")
         print(f"  Auto-promoted        : {payload.get('auto_promoted', directive.get('auto_promoted'))}")
+    note = format_dataset_extraction_note(payload.get("intermediate") or {})
+    if note:
+        print(note)
     print("=" * 60)
 
 
@@ -143,6 +276,21 @@ def build_catalog(name: str, *, download_dicom: bool = True) -> DemoCatalog | Li
     raise ValueError(f"Unknown catalog '{name}'. Use demo or live.")
 
 
+def _orchestrator(
+    *,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+) -> OrchestratorAgent:
+    return OrchestratorAgent(
+        tcga_project=tcga_project,
+        tcia_collection=tcia_collection,
+        modality=modality,
+        genes=genes,
+    )
+
+
 def _run_matcher(
     question_text: str,
     *,
@@ -152,12 +300,29 @@ def _run_matcher(
     max_patients: int,
     stage: int,
     download_dicom: bool = True,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+    max_genes: int | None = None,
+    min_altered: int = 1,
 ) -> tuple[dict[str, Any], ImageBundle | None, OmicsBundle | None]:
     catalog = build_catalog(catalog_name, download_dicom=download_dicom)
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
-    orchestrator = OrchestratorAgent()
+    orchestrator = _orchestrator(
+        tcga_project=tcga_project,
+        tcia_collection=tcia_collection,
+        modality=modality,
+        genes=genes,
+    )
     request = orchestrator.parse_and_plan(question_text, disease=disease)
-    request = request.model_copy(update={"max_patients": max_patients})
+    request = request.model_copy(
+        update={
+            "max_patients": max_patients,
+            "max_genes": max_genes,
+            "min_altered": min_altered,
+        }
+    )
     matcher = DataMatcherAgent(catalog, gate=gate)
     preview = matcher.preview(request)
     payload: dict[str, Any] = {
@@ -167,6 +332,7 @@ def _run_matcher(
         "request": request.model_dump(),
         "preview": preview.model_dump(),
         "source_counts": getattr(catalog, "last_source_counts", {}),
+        "intermediate": getattr(catalog, "last_intermediate", {}),
         "paired_only": True,
         "token_required": False,
         "download_approved": bool(approve_download or catalog_name == "demo"),
@@ -201,6 +367,12 @@ def run_stage1(
     approve_download: bool,
     max_patients: int,
     download_dicom: bool = True,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+    max_genes: int | None = None,
+    min_altered: int = 1,
 ) -> dict[str, Any]:
     payload, _, _ = _run_matcher(
         question_text,
@@ -210,6 +382,12 @@ def run_stage1(
         max_patients=max_patients,
         stage=1,
         download_dicom=download_dicom,
+        tcga_project=tcga_project,
+        tcia_collection=tcia_collection,
+        modality=modality,
+        genes=genes,
+        max_genes=max_genes,
+        min_altered=min_altered,
     )
     return payload
 
@@ -222,6 +400,12 @@ def run_stage2(
     approve_download: bool,
     max_patients: int,
     download_dicom: bool = True,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+    max_genes: int | None = None,
+    min_altered: int = 1,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -231,6 +415,12 @@ def run_stage2(
         max_patients=max_patients,
         stage=2,
         download_dicom=download_dicom,
+        tcga_project=tcga_project,
+        tcia_collection=tcia_collection,
+        modality=modality,
+        genes=genes,
+        max_genes=max_genes,
+        min_altered=min_altered,
     )
     payload["joined"] = False
     if images is None or omics is None:
@@ -268,6 +458,12 @@ def run_stage3(
     approve_download: bool,
     max_patients: int,
     download_dicom: bool = True,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+    max_genes: int | None = None,
+    min_altered: int = 1,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -277,6 +473,12 @@ def run_stage3(
         max_patients=max_patients,
         stage=3,
         download_dicom=download_dicom,
+        tcga_project=tcga_project,
+        tcia_collection=tcia_collection,
+        modality=modality,
+        genes=genes,
+        max_genes=max_genes,
+        min_altered=min_altered,
     )
     payload["joined"] = True
     payload["looped"] = False
@@ -318,13 +520,24 @@ def run_stage4(
     max_patients: int,
     max_iterations: int,
     download_dicom: bool = True,
+    tcga_project: str | None = None,
+    tcia_collection: str | None = None,
+    modality: str | None = None,
+    genes: str | None = None,
+    max_genes: int | None = None,
+    min_altered: int = 1,
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
     catalog = build_catalog(catalog_name, download_dicom=download_dicom)
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     state = DiscoveryLoop(
-        orchestrator=OrchestratorAgent(),
+        orchestrator=_orchestrator(
+            tcga_project=tcga_project,
+            tcia_collection=tcia_collection,
+            modality=modality,
+            genes=genes,
+        ),
         matcher=DataMatcherAgent(catalog, gate=gate),
         imaging=ImagingRadiomicsAgent(),
         genomics=GenomicsAgent(),
@@ -332,6 +545,8 @@ def run_stage4(
         literature=LiteratureAgent(),
         max_iterations=max_iterations,
         max_patients=max_patients,
+        max_genes=max_genes,
+        min_altered=min_altered,
     ).run(question_text, disease=disease)
     patient_table = resolve_patient_table(
         state.radiomics,
@@ -370,33 +585,62 @@ def run_stage4(
             else 0,
             "n_genomics_patients": len(state.genomics.patient_ids) if state.genomics else 0,
         },
-        "top_associations": all_assoc[:5],
-        "associations_by_gene": associations_by_gene(all_assoc, top_per_gene=3),
+        "top_associations": all_assoc[-5:] if all_assoc else [],
+        "associations_by_gene": associations_by_gene(all_assoc, top_per_gene=0),
         "associations": all_assoc,
         "metrics": [] if state.stats is None else [item.model_dump() for item in state.stats.metrics],
         "literature": None if state.literature is None else state.literature.model_dump(),
         "literature_history": [item.model_dump() for item in state.history],
         "imaging_notes": getattr(catalog, "last_imaging_notes", []),
+        "intermediate": getattr(catalog, "last_intermediate", {}),
         "segmentation": segmentation_backend(),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Agentic radiogenomics. Stage 4 runs the literature-driven self-correction loop."
+        description="Agentic radiogenomics. Stage 4 joins stats with optional literature annotation (data-driven; literature does not alter the cohort)."
     )
     parser.add_argument(
         "--stage",
         type=int,
         default=4,
         choices=(1, 2, 3, 4),
-        help="1 = matcher; 2 = specialists; 3 = stats+literature; 4 = self-correction loop.",
+        help="1 = matcher; 2 = specialists; 3 = stats+literature; 4 = full run (literature annotates only).",
     )
     parser.add_argument(
         "--question",
         default="Which imaging features are associated with EGFR mutations and survival in lung cancer?",
     )
-    parser.add_argument("--disease", default=None, help="Optional profile: lung or breast")
+    parser.add_argument(
+        "--disease",
+        default=None,
+        help="Disease alias or site code (lung, breast, gbm, pancreas, kidney, ...). "
+        "Also accepts TCGA project ids (TCGA-GBM). Use --list-diseases to list.",
+    )
+    parser.add_argument(
+        "--tcga-project",
+        default=None,
+        help="Override GDC project (e.g. TCGA-GBM). Implies live pairing for that project.",
+    )
+    parser.add_argument(
+        "--tcia-collection",
+        default=None,
+        help="Override TCIA collection (defaults to the TCGA project id).",
+    )
+    parser.add_argument("--modality", default=None, help="Override imaging modality (CT, MR, ...).")
+    parser.add_argument(
+        "--genes",
+        choices=("auto",),
+        default=None,
+        help="Gene panel mode. Default: all genes mutated in the paired genomics cohort. "
+        "--genes auto: literature/profile candidate genes only.",
+    )
+    parser.add_argument(
+        "--list-diseases",
+        action="store_true",
+        help="Print built-in TCGA disease aliases / projects and exit.",
+    )
     parser.add_argument("--catalog", choices=("demo", "live"), default="demo")
     parser.add_argument(
         "--approve-download",
@@ -413,7 +657,8 @@ def main() -> None:
     parser.add_argument(
         "--out",
         default=None,
-        help="Write the full JSON payload to this file (e.g. outputs/stage4_lung.json).",
+        help="Write full JSON to this path and a sibling .csv of all associations "
+        "(e.g. outputs/stage4_lung.json -> outputs/stage4_lung.csv).",
     )
     parser.add_argument(
         "--json",
@@ -421,47 +666,43 @@ def main() -> None:
         help="Also print the full JSON payload to stdout (default: summary only).",
     )
     args = parser.parse_args()
+    if args.list_diseases:
+        from agentic_radiogen.schemas.profiles import get_profile, list_profiles, list_projects
+
+        print("Built-in diseases (alias -> project):")
+        for name in list_profiles():
+            profile = get_profile(name)
+            print(f"  {name:24s} {profile.tcga_project:12s} modality={profile.default_modality}")
+        print(f"Projects: {', '.join(list_projects())}")
+        print("Any other TCGA-* id also works dynamically via --disease TCGA-XXXX or --tcga-project.")
+        return
     download_dicom = not args.no_dicom
+    common = dict(
+        disease=args.disease,
+        catalog_name=args.catalog,
+        approve_download=args.approve_download,
+        max_patients=args.max_patients,
+        download_dicom=download_dicom,
+        tcga_project=args.tcga_project,
+        tcia_collection=args.tcia_collection,
+        modality=args.modality,
+        genes=args.genes,
+    )
 
     try:
         if args.stage == 1:
-            payload = run_stage1(
-                args.question,
-                disease=args.disease,
-                catalog_name=args.catalog,
-                approve_download=args.approve_download,
-                max_patients=args.max_patients,
-                download_dicom=download_dicom,
-            )
+            payload = run_stage1(args.question, **common)
         elif args.stage == 2:
-            payload = run_stage2(
-                args.question,
-                disease=args.disease,
-                catalog_name=args.catalog,
-                approve_download=args.approve_download,
-                max_patients=args.max_patients,
-                download_dicom=download_dicom,
-            )
+            payload = run_stage2(args.question, **common)
         elif args.stage == 3:
-            payload = run_stage3(
-                args.question,
-                disease=args.disease,
-                catalog_name=args.catalog,
-                approve_download=args.approve_download,
-                max_patients=args.max_patients,
-                download_dicom=download_dicom,
-            )
+            payload = run_stage3(args.question, **common)
         else:
             payload = run_stage4(
                 args.question,
-                disease=args.disease,
-                catalog_name=args.catalog,
-                approve_download=args.approve_download,
-                max_patients=args.max_patients,
                 max_iterations=args.max_iterations,
-                download_dicom=download_dicom,
+                **common,
             )
-    except (RemoteApiError, ValueError) as exc:
+    except (RemoteApiError, ValueError, KeyError) as exc:
         raise SystemExit(str(exc)) from exc
 
     print_summary(payload)
@@ -470,6 +711,21 @@ def main() -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         print(f"Full JSON written to: {out_path.resolve()}")
+        associations = list(
+            (payload.get("stats") or {}).get("associations")
+            or payload.get("associations")
+            or []
+        )
+        if associations:
+            csv_path = out_path.with_suffix(".csv")
+            disease = str((payload.get("question") or {}).get("disease") or "unknown")
+            n_rows = write_associations_csv(
+                csv_path,
+                associations,
+                disease=disease,
+                mutation_prevalence=payload.get("mutation_prevalence") or {},
+            )
+            print(f"Associations CSV ({n_rows} rows) written to: {csv_path.resolve()}")
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
 

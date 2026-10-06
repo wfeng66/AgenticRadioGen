@@ -94,7 +94,7 @@ def test_literature_not_stats_marks_unverified_and_supported(
             ),
             Association(
                 imaging_feature="made_up_wavelet",
-                genomic_feature="TP53_mut",
+                genomic_feature="ZZZFAKE_mut",
                 effect_size=0.6,
                 p_value=1e-3,
                 q_value=1e-2,
@@ -106,7 +106,7 @@ def test_literature_not_stats_marks_unverified_and_supported(
     context = literature.interpret(result, disease="lung")
     supported = [item.finding for item in context.supports if item.supported]
     assert any("EGFR" in f for f in supported)
-    assert any("made_up_wavelet" in u for u in context.unverified)
+    assert any("ZZZFAKE" in u or "made_up_wavelet" in u for u in context.unverified)
     assert "made_up_wavelet" not in " ".join(supported)
 
 
@@ -141,7 +141,26 @@ def test_stage3_cli_joins_then_interprets_without_looping() -> None:
     assert any("EGFR" in finding for finding in supported)
 
 
-def test_literature_flags_contradictions(literature: LiteratureAgent) -> None:
+def test_literature_does_not_attach_breast_papers_to_lung_findings(
+    literature: LiteratureAgent,
+) -> None:
+    result = ModelResult(
+        associations=[
+            Association(
+                imaging_feature="original_shape_Sphericity",
+                genomic_feature="ACACB_mut",
+                effect_size=0.5,
+                p_value=0.01,
+                q_value=0.02,
+                n=67,
+            )
+        ]
+    )
+    context = literature.interpret(result, disease="lung")
+    assert context.unverified
+    assert all(not item.supported for item in context.supports)
+    assert not any("breast" in (p or "").lower() for item in context.supports for p in item.papers)
+
     result = ModelResult(
         associations=[
             Association(
@@ -157,3 +176,24 @@ def test_literature_flags_contradictions(literature: LiteratureAgent) -> None:
     context = literature.interpret(result, disease="lung")
     assert context.contradictions
     assert all(not item.supported for item in context.supports)
+
+
+def test_predict_mutation_skips_rare_class_instead_of_crashing() -> None:
+    from agentic_radiogen.schemas.contracts import GenomicMatrix, RadiomicMatrix
+
+    radio = RadiomicMatrix(
+        patient_ids=[f"P{i}" for i in range(10)],
+        feature_names=["f1"],
+        features={f"P{i}": {"f1": float(i)} for i in range(10)},
+    )
+    geno = GenomicMatrix(
+        patient_ids=[f"P{i}" for i in range(10)],
+        feature_names=["ALK_mut"],
+        features={
+            **{f"P{i}": {"ALK_mut": 0.0} for i in range(9)},
+            "P9": {"ALK_mut": 1.0},
+        },
+    )
+    result = StatisticalCriticalAgent().analyze(radio, geno)
+    alk = next(m for m in result.metrics if m.target == "ALK_mut")
+    assert alk.auroc is None

@@ -16,7 +16,8 @@ def test_orchestrator_plans_lung_question_without_downloading(
     assert request.disease == "lung"
     assert request.tcga_project == "TCGA-LUAD"
     assert request.modality == "CT"
-    assert request.genes == ["EGFR"]
+    assert request.genes == []
+    assert request.filters.get("gene_source") == "cohort"
     assert "OS_time" in request.clinical_fields  # requested if available
     assert request.filters["full_archive"] is False
     assert request.max_patients <= 24
@@ -40,7 +41,8 @@ def test_orchestrator_plans_breast_with_the_same_agent(
     assert request.disease == "breast"
     assert request.tcga_project == "TCGA-BRCA"
     assert request.modality == "MR"
-    assert request.genes == ["ERBB2"]
+    assert request.genes == []
+    assert request.filters.get("gene_source") == "cohort"
     assert request.tcia_collection != "TCGA-LUAD"
 
 
@@ -53,7 +55,15 @@ def test_explicit_disease_needed_when_question_is_generic(
         "Which imaging features associate with BRCA1?", disease="breast"
     )
     assert parsed.disease == "breast"
-    assert parsed.genes == ["BRCA1"]
+    assert parsed.genes == []
+
+
+def test_genes_auto_selects_breast_literature_panel(
+    orchestrator: OrchestratorAgent,
+) -> None:
+    request = OrchestratorAgent(genes="auto").parse_and_plan(BREAST_QUESTION)
+    assert "ERBB2" in request.genes
+    assert request.filters.get("gene_source") == "literature"
 
 
 def test_preview_is_metadata_only_and_question_scoped(
@@ -80,7 +90,9 @@ def test_fetch_downloads_only_previewed_patients(
     assert set(images.patient_ids).isdisjoint(
         {pid for pid in catalog._records if pid.startswith("TCGA-BRCA-")}
     )
-    assert all(set(mut) == {"EGFR"} for mut in omics.mutations.values())
+    assert all("EGFR" in mut for mut in omics.mutations.values())
+    # Cohort mode keeps every gene present on the demo genomics records.
+    assert set(omics.metadata["genes"]) >= {"EGFR", "KRAS", "TP53"}
     assert catalog.fetch_count == 1
 
 

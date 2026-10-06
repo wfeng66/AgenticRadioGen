@@ -143,15 +143,24 @@ def mutation_prevalence(table: dict[str, Any]) -> dict[str, dict[str, int]]:
 def associations_by_gene(
     associations: list[dict[str, Any]], *, top_per_gene: int = 3
 ) -> dict[str, list[dict[str, Any]]]:
-    """Group association dicts by genomic_feature; keep best q-values per gene."""
+    """Group by genomic_feature; sort by |r| ascending (strongest last).
+
+    When top_per_gene > 0, keep the strongest N (still ascending within the slice).
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in associations:
         gene = str(item.get("genomic_feature") or "")
         grouped.setdefault(gene, []).append(item)
     out: dict[str, list[dict[str, Any]]] = {}
     for gene, items in grouped.items():
-        ranked = sorted(items, key=lambda a: (a.get("q_value", 1.0), -abs(a.get("effect_size", 0.0))))
-        out[gene] = ranked[:top_per_gene]
+        ranked = sorted(
+            items,
+            key=lambda a: (abs(a.get("effect_size", 0.0)), a.get("q_value", 1.0)),
+        )
+        if top_per_gene <= 0:
+            out[gene] = ranked
+        else:
+            out[gene] = ranked[-top_per_gene:]
     return out
 
 
@@ -189,3 +198,88 @@ def print_patient_table(table: dict[str, Any], *, max_rows: int = 12) -> None:
         print(f"  {row['patient_id']}: altered=[{alt_txt}]; {flags}; radiomics={n_feat} features")
     if len(patients) > max_rows:
         print(f"  ... {len(patients) - max_rows} more patients in JSON patient_table.patients")
+
+
+def _fmt_r(r: float) -> str:
+    if r < 0:
+        return f"r={r:.3f} (|r|={abs(r):.3f})"
+    return f"r={r:.3f}"
+
+
+def write_associations_csv(
+    path: str | Any,
+    associations: list[dict[str, Any]],
+    *,
+    disease: str,
+    mutation_prevalence: dict[str, dict[str, int]] | None = None,
+    literature: Any | None = None,
+) -> int:
+    """Write one association per row with stats + literature category.
+
+    Returns the number of rows written.
+    """
+    import csv
+    from pathlib import Path
+
+    from agentic_radiogen.agents.literature import LiteratureAgent
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    lit = literature if literature is not None else LiteratureAgent()
+    prevalence = mutation_prevalence or {}
+    ranked = sorted(
+        associations,
+        key=lambda a: (abs(float(a.get("effect_size", 0.0))), float(a.get("q_value", 1.0))),
+    )
+    fieldnames = [
+        "imaging_feature",
+        "genomic_feature",
+        "finding",
+        "r",
+        "p",
+        "q",
+        "n",
+        "altered",
+        "wildtype",
+        "category",
+        "papers",
+        "contradiction_note",
+    ]
+    with out.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in ranked:
+            img = str(item.get("imaging_feature") or "")
+            geno = str(item.get("genomic_feature") or "")
+            gene = geno.rsplit("_", 1)[0] if geno.endswith(("_mut", "_expr")) else geno
+            counts = prevalence.get(gene) or {}
+            altered = int(counts.get("altered", 0)) if counts else ""
+            wildtype = int(counts.get("wildtype", 0)) if counts else ""
+            r = float(item.get("effect_size", 0.0))
+            p = float(item.get("p_value", 1.0))
+            q = float(item.get("q_value", 1.0))
+            n = int(item.get("n", 0))
+            category, papers, note = lit.classify(img, geno, disease=disease)
+            mut_bit = ""
+            if counts:
+                mut_bit = f"  [mut: altered={altered}, wildtype={wildtype}]"
+            finding = (
+                f"{img} ~ {geno} ({_fmt_r(r)}, p={p:.2e}, q={q:.2e}, n={n}){mut_bit}"
+            )
+            writer.writerow(
+                {
+                    "imaging_feature": img,
+                    "genomic_feature": geno,
+                    "finding": finding,
+                    "r": f"{r:.6g}",
+                    "p": f"{p:.6g}",
+                    "q": f"{q:.6g}",
+                    "n": n,
+                    "altered": altered,
+                    "wildtype": wildtype,
+                    "category": category,
+                    "papers": "; ".join(papers),
+                    "contradiction_note": note or "",
+                }
+            )
+    return len(ranked)
