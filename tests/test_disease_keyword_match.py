@@ -9,21 +9,16 @@ from agentic_radiogen.data.disease_match import (
 from agentic_radiogen.schemas.profiles import get_profile
 
 
-def test_nsclc_is_not_aliased_to_luad() -> None:
+def test_nsclc_uses_keyword_match_not_luad_register() -> None:
     assert infer_disease(
         "Which imaging features are associated with genomic alterations in Non-Small Cell Lung Cancer - NSCLC?"
-    ) == "nsclc"
+    ) == "non-small cell lung cancer"
     profile = get_profile("nsclc")
-    assert profile.name == "nsclc"
     assert profile.tcia_collection == "KEYWORD"
-    assert get_profile("lung").tcga_project == "TCGA-LUAD"
-
-
-def test_nsclc_request_enables_keyword_match() -> None:
+    assert profile.tcga_project == "KEYWORD"
     request = OrchestratorAgent().parse_and_plan(
         "Which imaging features are associated with specific genomic alterations in Non-Small Cell Lung Cancer - NSCLC?"
     )
-    assert request.disease == "nsclc"
     assert request.filters.get("keyword_match") is True
     assert "non-small" in str(request.filters.get("disease_query") or "").lower() or "nsclc" in str(
         request.filters.get("disease_query") or ""
@@ -52,6 +47,30 @@ def test_keyword_tiers_broaden_nsclc_to_lung_cancer() -> None:
     assert tiers[1].label == "broadened"
     assert broader_disease_query("non-small cell lung cancer") == "lung cancer"
     assert "lung" in tiers[1].keywords
+
+
+def test_brain_cancer_with_nbsp_uses_keyword_match() -> None:
+    q = "Which imaging features are associated with specific genomic alterations in\xa0brain cancer?"
+    assert infer_disease(q) == "brain cancer"
+    request = OrchestratorAgent().parse_and_plan(q)
+    assert request.disease == "brain_cancer"
+    assert request.filters.get("keyword_match") is True
+    assert "brain" in str(request.filters.get("disease_query") or "").lower()
+    assert request.modality == "MR"
+    profile = get_profile("brain cancer")
+    assert profile.tcia_collection == "KEYWORD"
+
+
+def test_bone_cancer_with_nbsp_infers_disease() -> None:
+    from agentic_radiogen.data.disease_match import keywords_from_query
+
+    q = "Which imaging features are associated with specific genomic alterations in\xa0bone cancer?"
+    assert infer_disease(q) == "bone cancer"
+    request = OrchestratorAgent().parse_and_plan(q)
+    assert request.disease == "bone_cancer"
+    assert request.filters.get("keyword_match") is True
+    assert request.filters.get("disease_query") == "bone cancer"
+    assert "sarc" in " ".join(keywords_from_query("bone cancer"))
 
 
 def test_format_dataset_extraction_note_broadened() -> None:

@@ -52,6 +52,15 @@ def _write_minimal_dicom(path: Path, value: float = 40.0) -> None:
 
 def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None:
     def tcia_get(_url: str, params=None):
+        if "getCollectionValues" in _url:
+            return [
+                {"Collection": "TCGA-LUAD"},
+                {"Collection": "TCGA-LUSC"},
+                {"Collection": "TCGA-BRCA"},
+            ]
+        collection = str((params or {}).get("Collection") or "")
+        if collection and collection != "TCGA-LUAD":
+            return []
         return [
             {
                 "PatientID": "TCGA-05-4244",
@@ -77,6 +86,29 @@ def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None
         return zip_path.read_bytes()
 
     def gdc_post(url: str, payload: dict):
+        if "/projects" in url:
+            return {
+                "data": {
+                    "hits": [
+                        {
+                            "project_id": "TCGA-LUAD",
+                            "name": "Lung Adenocarcinoma",
+                            "primary_site": ["Lung"],
+                            "disease_type": ["Adenomas and Adenocarcinomas"],
+                        }
+                    ]
+                }
+            }
+        if "facets" in payload:
+            return {
+                "data": {
+                    "aggregations": {
+                        "diagnoses.primary_diagnosis": {
+                            "buckets": [{"key": "Adenocarcinoma, NOS", "doc_count": 2}]
+                        }
+                    }
+                }
+            }
         if "ssm_occurrences" in url or "ssm.consequence" in str(payload):
             return {
                 "data": {
@@ -103,7 +135,8 @@ def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None
                         "submitter_id": "TCGA-05-4249",
                         "diagnoses": [{"vital_status": "Alive", "days_to_last_follow_up": 200}],
                     },
-                ]
+                ],
+                "pagination": {"total": 2},
             }
         }
 

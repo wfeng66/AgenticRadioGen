@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agentic_radiogen.schemas.profiles import get_profile
-
 
 @dataclass(frozen=True)
 class CatalogRecord:
@@ -39,6 +37,8 @@ class CatalogClient(Protocol):
         require_endpoint: str | None = None,
         disease_query: str | None = None,
         keyword_match: bool = False,
+        tcia_collection: str | None = None,
+        tcga_project: str | None = None,
     ) -> list[CatalogRecord]: ...
 
     def fetch_records(self, patient_ids: list[str]) -> list[CatalogRecord]: ...
@@ -140,13 +140,19 @@ class DemoCatalog:
         require_endpoint: str | None = None,
         disease_query: str | None = None,
         keyword_match: bool = False,
+        tcia_collection: str | None = None,
+        tcga_project: str | None = None,
     ) -> list[CatalogRecord]:
         self.query_count += 1
-        _ = disease_query
         _ = keyword_match
-        profile = get_profile(disease)
-        # Demo catalog only has lung/breast rows; map nsclc keyword disease onto lung.
-        wanted = "lung" if profile.name == "nsclc" else profile.name
+        _ = tcia_collection
+        _ = tcga_project
+        query = (disease_query or disease or "").lower().replace("_", " ")
+        # Demo only has lung/breast synthetic rows; map by closest keyword.
+        if any(token in query for token in ("breast", "brca", "mammary")):
+            wanted = "breast"
+        else:
+            wanted = "lung"
         hits: list[CatalogRecord] = []
         for rec in self._records.values():
             if rec.disease != wanted:
@@ -155,7 +161,6 @@ class DemoCatalog:
                 continue
             if genes and not any(g in rec.mutations for g in genes):
                 continue
-            # require_endpoint kept for API compatibility; OS is never a hard filter.
             _ = require_endpoint
             hits.append(rec)
         return hits

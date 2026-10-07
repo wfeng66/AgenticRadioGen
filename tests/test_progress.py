@@ -59,7 +59,14 @@ def test_live_catalog_records_intermediate(monkeypatch) -> None:
         extract_radiomics=False,
         show_progress=False,
     )
-    rows = catalog.query_metadata(disease="pancreas", modality="CT", genes=["KRAS"])
+    rows = catalog.query_metadata(
+        disease="pancreas",
+        modality="CT",
+        genes=["KRAS"],
+        keyword_match=False,
+        tcia_collection="CPTAC-PDA",
+        tcga_project="CPTAC-3",
+    )
     assert len(rows) == 1
     assert catalog.last_intermediate["tcia_series"] == 2
     assert catalog.last_intermediate["tcia_patients"] == 2

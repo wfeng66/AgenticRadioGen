@@ -41,6 +41,8 @@ class DataMatcherAgent:
                 require_endpoint=None,
                 disease_query=str(request.filters.get("disease_query") or request.disease),
                 keyword_match=bool(request.filters.get("keyword_match")),
+                tcia_collection=request.tcia_collection,
+                tcga_project=request.tcga_project,
             )
             if is_paired_record(record)
         ]

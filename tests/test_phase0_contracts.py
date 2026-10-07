@@ -22,74 +22,81 @@ from agentic_radiogen.schemas.profiles import (
 )
 
 
-def test_lung_and_breast_are_registered_profiles() -> None:
-    assert set(list_profiles()) >= {"lung", "breast"}
-    assert get_profile("lung").tcga_project == "TCGA-LUAD"
-    assert get_profile("breast").tcga_project == "TCGA-BRCA"
-    assert get_profile("LUNG").default_modality == "CT"
-    assert get_profile("breast").default_modality == "MR"
-
-
-def test_all_major_tcga_diseases_are_available() -> None:
+def test_profiles_are_keyword_plans_not_a_fixed_register() -> None:
+    lung = get_profile("lung cancer")
+    breast = get_profile("breast cancer")
+    assert lung.tcia_collection == "KEYWORD"
+    assert breast.tcia_collection == "KEYWORD"
+    assert lung.tcga_project == "KEYWORD"
+    assert lung.default_modality == "CT"
+    assert breast.default_modality == "MR"
+    assert lung.disease_query == "lung cancer"
+    assert "lung cancer" in list_profiles()
     assert "TCGA-GBM" in list_projects()
-    assert "CPTAC-3" in list_projects()
-    assert get_profile("pancreas").tcga_project == "CPTAC-3"
-    assert get_profile("pancreas").tcia_collection == "CPTAC-PDA"
-    assert get_profile("pdac").name == "pancreas"
-    assert get_profile("gbm").default_modality == "MR"
-    assert get_profile("TCGA-KIRC").name == "kidney"
-    assert len(list_profiles()) >= 30
 
 
-def test_profiles_are_not_hardcoded_to_one_disease() -> None:
-    assert LUNG_PROFILE.candidate_genes != BREAST_PROFILE.candidate_genes
-    assert "EGFR" in LUNG_PROFILE.candidate_genes
-    assert "ERBB2" in BREAST_PROFILE.candidate_genes
-    assert LUNG_PROFILE.tcia_collection != BREAST_PROFILE.tcia_collection
-
-
-def test_unknown_site_code_builds_dynamic_profile() -> None:
-    profile = get_profile("TCGA-XYZ")
-    assert profile.tcga_project == "TCGA-XYZ"
-    assert profile.tcia_collection == "TCGA-XYZ"
-    assert "TP53" in profile.candidate_genes
+def test_free_text_and_tcga_ids_use_keyword_matching() -> None:
+    brain = get_profile("brain cancer")
+    assert brain.name == "brain_cancer"
+    assert brain.tcia_collection == "KEYWORD"
+    assert brain.default_modality == "MR"
+    gbm = get_profile("glioblastoma")
+    assert gbm.tcia_collection == "KEYWORD"
+    assert "glioblastoma" in gbm.disease_query
+    xyz = get_profile("TCGA-XYZ")
+    assert xyz.tcia_collection == "KEYWORD"
+    assert "TCGA-XYZ" in xyz.disease_query.upper()
 
 
 def test_profile_overrides() -> None:
-    profile = get_profile("lung", modality="MR", genes=["EGFR", "ALK"])
+    profile = get_profile("lung cancer", modality="MR", genes=["EGFR", "ALK"])
     assert profile.default_modality == "MR"
     assert profile.candidate_genes == ["EGFR", "ALK"]
+    forced = get_profile(
+        "lung cancer",
+        tcga_project="TCGA-LUAD",
+        tcia_collection="TCGA-LUAD",
+    )
+    assert forced.tcga_project == "TCGA-LUAD"
+    assert forced.tcia_collection == "TCGA-LUAD"
 
 
-def test_orchestrator_infers_many_diseases() -> None:
-    assert infer_disease("IDH1 in glioblastoma MRI") == "gbm"
-    assert infer_disease("KRAS in pancreatic cancer CT") == "pancreas"
+def test_compat_lung_breast_profile_exports() -> None:
+    assert LUNG_PROFILE.tcia_collection == "KEYWORD"
+    assert BREAST_PROFILE.tcia_collection == "KEYWORD"
+    assert LUNG_PROFILE.default_modality == "CT"
+    assert BREAST_PROFILE.default_modality == "MR"
+
+
+def test_orchestrator_infers_disease_phrases() -> None:
+    assert infer_disease("IDH1 in glioblastoma MRI") == "glioblastoma"
+    assert infer_disease("KRAS in pancreatic cancer CT") == "pancreatic cancer"
     assert infer_disease("features in TCGA-OV") == "tcga-ov"
     req = OrchestratorAgent().parse_and_plan(
         "Which MRI features associate with IDH1 in glioblastoma?"
     )
-    assert req.disease == "gbm"
-    assert req.tcga_project == "TCGA-GBM"
+    assert req.disease == "glioblastoma"
+    assert req.tcga_project == "KEYWORD"
+    assert req.tcia_collection == "KEYWORD"
+    assert req.filters["keyword_match"] is True
     assert req.modality == "MR"
 
 
 def test_same_contracts_describe_lung_and_breast_requests() -> None:
     lung = DataRequest(
         question_id="q_lung",
-        disease="lung",
-        tcga_project=LUNG_PROFILE.tcga_project,
-        tcia_collection=LUNG_PROFILE.tcia_collection,
+        disease="lung_cancer",
+        tcga_project="KEYWORD",
+        tcia_collection="KEYWORD",
         modality="CT",
         genes=["EGFR"],
-        filters={"full_archive": False},
+        filters={"full_archive": False, "keyword_match": True},
         max_patients=12,
     )
     breast = lung.model_copy(
         update={
             "question_id": "q_breast",
-            "disease": "breast",
-            "tcga_project": BREAST_PROFILE.tcga_project,
-            "tcia_collection": BREAST_PROFILE.tcia_collection,
+            "disease": "breast_cancer",
             "modality": "MR",
             "genes": ["ERBB2"],
         }
@@ -111,9 +118,9 @@ def test_join_and_loop_contracts_exist() -> None:
     radio = RadiomicMatrix(patient_ids=["P1"], feature_names=["f"], features={"P1": {"f": 1.0}})
     geno = GenomicMatrix(patient_ids=["P1"], feature_names=["EGFR_mut"], features={"P1": {"EGFR_mut": 1}})
     lit = LiteratureContext(unverified=["f ~ EGFR_mut"])
-    question = ResearchQuestion(text="demo", disease="lung")
+    question = ResearchQuestion(text="demo", disease="lung_cancer")
     assert radio.feature_names and geno.feature_names
-    assert question.disease == "lung"
+    assert question.disease == "lung_cancer"
     assert "EGFR" in lit.unverified[0]
     directive = RefinementDirective.model_validate(
         {"action": "stop", "reason": "cap", "human_review_required": True}

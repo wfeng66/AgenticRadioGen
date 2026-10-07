@@ -55,7 +55,7 @@ def test_stage4_also_runs_for_breast() -> None:
         max_patients=16,
         max_iterations=3,
     )
-    assert payload["question"]["disease"] == "breast"
+    assert payload["question"]["disease"] == "breast_cancer"
     assert payload["stopped"] is True
     assert payload["auto_promoted"] == []
     shape = next(

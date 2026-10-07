@@ -13,8 +13,10 @@ def test_orchestrator_plans_lung_question_without_downloading(
     orchestrator: OrchestratorAgent, catalog: DemoCatalog
 ) -> None:
     request = orchestrator.parse_and_plan(LUNG_QUESTION)
-    assert request.disease == "lung"
-    assert request.tcga_project == "TCGA-LUAD"
+    assert request.disease == "lung_cancer"
+    assert request.tcga_project == "KEYWORD"
+    assert request.tcia_collection == "KEYWORD"
+    assert request.filters.get("keyword_match") is True
     assert request.modality == "CT"
     assert request.genes == []
     assert request.filters.get("gene_source") == "cohort"
@@ -38,12 +40,12 @@ def test_orchestrator_plans_breast_with_the_same_agent(
     orchestrator: OrchestratorAgent,
 ) -> None:
     request = orchestrator.parse_and_plan(BREAST_QUESTION)
-    assert request.disease == "breast"
-    assert request.tcga_project == "TCGA-BRCA"
+    assert request.disease == "breast_cancer"
+    assert request.tcga_project == "KEYWORD"
+    assert request.filters.get("keyword_match") is True
     assert request.modality == "MR"
     assert request.genes == []
     assert request.filters.get("gene_source") == "cohort"
-    assert request.tcia_collection != "TCGA-LUAD"
 
 
 def test_explicit_disease_needed_when_question_is_generic(
@@ -52,9 +54,9 @@ def test_explicit_disease_needed_when_question_is_generic(
     with pytest.raises(ValueError, match="Cannot infer disease"):
         orchestrator.parse("Which imaging features associate with mutations?")
     parsed = orchestrator.parse(
-        "Which imaging features associate with BRCA1?", disease="breast"
+        "Which imaging features associate with BRCA1?", disease="breast cancer"
     )
-    assert parsed.disease == "breast"
+    assert parsed.disease == "breast_cancer"
     assert parsed.genes == []
 
 

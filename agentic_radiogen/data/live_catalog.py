@@ -14,7 +14,6 @@ from agentic_radiogen.data.disease_match import (
 from agentic_radiogen.data.gdc_client import GdcCase, GdcClient
 from agentic_radiogen.data.tcia_client import TciaClient, TciaSeries
 from agentic_radiogen.imaging.radiomics_extract import extract_series_features
-from agentic_radiogen.schemas.profiles import get_profile
 from agentic_radiogen.util.progress import log, progress_enabled, progress_iter
 
 
@@ -63,34 +62,39 @@ class LiveCatalog:
         require_endpoint: str | None = None,
         disease_query: str | None = None,
         keyword_match: bool = False,
+        tcia_collection: str | None = None,
+        tcga_project: str | None = None,
     ) -> list[CatalogRecord]:
         self.query_count += 1
-        profile = get_profile(disease)
         verbose = self._progress_on()
         query = (
             disease_query
             or self.last_intermediate.get("disease_query")
-            or disease
+            or disease.replace("_", " ")
         )
+        forced_tcia = (tcia_collection or "").strip()
+        forced_gdc = (tcga_project or "").strip()
         use_keywords = bool(
             keyword_match
             or self.last_intermediate.get("keyword_match")
-            or profile.tcia_collection == "KEYWORD"
-            or profile.name == "nsclc"
+            or not forced_tcia
+            or forced_tcia.upper() == "KEYWORD"
+            or not forced_gdc
+            or forced_gdc.upper() == "KEYWORD"
         )
         _ = require_endpoint
         if use_keywords:
             return self._query_by_keywords(
-                disease=profile.name,
+                disease=disease,
                 modality=modality,
                 genes=genes,
                 disease_query=str(query),
                 verbose=verbose,
             )
         return self._query_fixed_profile(
-            profile_name=profile.name,
-            tcia_collection=profile.tcia_collection,
-            gdc_project=profile.tcga_project,
+            profile_name=disease,
+            tcia_collection=forced_tcia,
+            gdc_project=forced_gdc,
             modality=modality,
             genes=genes,
             verbose=verbose,
@@ -199,6 +203,7 @@ class LiveCatalog:
             [label for _, label in project_labels], keywords, min_score=min_score
         )
         label_to_pid = {label: pid for pid, label in project_labels}
+        all_project_ids = {pid for pid, _ in project_labels}
         gdc_projects: list[str] = []
         for match in ranked_projects[:12]:
             pid = label_to_pid.get(match.name)
@@ -223,13 +228,20 @@ class LiveCatalog:
                     enabled=verbose,
                 )
 
-        if tier.label == "broadened" and "lung" in tier.query.lower():
-            for pid in ("TCGA-LUAD", "TCGA-LUSC"):
-                if pid in collections and pid not in tcia_collections:
-                    tcia_collections.append(pid)
-            for pid in ("TCGA-LUAD", "TCGA-LUSC"):
-                if pid not in gdc_projects:
-                    gdc_projects.append(pid)
+        # Prefer GDC projects that share IDs with pairable TCIA collections (e.g. TCGA-LUAD).
+        # Those are the ones that can grow i&g; list them first and always include them.
+        pairable_gdc = [c for c in tcia_collections if c in all_project_ids]
+        for pid in reversed(pairable_gdc):
+            if pid in gdc_projects:
+                gdc_projects.remove(pid)
+            gdc_projects.insert(0, pid)
+            log(
+                f"[match] Prioritizing pairable GDC project {pid} (matches TCIA collection)",
+                enabled=verbose,
+            )
+        for pid in pairable_gdc:
+            if pid not in gdc_projects:
+                gdc_projects.insert(0, pid)
 
         if not tcia_collections or not gdc_projects:
             log(
@@ -248,10 +260,22 @@ class LiveCatalog:
             enabled=verbose,
         )
 
+        # Fetch pairable projects in full; other keyword hits only for imaging IDs
+        # (avoids huge non-pairable cohorts crowding out LUAD/LUSC cases).
+        primary_projects = [p for p in gdc_projects if p in pairable_gdc] or list(gdc_projects)
+        extra_projects = [p for p in gdc_projects if p not in primary_projects]
         gdc_cases = {
             case.submitter_id: case
-            for case in self.gdc.list_cases_multi(gdc_projects, submitter_ids=None)
+            for case in self.gdc.list_cases_multi(primary_projects, submitter_ids=None)
         }
+        if extra_projects and tcia_patients:
+            for case in self.gdc.list_cases_multi(
+                extra_projects,
+                submitter_ids=list(tcia_patients.keys()),
+            ):
+                gdc_cases.setdefault(case.submitter_id, case)
+        # Keep log / facet over the projects we actually used for pairing.
+        gdc_projects = primary_projects + [p for p in extra_projects if p not in primary_projects]
         diagnosis_facet = self.gdc.primary_diagnosis_counts(gdc_projects)
         matched_dx = sorted(dx for dx in diagnosis_facet if diagnosis_matches(dx, keywords))
         apply_dx_filter = tier.label == "specific" and matched_dx

@@ -55,6 +55,43 @@ def _requested_ids(payload: dict) -> list[str] | None:
 
 
 def _gdc_poster(_url: str, payload: dict) -> dict:
+    if "/projects" in _url:
+        return {
+            "data": {
+                "hits": [
+                    {
+                        "project_id": "TCGA-LUAD",
+                        "name": "Lung Adenocarcinoma",
+                        "primary_site": ["Lung"],
+                        "disease_type": ["Adenomas and Adenocarcinomas"],
+                    },
+                    {
+                        "project_id": "TCGA-LUSC",
+                        "name": "Lung Squamous Cell Carcinoma",
+                        "primary_site": ["Lung"],
+                        "disease_type": ["Squamous Cell Neoplasms"],
+                    },
+                    {
+                        "project_id": "TCGA-BRCA",
+                        "name": "Breast Invasive Carcinoma",
+                        "primary_site": ["Breast"],
+                        "disease_type": ["Ductal and Lobular Neoplasms"],
+                    },
+                ]
+            }
+        }
+    if "facets" in payload:
+        return {
+            "data": {
+                "aggregations": {
+                    "diagnoses.primary_diagnosis": {
+                        "buckets": [
+                            {"key": "Adenocarcinoma, NOS", "doc_count": 2},
+                        ]
+                    }
+                }
+            }
+        }
     if "ssm_occurrences" in _url or "ssm.consequence" in str(payload):
         return {
             "data": {
@@ -88,6 +125,18 @@ def _gdc_poster(_url: str, payload: dict) -> dict:
 
 
 def _tcia_getter(_url: str, params: dict) -> list[dict]:
+    if "getCollectionValues" in _url:
+        return [
+            {"Collection": "TCGA-LUAD"},
+            {"Collection": "TCGA-LUSC"},
+            {"Collection": "TCGA-BRCA"},
+            {"Collection": "NSCLC-Radiomics"},
+        ]
+    collection = str((params or {}).get("Collection") or "")
+    if collection and collection not in {"TCGA-LUAD", "TCGA-LUSC"}:
+        return []
+    if collection == "TCGA-LUSC":
+        return []
     return [
         {
             "PatientID": "TCGA-05-4244-01A",

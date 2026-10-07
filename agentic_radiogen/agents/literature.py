@@ -157,11 +157,20 @@ class LiteratureAgent:
         )
 
     @staticmethod
+    def _disease_tokens(disease: str) -> set[str]:
+        raw = disease.lower().replace("-", " ").replace("_", " ").strip()
+        parts = {raw, *raw.split()}
+        parts.discard("cancer")
+        parts.discard("tumor")
+        parts.discard("tumour")
+        return {p for p in parts if p}
+
+    @staticmethod
     def _tokens(imaging_feature: str, genomic_feature: str, disease: str) -> set[str]:
         parts = (
             imaging_feature.lower().replace("-", "_").split("_")
             + genomic_feature.lower().replace("-", "_").split("_")
-            + [disease.lower()]
+            + list(LiteratureAgent._disease_tokens(disease))
         )
         aliases = set(parts)
         if "erbb2" in aliases:
@@ -170,9 +179,9 @@ class LiteratureAgent:
 
     @staticmethod
     def _paper_matches(paper: Paper, tokens: set[str], disease: str) -> bool:
-        disease_l = disease.lower()
+        disease_tokens = LiteratureAgent._disease_tokens(disease)
         paper_diseases = paper.keywords & _DISEASE_TAGS
-        if paper_diseases and disease_l not in paper_diseases:
+        if paper_diseases and not (paper_diseases & disease_tokens):
             return False
         generic = {
             "original",
@@ -181,7 +190,6 @@ class LiteratureAgent:
             "mut",
             "expr",
             "cancer",
-            disease_l,
             "sphericity",
             "volume",
             "mean",
@@ -190,6 +198,7 @@ class LiteratureAgent:
             "skewness",
             "entropy",
             "glcm",
+            *disease_tokens,
         }
         return bool((paper.keywords & tokens) - generic)
 

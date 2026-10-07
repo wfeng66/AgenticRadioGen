@@ -9,6 +9,8 @@ GDC_BASE = "https://api.gdc.cancer.gov"
 _CASE_FIELDS = ",".join(
     [
         "submitter_id",
+        "primary_site",
+        "project.project_id",
         "diagnoses.vital_status",
         "diagnoses.days_to_death",
         "diagnoses.days_to_last_follow_up",
@@ -97,10 +99,15 @@ class GdcClient:
         self,
         project_ids: list[str],
         submitter_ids: list[str] | None = None,
-        size: int = 10000,
+        size: int = 20000,
         page_size: int = 1000,
     ) -> list[GdcCase]:
-        """List cases across one or more GDC projects."""
+        """List cases across one or more GDC projects.
+
+        Fetches each project separately so a shared page budget cannot drop
+        cases from pairable TCGA projects when many keyword-matched projects
+        are requested together.
+        """
         projects = [p for p in project_ids if p and p != "KEYWORD"]
         if not projects:
             return []
@@ -109,40 +116,53 @@ class GdcClient:
         wanted = set(submitter_ids) if submitter_ids is not None else None
         cases: list[GdcCase] = []
         seen: set[str] = set()
-        offset = 0
         page = max(1, min(page_size, size))
-        while offset < size:
-            payload = {
-                "filters": {
-                    "op": "in",
-                    "content": {"field": "project.project_id", "value": projects},
-                },
-                "fields": _CASE_FIELDS,
-                "size": min(page, size - offset),
-                "from": offset,
-            }
-            data = self._post(f"{self.base_url}/cases", payload)
-            hits = data.get("data", {}).get("hits", []) if isinstance(data, dict) else []
-            if not hits:
-                break
-            for hit in hits:
-                submitter = str(hit.get("submitter_id") or "")
-                if not submitter or submitter in seen:
-                    continue
-                if wanted is not None and submitter not in wanted:
-                    continue
-                seen.add(submitter)
-                cases.append(GdcCase(submitter_id=submitter, clinical=_clinical_from_hit(hit)))
-            total = (
-                ((data.get("data") or {}).get("pagination") or {}).get("total")
-                if isinstance(data, dict)
-                else None
-            )
-            offset += len(hits)
-            if total is not None and offset >= int(total):
-                break
-            if len(hits) < payload["size"]:
-                break
+        for project_id in projects:
+            offset = 0
+            while offset < size:
+                payload = {
+                    "filters": {
+                        "op": "in",
+                        "content": {
+                            "field": "project.project_id",
+                            "value": [project_id],
+                        },
+                    },
+                    "fields": _CASE_FIELDS,
+                    "size": min(page, size - offset),
+                    "from": offset,
+                }
+                data = self._post(f"{self.base_url}/cases", payload)
+                hits = (
+                    data.get("data", {}).get("hits", [])
+                    if isinstance(data, dict)
+                    else []
+                )
+                if not hits:
+                    break
+                for hit in hits:
+                    submitter = str(hit.get("submitter_id") or "")
+                    if not submitter or submitter in seen:
+                        continue
+                    if wanted is not None and submitter not in wanted:
+                        continue
+                    seen.add(submitter)
+                    cases.append(
+                        GdcCase(
+                            submitter_id=submitter,
+                            clinical=_clinical_from_hit(hit),
+                        )
+                    )
+                total = (
+                    ((data.get("data") or {}).get("pagination") or {}).get("total")
+                    if isinstance(data, dict)
+                    else None
+                )
+                offset += len(hits)
+                if total is not None and offset >= int(total):
+                    break
+                if len(hits) < payload["size"]:
+                    break
         return cases
 
     def mutation_flags(self, submitter_ids: list[str], genes: list[str]) -> dict[str, dict[str, int]]:

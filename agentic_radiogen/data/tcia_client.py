@@ -55,6 +55,23 @@ class TciaClient:
             f"{self.base_url}/getSeries",
             {"Collection": collection, "Modality": modality},
         )
+        return self._parse_series_rows(rows, default_collection=collection, modality=modality)
+
+    def list_series_for_patient(self, patient_id: str, modality: str) -> list[TciaSeries]:
+        """Look up imaging series for one patient ID across TCIA collections."""
+        rows = self._get(
+            f"{self.base_url}/getSeries",
+            {"PatientID": patient_id, "Modality": modality},
+        )
+        return self._parse_series_rows(rows, default_collection="", modality=modality)
+
+    def _parse_series_rows(
+        self,
+        rows: Any,
+        *,
+        default_collection: str,
+        modality: str,
+    ) -> list[TciaSeries]:
         if not isinstance(rows, list):
             return []
         series: list[TciaSeries] = []
@@ -70,7 +87,7 @@ class TciaClient:
                     patient_id=_submitter_id(patient_id),
                     series_uid=uid,
                     modality=str(row.get("Modality") or modality),
-                    collection=str(row.get("Collection") or collection),
+                    collection=str(row.get("Collection") or default_collection),
                 )
             )
         return series

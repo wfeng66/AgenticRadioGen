@@ -6,7 +6,13 @@ import numpy as np
 
 
 def load_dicom_series(series_dir: str | Path) -> np.ndarray:
-    """Load a DICOM series directory into a 3D float volume (z, y, x)."""
+    """Load a DICOM series directory into a 3D float volume (z, y, x).
+
+    RGB / multi-channel frames shaped (h, w, 3) are converted per-slice with
+    luminance (uses all channels). Never stack to (n, h, w, 3) or drop axes as
+    a fake (n, h, w) volume (that triggers TotalSegmentator 4D warnings and
+    wrong radiomics).
+    """
     try:
         import pydicom
     except ImportError as exc:
@@ -46,7 +52,7 @@ def load_dicom_series(series_dir: str | Path) -> np.ndarray:
         arr = ds.pixel_array.astype(np.float32)
         slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
         intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
-        slice2d = arr * slope + intercept
+        slice2d = _as_grayscale_hw(arr) * slope + intercept
         if target_shape is None:
             target_shape = slice2d.shape
         if slice2d.shape != target_shape:
@@ -54,7 +60,29 @@ def load_dicom_series(series_dir: str | Path) -> np.ndarray:
         slices.append(slice2d)
     if not slices:
         raise ValueError(f"No usable DICOM slices in {series_dir}")
-    return np.stack(slices, axis=0)
+    volume = np.stack(slices, axis=0)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume (n,h,w); got shape {volume.shape}")
+    return volume
+
+
+def _as_grayscale_hw(arr: np.ndarray) -> np.ndarray:
+    """Reduce a frame to (h, w) using (h, w, 3) RGB when present."""
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        # ITU-R BT.601 luminance from (h, w, 3[+A]); uses full RGB, not channel-0 only.
+        rgb = arr[..., :3]
+        return (
+            0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+        ).astype(np.float32)
+    if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
+        # Rare planar (c, h, w)
+        rgb = arr[:3]
+        return (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]).astype(np.float32)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        return arr[0]
+    raise ValueError(f"Unsupported DICOM pixel array shape {arr.shape}; expected (h,w) or (h,w,3)")
 
 
 def _resize_slice(slice2d: np.ndarray, target: tuple[int, int]) -> np.ndarray:

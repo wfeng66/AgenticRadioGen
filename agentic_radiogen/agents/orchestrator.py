@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import re
 
+from agentic_radiogen.data.disease_match import (
+    extract_disease_query,
+    normalize_question_text,
+)
 from agentic_radiogen.schemas.contracts import DataRequest, ResearchQuestion
-from agentic_radiogen.schemas.profiles import disease_hint_map, get_profile
-from agentic_radiogen.data.disease_match import extract_disease_query
+from agentic_radiogen.schemas.profiles import get_profile
 
 
 _ENDPOINT_HINTS = {
@@ -14,37 +17,13 @@ _ENDPOINT_HINTS = {
     "subtype": ("subtype", "molecular subtype"),
 }
 
-# Prefer specific phrases over short aliases (e.g. NSCLC must not collapse to "lung"/LUAD).
-_SPECIFIC_DISEASE_HINTS: tuple[tuple[str, str], ...] = (
-    ("non-small cell lung cancer", "nsclc"),
-    ("non small cell lung cancer", "nsclc"),
-    ("non-small-cell lung cancer", "nsclc"),
-    ("non-small cell lung", "nsclc"),
-    ("non small cell lung", "nsclc"),
-    ("non-small cell", "nsclc"),
-    ("non small cell", "nsclc"),
-    ("nsclc", "nsclc"),
-)
-
 
 def infer_disease(text: str) -> str | None:
-    """Infer canonical disease from question text using the full TCGA alias map."""
-    lowered = text.lower()
+    """Infer a disease query phrase from free text (no disease register)."""
+    lowered = normalize_question_text(text).lower()
     match = re.search(r"\btcga-([a-z0-9]+)\b", lowered)
     if match:
         return f"tcga-{match.group(1)}"
-    for hint, name in _SPECIFIC_DISEASE_HINTS:
-        if re.search(rf"(?<![a-z0-9_-]){re.escape(hint)}(?![a-z0-9_-])", lowered):
-            return name
-    ranked: list[tuple[int, str]] = []
-    for name, hints in disease_hint_map().items():
-        for hint in hints:
-            if re.search(rf"(?<![a-z0-9_-]){re.escape(hint)}(?![a-z0-9_-])", lowered):
-                ranked.append((len(hint), name))
-                break
-    if ranked:
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        return ranked[0][1]
     return extract_disease_query(text)
 
 
@@ -72,14 +51,15 @@ class OrchestratorAgent:
         self.genes = genes
 
     def parse(self, text: str, disease: str | None = None) -> ResearchQuestion:
+        text = normalize_question_text(text)
         inferred = infer_disease(text)
-        resolved = (disease or inferred or "").strip().lower()
+        resolved = (disease or inferred or "").strip()
         if not resolved and self.tcga_project:
-            resolved = self.tcga_project.strip().lower()
+            resolved = self.tcga_project.strip()
         if not resolved:
             raise ValueError(
-                "Cannot infer disease from the question. Pass --disease (e.g. gbm, pancreas, breast) "
-                "or --tcga-project (e.g. TCGA-GBM)."
+                "Cannot infer disease from the question. Name a disease in the question "
+                "(e.g. 'brain cancer', 'NSCLC'), or pass --disease / --tcga-project."
             )
         profile = get_profile(
             resolved,
@@ -90,7 +70,7 @@ class OrchestratorAgent:
         return ResearchQuestion(
             text=text,
             disease=profile.name,
-            genes=[],  # gene panel is chosen at plan/fetch time (cohort vs literature)
+            genes=[],
             endpoints=[
                 name
                 for name, hints in _ENDPOINT_HINTS.items()
@@ -101,11 +81,20 @@ class OrchestratorAgent:
 
     def plan(self, question: ResearchQuestion) -> DataRequest:
         profile = get_profile(
-            question.disease,
+            question.disease.replace("_", " "),
             tcga_project=self.tcga_project,
             tcia_collection=self.tcia_collection,
             modality=self.modality or question.modality,
         )
+        # Preserve disease_query extracted from the full question when richer.
+        from_text = extract_disease_query(question.text)
+        if from_text:
+            profile = get_profile(
+                from_text,
+                tcga_project=self.tcga_project,
+                tcia_collection=self.tcia_collection,
+                modality=self.modality or question.modality,
+            )
         mode = self._gene_mode(self.genes)
         if mode == "literature":
             genes = list(profile.candidate_genes)
@@ -118,13 +107,15 @@ class OrchestratorAgent:
         clinical_fields = ["OS_time", "OS_event"] if "OS" in question.endpoints else []
         if "subtype" in question.endpoints:
             clinical_fields.append("subtype")
-        disease_query = extract_disease_query(question.text) or question.disease
-        keyword_match = profile.tcia_collection == "KEYWORD" or profile.name == "nsclc"
+        disease_query = profile.disease_query or from_text or question.disease.replace("_", " ")
+        # Always match disease text to TCIA/GDC unless both sources are explicitly overridden.
+        forced = bool(self.tcga_project and self.tcia_collection)
+        keyword_match = not forced
         return DataRequest(
             question_id=_question_id(question.text, profile.name),
             disease=profile.name,
-            tcga_project=profile.tcga_project,
-            tcia_collection=profile.tcia_collection,
+            tcga_project=("KEYWORD" if keyword_match else profile.tcga_project),
+            tcia_collection=("KEYWORD" if keyword_match else profile.tcia_collection),
             modality=question.modality or profile.default_modality,
             genes=genes,
             clinical_fields=clinical_fields,

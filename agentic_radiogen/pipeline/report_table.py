@@ -174,14 +174,26 @@ def print_patient_table(table: dict[str, Any], *, max_rows: int = 12) -> None:
         print(f"Radiomic features ({len(table['radiomic_feature_names'])}): "
               f"{', '.join(table['radiomic_feature_names'])}")
     if table.get("genomic_feature_names"):
-        print(f"Genomic features : {', '.join(table['genomic_feature_names'])}")
+        names = table["genomic_feature_names"]
+        preview = ", ".join(names[:8])
+        more = f" ... (+{len(names) - 8} more)" if len(names) > 8 else ""
+        print(f"Genomic features ({len(names)}): {preview}{more}")
     prevalence = mutation_prevalence(table)
     if prevalence:
-        print("Mutation prevalence:")
-        for gene in sorted(prevalence):
+        # Only summarize; full per-gene counts stay in JSON / CSV.
+        altered_genes = sorted(
+            g for g, c in prevalence.items() if int(c.get("altered", 0)) > 0
+        )
+        print(
+            f"Mutation prevalence: {len(altered_genes)} genes with ≥1 altered patient "
+            f"(of {len(prevalence)} tested); details in --out JSON"
+        )
+        for gene in altered_genes[:12]:
             alt = prevalence[gene]["altered"]
             wt = prevalence[gene]["wildtype"]
             print(f"  {gene}: {alt} altered / {alt + wt} ({100.0 * alt / max(1, alt + wt):.0f}%)")
+        if len(altered_genes) > 12:
+            print(f"  ... {len(altered_genes) - 12} more genes with mutations in JSON")
     patients = table.get("patients") or []
     if not patients:
         print("  (no patients)")
@@ -191,11 +203,12 @@ def print_patient_table(table: dict[str, Any], *, max_rows: int = 12) -> None:
     for row in patients[:max_rows]:
         geno = row.get("genomic_alterations") or {}
         altered = geno.get("altered_genes") or []
-        mutations = geno.get("mutations") or {}
-        flags = ", ".join(f"{g}={int(v)}" for g, v in mutations.items()) or "none"
-        alt_txt = ", ".join(altered) if altered else "none"
+        # Do not print thousands of GENE=0 flags; only list mutated genes.
+        alt_txt = ", ".join(altered[:12]) if altered else "none"
+        if len(altered) > 12:
+            alt_txt += f", ... (+{len(altered) - 12} more)"
         n_feat = len(row.get("radiomic_features") or {})
-        print(f"  {row['patient_id']}: altered=[{alt_txt}]; {flags}; radiomics={n_feat} features")
+        print(f"  {row['patient_id']}: altered=[{alt_txt}]; radiomics={n_feat} features")
     if len(patients) > max_rows:
         print(f"  ... {len(patients) - max_rows} more patients in JSON patient_table.patients")
 

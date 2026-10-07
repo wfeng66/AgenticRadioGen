@@ -669,12 +669,16 @@ def main() -> None:
     if args.list_diseases:
         from agentic_radiogen.schemas.profiles import get_profile, list_profiles, list_projects
 
-        print("Built-in diseases (alias -> project):")
+        print("No fixed disease register. The agent matches your question to TCIA/GDC by keywords.")
+        print("Example disease phrases:")
         for name in list_profiles():
             profile = get_profile(name)
-            print(f"  {name:24s} {profile.tcga_project:12s} modality={profile.default_modality}")
-        print(f"Projects: {', '.join(list_projects())}")
-        print("Any other TCGA-* id also works dynamically via --disease TCGA-XXXX or --tcga-project.")
+            print(
+                f"  {name:28s} modality={profile.default_modality:3s} "
+                f"(sources discovered at runtime)"
+            )
+        print(f"Example projects often matched: {', '.join(list_projects())}")
+        print("Override with --tcga-project / --tcia-collection if you need a fixed pair.")
         return
     download_dicom = not args.no_dicom
     common = dict(
