@@ -54,17 +54,23 @@ def _threshold_mask(volume: np.ndarray) -> np.ndarray:
     finite = volume[np.isfinite(volume)]
     if finite.size == 0:
         return np.ones(volume.shape, dtype=bool)
-    # Body vs air
+    # Body vs air (CT HU heuristic). Tiny synthetic volumes skip the air cut.
     body = volume > -500
-    if body.sum() < 100:
+    if body.sum() == 0:
         body = volume > np.percentile(finite, 10)
+    if body.sum() == 0:
+        return np.isfinite(volume)
     roi_vals = volume[body]
-    if roi_vals.size == 0:
-        return body
-    lo = np.percentile(roi_vals, 60)
-    hi = np.percentile(roi_vals, 99)
-    mask = body & (volume >= lo) & (volume <= hi)
-    if mask.sum() < 50:
+    lo = float(np.percentile(roi_vals, 60))
+    hi = float(np.percentile(roi_vals, 99))
+    if hi < lo:
+        lo, hi = hi, lo
+    # Inclusive band; expand slightly when the ROI is nearly constant.
+    if hi - lo < 1e-6:
+        mask = body
+    else:
+        mask = body & (volume >= lo) & (volume <= hi)
+    if mask.sum() < max(8, int(0.01 * body.sum())):
         mask = body
     return mask
 

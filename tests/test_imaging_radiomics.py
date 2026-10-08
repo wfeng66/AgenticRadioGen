@@ -21,6 +21,16 @@ def test_threshold_radiomics_from_synthetic_volume() -> None:
     assert features["original_shape_VoxelVolume"] > 0
     assert "original_glcm_Entropy" in features
     assert summary["size"] == features["original_shape_VoxelVolume"]
+    # PyRadiomics full set: shape + firstorder + GLCM/GLRLM/GLSZM/GLDM/NGTDM
+    analysis = {k: v for k, v in features.items() if not str(k).startswith("meta_")}
+    assert len(analysis) >= 100
+    assert any(k.startswith("original_shape_") for k in analysis)
+    assert any(k.startswith("original_firstorder_") for k in analysis)
+    assert any(k.startswith("original_glcm_") for k in analysis)
+    assert any(k.startswith("original_glrlm_") for k in analysis)
+    assert any(k.startswith("original_glszm_") for k in analysis)
+    assert any(k.startswith("original_gldm_") for k in analysis)
+    assert any(k.startswith("original_ngtdm_") for k in analysis)
     mask, backend = make_roi_mask(volume)
     assert mask.any()
     assert backend == "threshold_cpu"

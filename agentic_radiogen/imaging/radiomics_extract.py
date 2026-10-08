@@ -1,6 +1,10 @@
+"""Radiomics via PyRadiomics (shape, first-order, GLCM/GLRLM/GLSZM/GLDM/NGTDM)."""
+
 from __future__ import annotations
 
 import json
+import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +14,8 @@ from agentic_radiogen.imaging.dicom_io import load_dicom_series
 from agentic_radiogen.imaging.segment import make_roi_mask
 
 _RADIOMICS_CACHE = "radiomics_features.json"
+_CACHE_VERSION = 3  # PyRadiomics-backed feature set
+logger = logging.getLogger(__name__)
 
 
 def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -> dict[str, Any]:
@@ -18,7 +24,11 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
     if use_cache and cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, dict) and cached.get("features"):
+            if (
+                isinstance(cached, dict)
+                and cached.get("features")
+                and int(cached.get("version", 0)) >= _CACHE_VERSION
+            ):
                 return {
                     "features": {k: float(v) for k, v in cached["features"].items()},
                     "volume_summary": {
@@ -43,7 +53,11 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
         try:
             cache_path.write_text(
                 json.dumps(
-                    {"features": features, "volume_summary": summary},
+                    {
+                        "version": _CACHE_VERSION,
+                        "features": features,
+                        "volume_summary": summary,
+                    },
                     indent=2,
                 ),
                 encoding="utf-8",
@@ -54,76 +68,88 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
 
 
 def extract_radiomics_from_volume(volume: np.ndarray) -> tuple[dict[str, float], dict[str, float]]:
-    """Classical radiomics-style features (not CNN embeddings).
+    """Extract classical radiomics with PyRadiomics.
 
-    Uses TotalSegmentator on GPU when available; otherwise a CPU threshold ROI.
-    Feature extraction itself is NumPy/CPU (PyRadiomics-compatible names).
+    Segments an ROI (TotalSegmentator when available, else intensity threshold),
+    then calls ``RadiomicsFeatureExtractor`` with all feature classes enabled.
     """
     mask, backend = make_roi_mask(volume)
-    vals = volume[mask]
-    if vals.size == 0:
-        vals = volume[np.isfinite(volume)].ravel()
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
+    if not np.asarray(mask).any():
         raise ValueError("Volume has no finite voxels for radiomics")
 
-    # Downsample mid-slice for cheap GLCM-like entropy
-    z = volume.shape[0] // 2
-    slice2d = volume[z]
-    mask2d = mask[z] if mask.ndim == 3 else mask
-    entropy = _slice_entropy(slice2d, mask2d)
-    sphericity = _sphericity_proxy(mask)
+    features = _pyradiomics_features(volume, mask)
+    if "original_firstorder_StandardDeviation" in features:
+        features["original_firstorder_Std"] = features[
+            "original_firstorder_StandardDeviation"
+        ]
+    # Legacy alias used by demo catalog / older tests
+    if (
+        "original_glcm_Entropy" not in features
+        and "original_glcm_JointEntropy" in features
+    ):
+        features["original_glcm_Entropy"] = features["original_glcm_JointEntropy"]
 
-    features = {
-        "original_firstorder_Mean": float(np.mean(vals)),
-        "original_firstorder_Std": float(np.std(vals)),
-        "original_firstorder_Median": float(np.median(vals)),
-        "original_firstorder_Skewness": float(_skewness(vals)),
-        "original_glcm_Entropy": float(entropy),
-        "original_shape_Sphericity": float(sphericity),
-        "original_shape_VoxelVolume": float(mask.sum()),
-    }
     summary = {
-        "mean": features["original_firstorder_Mean"],
-        "std": features["original_firstorder_Std"],
-        "size": features["original_shape_VoxelVolume"],
+        "mean": features.get("original_firstorder_Mean", 0.0),
+        "std": features.get(
+            "original_firstorder_StandardDeviation",
+            features.get("original_firstorder_Std", 0.0),
+        ),
+        "size": features.get("original_shape_VoxelVolume", float(np.asarray(mask).sum())),
         "segmentation_backend": 1.0 if backend.startswith("totalsegmentator") else 0.0,
+        "n_features": float(len([k for k in features if not k.startswith("meta_")])),
     }
-    # Keep backend name accessible via imaging metadata path
     features["meta_segmentation_is_gpu_or_ts"] = summary["segmentation_backend"]
     return features, summary
 
 
-def _skewness(vals: np.ndarray) -> float:
-    mu = float(np.mean(vals))
-    sigma = float(np.std(vals))
-    if sigma < 1e-8:
-        return 0.0
-    return float(np.mean(((vals - mu) / sigma) ** 3))
+@lru_cache(maxsize=1)
+def _extractor():
+    try:
+        from radiomics.featureextractor import RadiomicsFeatureExtractor
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "PyRadiomics is required for radiomics extraction. "
+            "Install with: pip install pyradiomics SimpleITK"
+        ) from exc
+
+    # Quiet PyRadiomics' verbose logging of every feature.
+    logging.getLogger("radiomics").setLevel(logging.ERROR)
+    extractor = RadiomicsFeatureExtractor()
+    extractor.enableAllFeatures()
+    # Bin width suitable for CT HU ranges; override if needed via settings later.
+    extractor.settings["binWidth"] = 25
+    extractor.settings["normalize"] = False
+    return extractor
 
 
-def _slice_entropy(slice2d: np.ndarray, mask2d: np.ndarray, bins: int = 32) -> float:
-    vals = slice2d[mask2d] if mask2d.any() else slice2d.ravel()
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return 0.0
-    hist, _ = np.histogram(vals, bins=bins)
-    p = hist.astype(np.float64)
-    p = p[p > 0]
-    p /= p.sum()
-    return float(-(p * np.log2(p)).sum())
+def _pyradiomics_features(volume: np.ndarray, mask: np.ndarray) -> dict[str, float]:
+    import SimpleITK as sitk
 
+    vol = np.ascontiguousarray(volume, dtype=np.float32)
+    msk = np.ascontiguousarray(mask.astype(np.uint8))
+    if msk.sum() < 2:
+        raise ValueError("ROI mask too small for PyRadiomics")
+    # PyRadiomics requires background (0) and label (1); a full-volume ROI is rejected.
+    if msk.min() == msk.max() == 1:
+        msk = msk.copy()
+        msk.flat[0] = 0
 
-def _sphericity_proxy(mask: np.ndarray) -> float:
-    vol = float(mask.sum())
-    if vol <= 0:
-        return 0.0
-    # Surface approximation via binary gradient magnitude count
-    surface = 0.0
-    for axis in range(mask.ndim):
-        diff = np.diff(mask.astype(np.int8), axis=axis)
-        surface += float(np.abs(diff).sum())
-    surface = max(surface, 1.0)
-    # Ideal sphere: 36*pi*V^2 / A^3  -> use softer proxy in [0, 1]
-    ratio = (36.0 * np.pi * (vol**2)) / (surface**3 + 1e-8)
-    return float(np.clip(ratio ** (1.0 / 3.0), 0.0, 1.0))
+    image = sitk.GetImageFromArray(vol)
+    label = sitk.GetImageFromArray(msk)
+    # Identical geometry (unit spacing); real DICOM spacing can be wired later.
+    image.SetSpacing((1.0, 1.0, 1.0))
+    label.SetSpacing((1.0, 1.0, 1.0))
+
+    result = _extractor().execute(image, label, label=1)
+    features: dict[str, float] = {}
+    for key, value in result.items():
+        if not str(key).startswith("original_"):
+            continue
+        try:
+            features[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    if not features:
+        raise ValueError("PyRadiomics returned no original_* features")
+    return features

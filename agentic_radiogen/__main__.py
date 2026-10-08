@@ -282,12 +282,18 @@ def _orchestrator(
     tcia_collection: str | None = None,
     modality: str | None = None,
     genes: str | None = None,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> OrchestratorAgent:
     return OrchestratorAgent(
         tcga_project=tcga_project,
         tcia_collection=tcia_collection,
         modality=modality,
         genes=genes,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -306,6 +312,9 @@ def _run_matcher(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> tuple[dict[str, Any], ImageBundle | None, OmicsBundle | None]:
     catalog = build_catalog(catalog_name, download_dicom=download_dicom)
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
@@ -314,6 +323,9 @@ def _run_matcher(
         tcia_collection=tcia_collection,
         modality=modality,
         genes=genes,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
     request = orchestrator.parse_and_plan(question_text, disease=disease)
     request = request.model_copy(
@@ -323,7 +335,13 @@ def _run_matcher(
             "min_altered": min_altered,
         }
     )
-    matcher = DataMatcherAgent(catalog, gate=gate)
+    matcher = DataMatcherAgent(
+        catalog,
+        gate=gate,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+    )
     preview = matcher.preview(request)
     payload: dict[str, Any] = {
         "stage": stage,
@@ -373,6 +391,9 @@ def run_stage1(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict[str, Any]:
     payload, _, _ = _run_matcher(
         question_text,
@@ -388,6 +409,9 @@ def run_stage1(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
     return payload
 
@@ -406,6 +430,9 @@ def run_stage2(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -421,6 +448,9 @@ def run_stage2(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
     payload["joined"] = False
     if images is None or omics is None:
@@ -464,6 +494,9 @@ def run_stage3(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -479,6 +512,9 @@ def run_stage3(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
     payload["joined"] = True
     payload["looped"] = False
@@ -526,6 +562,9 @@ def run_stage4(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    use_llm: bool | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
@@ -537,8 +576,17 @@ def run_stage4(
             tcia_collection=tcia_collection,
             modality=modality,
             genes=genes,
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
         ),
-        matcher=DataMatcherAgent(catalog, gate=gate),
+        matcher=DataMatcherAgent(
+            catalog,
+            gate=gate,
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        ),
         imaging=ImagingRadiomicsAgent(),
         genomics=GenomicsAgent(),
         stats=StatisticalCriticalAgent(),
@@ -637,6 +685,29 @@ def main() -> None:
         "--genes auto: literature/profile candidate genes only.",
     )
     parser.add_argument(
+        "--llm",
+        action="store_true",
+        default=None,
+        help="Force Orchestrator + DataMatcher to use a free-tier LLM "
+        "(Gemini 3.8 Flash by default). Requires GEMINI_API_KEY or GROQ_API_KEY.",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Force rule-based Orchestrator (no LLM calls).",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=("gemini", "groq"),
+        default=None,
+        help="LLM provider for Orchestrator. Default: gemini if GEMINI_API_KEY is set, else groq.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Override model id (default: gemini-3.8-flash or openai/gpt-oss-120b).",
+    )
+    parser.add_argument(
         "--list-diseases",
         action="store_true",
         help="Print built-in TCGA disease aliases / projects and exit.",
@@ -681,6 +752,12 @@ def main() -> None:
         print("Override with --tcga-project / --tcia-collection if you need a fixed pair.")
         return
     download_dicom = not args.no_dicom
+    if args.no_llm:
+        use_llm: bool | None = False
+    elif args.llm:
+        use_llm = True
+    else:
+        use_llm = None  # auto: LLM when GEMINI_API_KEY / GROQ_API_KEY is set
     common = dict(
         disease=args.disease,
         catalog_name=args.catalog,
@@ -691,6 +768,9 @@ def main() -> None:
         tcia_collection=args.tcia_collection,
         modality=args.modality,
         genes=args.genes,
+        use_llm=use_llm,
+        llm_provider=args.llm_provider,
+        llm_model=args.llm_model,
     )
 
     try:

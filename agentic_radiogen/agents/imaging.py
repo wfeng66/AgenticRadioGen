@@ -77,9 +77,12 @@ class ImagingRadiomicsAgent:
             }
         if path.suffix == ".npy":
             volume = np.load(path)
+            from agentic_radiogen.imaging.radiomics_extract import extract_radiomics_from_volume
+
+            features, _ = extract_radiomics_from_volume(volume)
             return {
-                "original_firstorder_Mean": float(np.mean(volume)),
-                "original_firstorder_Std": float(np.std(volume)),
-                "original_shape_VoxelVolume": float(volume.size),
+                k: float(v)
+                for k, v in features.items()
+                if not str(k).startswith("meta_")
             }
         raise ValueError(f"Unsupported imaging path: {local_path}")

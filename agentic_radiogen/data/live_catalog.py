@@ -41,12 +41,26 @@ class LiveCatalog:
         min_altered: int = 1,
         disease_query: str | None = None,
         keyword_match: bool = False,
+        preferred_tcia_collections: list[str] | None = None,
+        preferred_gdc_projects: list[str] | None = None,
+        preferred_keywords: list[str] | None = None,
+        matcher_backend: str | None = None,
     ) -> None:
         self.last_intermediate["max_genes"] = max_genes
         self.last_intermediate["min_altered"] = int(min_altered)
         if disease_query:
             self.last_intermediate["disease_query"] = disease_query
         self.last_intermediate["keyword_match"] = bool(keyword_match)
+        if preferred_tcia_collections is not None:
+            self.last_intermediate["preferred_tcia_collections"] = list(
+                preferred_tcia_collections
+            )
+        if preferred_gdc_projects is not None:
+            self.last_intermediate["preferred_gdc_projects"] = list(preferred_gdc_projects)
+        if preferred_keywords is not None:
+            self.last_intermediate["preferred_keywords"] = list(preferred_keywords)
+        if matcher_backend:
+            self.last_intermediate["matcher_backend"] = matcher_backend
 
     def _progress_on(self) -> bool:
         if self.show_progress is None:
@@ -109,6 +123,41 @@ class LiveCatalog:
         disease_query: str,
         verbose: bool,
     ) -> list[CatalogRecord]:
+        preferred_tcia = list(self.last_intermediate.get("preferred_tcia_collections") or [])
+        preferred_gdc = list(self.last_intermediate.get("preferred_gdc_projects") or [])
+        preferred_kw = list(self.last_intermediate.get("preferred_keywords") or [])
+        if preferred_tcia or preferred_gdc:
+            log(
+                "[match] Using LLM-selected sources: "
+                f"TCIA={preferred_tcia or '(none)'} GDC={preferred_gdc or '(none)'}",
+                enabled=verbose,
+            )
+            keywords = preferred_kw or keywords_from_query(disease_query)
+            bundle = self._resolve_selected_sources(
+                tcia_collections=preferred_tcia,
+                gdc_projects=preferred_gdc,
+                keywords=keywords,
+                modality=modality,
+                verbose=verbose,
+                match_tier="llm",
+            )
+            return self._build_paired_records(
+                disease=disease,
+                modality=modality,
+                genes=genes,
+                tcia_patients=bundle["tcia_patients"],
+                gdc_cases=bundle["gdc_cases"],
+                tcia_collections=bundle["tcia_collections"],
+                gdc_projects=bundle["gdc_projects"],
+                disease_query=disease_query,
+                keywords=keywords,
+                matched_diagnoses=bundle["matched_diagnoses"],
+                match_tier="llm",
+                broadened_from=None,
+                tier_query=disease_query,
+                verbose=verbose,
+            )
+
         tiers = keyword_match_tiers(disease_query)
         chosen: KeywordTier | None = None
         bundle: dict | None = None
@@ -228,8 +277,44 @@ class LiveCatalog:
                     enabled=verbose,
                 )
 
-        # Prefer GDC projects that share IDs with pairable TCIA collections (e.g. TCGA-LUAD).
-        # Those are the ones that can grow i&g; list them first and always include them.
+        return self._resolve_selected_sources(
+            tcia_collections=tcia_collections,
+            gdc_projects=gdc_projects,
+            keywords=keywords,
+            modality=modality,
+            verbose=verbose,
+            match_tier=tier.label,
+            all_project_ids=all_project_ids,
+            collections=collections,
+        )
+
+    def _resolve_selected_sources(
+        self,
+        *,
+        tcia_collections: list[str],
+        gdc_projects: list[str],
+        keywords: list[str],
+        modality: str,
+        verbose: bool,
+        match_tier: str,
+        all_project_ids: set[str] | None = None,
+        collections: list[str] | None = None,
+    ) -> dict:
+        """Load imaging + genomics patients for selected sources and prepare intersection inputs."""
+        if collections is None:
+            collections = self.tcia.list_collections()
+        collection_set = set(collections)
+        if all_project_ids is None:
+            projects_meta = self.gdc.list_projects()
+            all_project_ids = {
+                str(p.get("project_id") or "")
+                for p in projects_meta
+                if p.get("project_id")
+            }
+
+        tcia_collections = [c for c in tcia_collections if c in collection_set]
+        gdc_projects = [p for p in gdc_projects if p in all_project_ids]
+
         pairable_gdc = [c for c in tcia_collections if c in all_project_ids]
         for pid in reversed(pairable_gdc):
             if pid in gdc_projects:
@@ -242,10 +327,12 @@ class LiveCatalog:
         for pid in pairable_gdc:
             if pid not in gdc_projects:
                 gdc_projects.insert(0, pid)
+            if pid in collection_set and pid not in tcia_collections:
+                tcia_collections.insert(0, pid)
 
         if not tcia_collections or not gdc_projects:
             log(
-                "[match] WARNING: keyword match found incomplete sources "
+                "[match] WARNING: selected sources incomplete "
                 f"(tcia={tcia_collections}, gdc={gdc_projects})",
                 enabled=verbose,
             )
@@ -255,13 +342,11 @@ class LiveCatalog:
             for item in self._series(coll, modality):
                 tcia_patients.setdefault(item.patient_id, item)
         log(
-            f"[match] (1) Imaging patients with {modality} in keyword-matched TCIA "
+            f"[match] (1) Imaging patients with {modality} in selected TCIA "
             f"[{', '.join(tcia_collections) or 'none'}]: {len(tcia_patients)}",
             enabled=verbose,
         )
 
-        # Fetch pairable projects in full; other keyword hits only for imaging IDs
-        # (avoids huge non-pairable cohorts crowding out LUAD/LUSC cases).
         primary_projects = [p for p in gdc_projects if p in pairable_gdc] or list(gdc_projects)
         extra_projects = [p for p in gdc_projects if p not in primary_projects]
         gdc_cases = {
@@ -274,11 +359,9 @@ class LiveCatalog:
                 submitter_ids=list(tcia_patients.keys()),
             ):
                 gdc_cases.setdefault(case.submitter_id, case)
-        # Keep log / facet over the projects we actually used for pairing.
         gdc_projects = primary_projects + [p for p in extra_projects if p not in primary_projects]
         diagnosis_facet = self.gdc.primary_diagnosis_counts(gdc_projects)
         matched_dx = sorted(dx for dx in diagnosis_facet if diagnosis_matches(dx, keywords))
-        apply_dx_filter = tier.label == "specific" and matched_dx
         if matched_dx:
             log(
                 f"[match] GDC primary_diagnosis values matching keywords "
@@ -286,36 +369,67 @@ class LiveCatalog:
                 f"{'...' if len(matched_dx) > 8 else ''}",
                 enabled=verbose,
             )
-        if apply_dx_filter:
+        apply_dx_filter = (
+            match_tier == "specific"
+            and bool(matched_dx)
+            and not pairable_gdc
+        )
+        if pairable_gdc and matched_dx:
+            log(
+                "[match] Pairable GDC project(s) "
+                f"{', '.join(pairable_gdc)}: keeping full project cohort "
+                "(diagnosis keywords are informational only)",
+                enabled=verbose,
+            )
+        elif apply_dx_filter:
             matched_set = {d.lower() for d in matched_dx}
+            before = dict(gdc_cases)
             filtered = {
                 pid: case
                 for pid, case in gdc_cases.items()
                 if str(case.clinical.get("subtype") or "").lower() in matched_set
             }
             if filtered:
-                gdc_cases = filtered
+                if (
+                    tcia_patients
+                    and not (set(filtered) & set(tcia_patients))
+                    and (set(before) & set(tcia_patients))
+                ):
+                    log(
+                        "[match] Diagnosis filter would drop all paired IDs "
+                        f"({len(set(before) & set(tcia_patients))} available); "
+                        "keeping unfiltered GDC cohort",
+                        enabled=verbose,
+                    )
+                else:
+                    gdc_cases = filtered
             else:
                 log(
                     "[match] Diagnosis facet matched keywords but no case subtype "
                     "strings aligned; keeping project-level GDC cohort",
                     enabled=verbose,
                 )
-        elif tier.label == "broadened":
+        elif match_tier == "broadened":
             log(
                 "[match] Broadened disease tier: using project-level GDC cohort "
+                "(no strict primary_diagnosis filter)",
+                enabled=verbose,
+            )
+        elif match_tier == "llm":
+            log(
+                "[match] LLM-selected sources: using project-level GDC cohort "
                 "(no strict primary_diagnosis filter)",
                 enabled=verbose,
             )
         else:
             log(
                 "[match] No GDC primary_diagnosis string matched keywords; "
-                "keeping keyword-matched projects without diagnosis filter",
+                "keeping selected projects without diagnosis filter",
                 enabled=verbose,
             )
 
         log(
-            f"[match] (2) Genomics patients in keyword-matched GDC "
+            f"[match] (2) Genomics patients in selected GDC "
             f"[{', '.join(gdc_projects) or 'none'}]: {len(gdc_cases)}",
             enabled=verbose,
         )

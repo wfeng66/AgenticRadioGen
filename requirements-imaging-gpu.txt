@@ -1,0 +1,5 @@
+# Optional GPU radiomics / TotalSegmentator path
+-r requirements.txt
+torch
+totalsegmentator
+nibabel
