@@ -48,7 +48,13 @@ class ImagingRadiomicsAgent:
             if not str(k).startswith("meta_")
         }
         if not row and series.local_path:
-            row.update(self._from_local_path(series.local_path))
+            disease = getattr(series, "disease", None)
+            modality = getattr(series, "modality", None) or "CT"
+            row.update(
+                self._from_local_path(
+                    series.local_path, disease=disease, modality=modality
+                )
+            )
         if series.volume_summary:
             row.setdefault(
                 "original_firstorder_Mean", float(series.volume_summary.get("mean", 0.0))
@@ -64,12 +70,19 @@ class ImagingRadiomicsAgent:
         return {k: float(v) for k, v in row.items()}
 
     @staticmethod
-    def _from_local_path(local_path: str) -> dict[str, float]:
+    def _from_local_path(
+        local_path: str,
+        *,
+        disease: str | None = None,
+        modality: str = "CT",
+    ) -> dict[str, float]:
         path = Path(local_path)
         if path.is_dir():
             from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 
-            extracted = extract_series_features(path)
+            extracted = extract_series_features(
+                path, disease=disease, modality=modality
+            )
             return {
                 k: float(v)
                 for k, v in extracted["features"].items()
@@ -79,7 +92,9 @@ class ImagingRadiomicsAgent:
             volume = np.load(path)
             from agentic_radiogen.imaging.radiomics_extract import extract_radiomics_from_volume
 
-            features, _ = extract_radiomics_from_volume(volume)
+            features, _ = extract_radiomics_from_volume(
+                volume, disease=disease, modality=modality
+            )
             return {
                 k: float(v)
                 for k, v in features.items()

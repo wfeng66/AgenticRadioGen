@@ -296,11 +296,15 @@ def _clinical_from_hit(hit: dict[str, Any]) -> dict[str, Any]:
         days_death = demographic.get("days_to_death")
     days_follow = diagnosis.get("days_to_last_follow_up")
     os_time = days_death if days_death not in (None, "") else days_follow
+    project = hit.get("project") or {}
     clinical: dict[str, Any] = {
         "subtype": diagnosis.get("primary_diagnosis"),
+        "primary_diagnosis": diagnosis.get("primary_diagnosis"),
         "stage": diagnosis.get("ajcc_pathologic_stage"),
         "vital_status": vital,
         "age_at_diagnosis": diagnosis.get("age_at_diagnosis"),
+        "primary_site": hit.get("primary_site"),
+        "_gdc_project": project.get("project_id"),
     }
     if os_time not in (None, ""):
         clinical["OS_time"] = float(os_time)

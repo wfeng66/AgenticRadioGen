@@ -10,9 +10,14 @@ from agentic_radiogen.data.disease_match import (
     keyword_match_tiers,
     keywords_from_query,
     rank_names,
+    segmentation_disease_label,
 )
 from agentic_radiogen.data.gdc_client import GdcCase, GdcClient
-from agentic_radiogen.data.tcia_client import TciaClient, TciaSeries
+from agentic_radiogen.data.tcia_client import (
+    TciaClient,
+    TciaSeries,
+    prefer_volumetric_series,
+)
 from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 from agentic_radiogen.util.progress import log, progress_enabled, progress_iter
 
@@ -25,12 +30,14 @@ class LiveCatalog:
     tcia: TciaClient = field(default_factory=TciaClient)
     download_dicom: bool = True
     extract_radiomics: bool = True
+    use_llm: bool | None = None
     show_progress: bool | None = None
     query_count: int = 0
     fetch_count: int = 0
     last_source_counts: dict[str, int] = field(default_factory=dict)
     last_imaging_notes: list[str] = field(default_factory=list)
     last_intermediate: dict = field(default_factory=dict)
+    last_question_text: str = ""
     _record_cache: dict[str, CatalogRecord] = field(default_factory=dict)
     _series_cache: dict[tuple[str, str], list[TciaSeries]] = field(default_factory=dict)
 
@@ -50,6 +57,7 @@ class LiveCatalog:
         self.last_intermediate["min_altered"] = int(min_altered)
         if disease_query:
             self.last_intermediate["disease_query"] = disease_query
+            self.last_question_text = str(disease_query)
         self.last_intermediate["keyword_match"] = bool(keyword_match)
         if preferred_tcia_collections is not None:
             self.last_intermediate["preferred_tcia_collections"] = list(
@@ -337,10 +345,9 @@ class LiveCatalog:
                 enabled=verbose,
             )
 
-        tcia_patients: dict[str, TciaSeries] = {}
-        for coll in tcia_collections:
-            for item in self._series(coll, modality):
-                tcia_patients.setdefault(item.patient_id, item)
+        tcia_patients = self._best_series_per_patient(
+            tcia_collections, modality, verbose=verbose
+        )
         log(
             f"[match] (1) Imaging patients with {modality} in selected TCIA "
             f"[{', '.join(tcia_collections) or 'none'}]: {len(tcia_patients)}",
@@ -455,10 +462,9 @@ class LiveCatalog:
             f"[match] Querying TCIA collection={tcia_collection} modality={modality}",
             enabled=verbose,
         )
-        series = self._series(tcia_collection, modality)
-        tcia_patients: dict[str, TciaSeries] = {}
-        for item in series:
-            tcia_patients.setdefault(item.patient_id, item)
+        tcia_patients = self._best_series_per_patient(
+            [tcia_collection], modality, verbose=verbose
+        )
         log(
             f"[match] (1) Imaging patients with {modality} in {tcia_collection}: "
             f"{len(tcia_patients)}",
@@ -509,6 +515,10 @@ class LiveCatalog:
         verbose: bool,
     ) -> list[CatalogRecord]:
         paired = sorted(set(tcia_patients) & set(gdc_cases))
+        image_counts = [int(tcia_patients[pid].image_count or 0) for pid in paired]
+        n_ge8 = sum(1 for n in image_counts if n >= 8)
+        n_thin = sum(1 for n in image_counts if 0 < n < 8)
+        n_unk = sum(1 for n in image_counts if n <= 0)
         self.last_source_counts = {
             "tcia_series": sum(len(self._series(c, modality)) for c in tcia_collections),
             "tcia_patients": len(tcia_patients),
@@ -518,6 +528,9 @@ class LiveCatalog:
             "gdc_only_dropped": len(set(gdc_cases) - set(tcia_patients)),
             "paired_available": len(paired),
             "paired_kept": len(paired),
+            "paired_series_imagecount_ge8": n_ge8,
+            "paired_series_imagecount_lt8": n_thin,
+            "paired_series_imagecount_unknown": n_unk,
             "i_and_g": len(paired),
         }
         self.last_intermediate = {
@@ -547,30 +560,46 @@ class LiveCatalog:
         }
         log(
             f"[match] (3) i&g = imaging ∩ genomics = {len(paired)} paired patients "
-            f"(tcia-only={self.last_source_counts['tcia_only_dropped']}, "
+            f"(modality={modality}; tcia-only={self.last_source_counts['tcia_only_dropped']}, "
             f"gdc-only={self.last_source_counts['gdc_only_dropped']})",
             enabled=verbose,
         )
+        log(
+            f"[match] Assigned volumetric {modality} series per patient: "
+            f"ImageCount>=8: {n_ge8}, 1-7: {n_thin}, unknown: {n_unk} "
+            f"(prefer thickest non-scout series, not first TCIA row)",
+            enabled=verbose,
+        )
         self._record_cache.clear()
-        primary_project = gdc_projects[0] if gdc_projects else ""
-        records = [
-            CatalogRecord(
-                patient_id=pid,
-                disease=disease,
-                modality=modality,
-                mutations={gene: 0 for gene in genes},
-                expression={},
-                clinical={
-                    **dict(gdc_cases[pid].clinical),
-                    "_gdc_paired": True,
-                    "_gdc_project": primary_project,
-                },
-                series_uid=tcia_patients[pid].series_uid,
-                radiomic_features={},
-                volume_summary={},
+        fallback_project = gdc_projects[0] if gdc_projects else ""
+        records = []
+        for pid in paired:
+            case_clinical = dict(gdc_cases[pid].clinical)
+            project = str(
+                case_clinical.get("_gdc_project")
+                or fallback_project
             )
-            for pid in paired
-        ]
+            series = tcia_patients[pid]
+            collection = str(series.collection or "")
+            case_clinical["_gdc_paired"] = True
+            case_clinical["_gdc_project"] = project
+            case_clinical["_tcia_collection"] = collection
+            case_clinical["_tcia_series_uid"] = series.series_uid
+            case_clinical["_tcia_image_count"] = int(series.image_count or 0)
+            case_clinical["_tcia_series_description"] = series.series_description or ""
+            records.append(
+                CatalogRecord(
+                    patient_id=pid,
+                    disease=disease,
+                    modality=modality,
+                    mutations={gene: 0 for gene in genes},
+                    expression={},
+                    clinical=case_clinical,
+                    series_uid=series.series_uid,
+                    radiomic_features={},
+                    volume_summary={},
+                )
+            )
         for rec in records:
             self._record_cache[rec.patient_id] = rec
         return records
@@ -651,7 +680,35 @@ class LiveCatalog:
                     series_dir = self.tcia.download_series(rec.series_uid)
                     local_path = str(series_dir)
                     if self.extract_radiomics:
-                        extracted = extract_series_features(series_dir)
+                        # Question disease is the matching anchor (site filter);
+                        # cohort/histology are secondary context only.
+                        q_disease = str(
+                            self.last_intermediate.get("disease_query")
+                            or self.last_question_text
+                            or rec.disease
+                            or ""
+                        ).strip()
+                        seg_disease = segmentation_disease_label(
+                            question_disease=q_disease or rec.disease,
+                            gdc_project=str(rec.clinical.get("_gdc_project") or ""),
+                            tcia_collection=str(
+                                rec.clinical.get("_tcia_collection") or ""
+                            ),
+                            primary_diagnosis=str(
+                                rec.clinical.get("primary_diagnosis")
+                                or rec.clinical.get("subtype")
+                                or ""
+                            ),
+                        )
+                        extracted = extract_series_features(
+                            series_dir,
+                            disease=seg_disease,
+                            modality=rec.modality or "CT",
+                            question=q_disease
+                            or self.last_question_text
+                            or seg_disease,
+                            use_llm=self.use_llm,
+                        )
                         radiomic_features = {
                             k: float(v)
                             for k, v in extracted["features"].items()
@@ -663,8 +720,10 @@ class LiveCatalog:
                             if isinstance(v, (int, float))
                         }
                         cache_note = "cached" if extracted.get("from_cache") else "computed"
+                        seg = extracted.get("segmentation_backend") or "?"
                         self.last_imaging_notes.append(
-                            f"{pid}: radiomics ok ({cache_note}, {Path(series_dir).name})"
+                            f"{pid}: radiomics ok ({cache_note}, seg={seg}, "
+                            f"disease={seg_disease}, {Path(series_dir).name})"
                         )
                         ok += 1
                     else:
@@ -684,14 +743,15 @@ class LiveCatalog:
                 mutations=flags.get(pid, dict(rec.mutations)),
                 expression=expression.get(pid, dict(rec.expression)),
                 clinical={
-                **{
-                    k: v
-                    for k, v in dict(rec.clinical).items()
-                    if not str(k).startswith("_")
+                    **{
+                        k: v
+                        for k, v in dict(rec.clinical).items()
+                        if not str(k).startswith("_")
+                    },
+                    "_gdc_paired": True,
+                    "_gdc_project": rec.clinical.get("_gdc_project"),
+                    "_tcia_collection": rec.clinical.get("_tcia_collection"),
                 },
-                "_gdc_paired": True,
-                "_gdc_project": rec.clinical.get("_gdc_project"),
-            },
                 series_uid=rec.series_uid,
                 radiomic_features=radiomic_features,
                 volume_summary=volume_summary,
@@ -713,6 +773,35 @@ class LiveCatalog:
             enabled=verbose,
         )
         return fetched
+
+    def _best_series_per_patient(
+        self,
+        collections: list[str],
+        modality: str,
+        *,
+        verbose: bool = False,
+    ) -> dict[str, TciaSeries]:
+        """One CT series per patient: thickest non-scout (not first NBIA row)."""
+        by_patient: dict[str, list[TciaSeries]] = {}
+        for coll in collections:
+            for item in self._series(coll, modality):
+                by_patient.setdefault(item.patient_id, []).append(item)
+        chosen: dict[str, TciaSeries] = {}
+        thin = 0
+        for pid, cands in by_patient.items():
+            best = prefer_volumetric_series(cands)
+            if best is None:
+                continue
+            chosen[pid] = best
+            if 0 < int(best.image_count) < 8:
+                thin += 1
+        if thin and verbose:
+            log(
+                f"[match] WARNING: {thin} patients still have ImageCount<8 after "
+                f"preferring volumetric series (nnU-Net may fall back per case)",
+                enabled=True,
+            )
+        return chosen
 
     def _series(self, collection: str, modality: str) -> list[TciaSeries]:
         key = (collection, modality)

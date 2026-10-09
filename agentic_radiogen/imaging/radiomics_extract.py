@@ -4,23 +4,36 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from agentic_radiogen.imaging.dicom_io import load_dicom_series
 from agentic_radiogen.imaging.segment import make_roi_mask
 
 _RADIOMICS_CACHE = "radiomics_features.json"
-_CACHE_VERSION = 3  # PyRadiomics-backed feature set
+_CACHE_VERSION = 5  # disease-aware ROI + PyRadiomics
 logger = logging.getLogger(__name__)
 
 
-def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -> dict[str, Any]:
+def _disease_key(disease: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (disease or "unknown").strip().lower()).strip("_") or "unknown"
+
+
+def extract_series_features(
+    series_dir: str | Path,
+    *,
+    use_cache: bool = True,
+    disease: str | None = None,
+    modality: str = "CT",
+    question: str = "",
+    use_llm: bool | None = None,
+) -> dict[str, Any]:
     root = Path(series_dir)
     cache_path = root / _RADIOMICS_CACHE
+    dkey = _disease_key(disease)
     if use_cache and cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -28,6 +41,7 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
                 isinstance(cached, dict)
                 and cached.get("features")
                 and int(cached.get("version", 0)) >= _CACHE_VERSION
+                and str(cached.get("disease_key") or "") == dkey
             ):
                 return {
                     "features": {k: float(v) for k, v in cached["features"].items()},
@@ -38,16 +52,27 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
                     },
                     "local_path": str(root.resolve()),
                     "from_cache": True,
+                    "segmentation_backend": cached.get("segmentation_backend"),
                 }
         except Exception:
             pass
-    volume = load_dicom_series(root)
-    features, summary = extract_radiomics_from_volume(volume)
+    from agentic_radiogen.imaging.dicom_io import load_dicom_series_with_spacing
+
+    volume, spacing_zyx = load_dicom_series_with_spacing(root)
+    features, summary = extract_radiomics_from_volume(
+        volume,
+        disease=disease,
+        modality=modality,
+        question=question,
+        use_llm=use_llm,
+        spacing_zyx=spacing_zyx,
+    )
     payload = {
         "features": features,
         "volume_summary": summary,
         "local_path": str(root.resolve()),
         "from_cache": False,
+        "segmentation_backend": summary.get("segmentation_backend_name"),
     }
     if use_cache:
         try:
@@ -55,6 +80,10 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
                 json.dumps(
                     {
                         "version": _CACHE_VERSION,
+                        "disease_key": dkey,
+                        "disease": disease,
+                        "modality": modality,
+                        "segmentation_backend": summary.get("segmentation_backend_name"),
                         "features": features,
                         "volume_summary": summary,
                     },
@@ -67,13 +96,24 @@ def extract_series_features(series_dir: str | Path, *, use_cache: bool = True) -
     return payload
 
 
-def extract_radiomics_from_volume(volume: np.ndarray) -> tuple[dict[str, float], dict[str, float]]:
-    """Extract classical radiomics with PyRadiomics.
-
-    Segments an ROI (TotalSegmentator when available, else intensity threshold),
-    then calls ``RadiomicsFeatureExtractor`` with all feature classes enabled.
-    """
-    mask, backend = make_roi_mask(volume)
+def extract_radiomics_from_volume(
+    volume: np.ndarray,
+    *,
+    disease: str | None = None,
+    modality: str = "CT",
+    question: str = "",
+    use_llm: bool | None = None,
+    spacing_zyx: tuple[float, float, float] | None = None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Extract classical radiomics with PyRadiomics on a SegmentationAgent mask."""
+    mask, backend = make_roi_mask(
+        volume,
+        disease=disease,
+        modality=modality,
+        question=question,
+        use_llm=use_llm,
+        spacing_zyx=spacing_zyx,
+    )
     if not np.asarray(mask).any():
         raise ValueError("Volume has no finite voxels for radiomics")
 
@@ -89,6 +129,7 @@ def extract_radiomics_from_volume(volume: np.ndarray) -> tuple[dict[str, float],
     ):
         features["original_glcm_Entropy"] = features["original_glcm_JointEntropy"]
 
+    is_deep = backend.startswith("totalsegmentator") or "tumor" in backend
     summary = {
         "mean": features.get("original_firstorder_Mean", 0.0),
         "std": features.get(
@@ -96,7 +137,8 @@ def extract_radiomics_from_volume(volume: np.ndarray) -> tuple[dict[str, float],
             features.get("original_firstorder_Std", 0.0),
         ),
         "size": features.get("original_shape_VoxelVolume", float(np.asarray(mask).sum())),
-        "segmentation_backend": 1.0 if backend.startswith("totalsegmentator") else 0.0,
+        "segmentation_backend": 1.0 if is_deep else 0.0,
+        "segmentation_backend_name": backend,
         "n_features": float(len([k for k in features if not k.startswith("meta_")])),
     }
     features["meta_segmentation_is_gpu_or_ts"] = summary["segmentation_backend"]

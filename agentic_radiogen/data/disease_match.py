@@ -452,3 +452,111 @@ def diagnosis_matches(diagnosis: str, keywords: list[str]) -> bool:
     ):
         return False
     return score_keyword_match(text, keywords) >= 12
+
+
+# Readable expansions for common TCGA / TCIA cohort codes (most-specific first for seg LLM).
+_PROJECT_LABELS: dict[str, str] = {
+    "TCGA-LUSC": "lung squamous cell carcinoma",
+    "TCGA-LUAD": "lung adenocarcinoma",
+    "TCGA-BRCA": "breast invasive carcinoma",
+    "TCGA-GBM": "glioblastoma multiforme",
+    "TCGA-LGG": "lower grade glioma",
+    "TCGA-KIRC": "kidney clear cell carcinoma",
+    "TCGA-KIRP": "kidney papillary cell carcinoma",
+    "TCGA-KICH": "kidney chromophobe",
+    "TCGA-LIHC": "liver hepatocellular carcinoma",
+    "TCGA-PAAD": "pancreatic adenocarcinoma",
+    "TCGA-PRAD": "prostate adenocarcinoma",
+    "TCGA-COAD": "colon adenocarcinoma",
+    "TCGA-READ": "rectum adenocarcinoma",
+    "TCGA-STAD": "stomach adenocarcinoma",
+    "TCGA-ESCA": "esophageal carcinoma",
+    "TCGA-HNSC": "head and neck squamous cell carcinoma",
+    "TCGA-THCA": "thyroid carcinoma",
+    "TCGA-BLCA": "bladder urothelial carcinoma",
+    "TCGA-CESC": "cervical squamous cell carcinoma",
+    "TCGA-UCEC": "uterine corpus endometrial carcinoma",
+    "TCGA-OV": "ovarian serous cystadenocarcinoma",
+    "TCGA-SARC": "sarcoma",
+    "TCGA-SKCM": "skin cutaneous melanoma",
+    "TCGA-TGCT": "testicular germ cell tumors",
+    "TCGA-ACC": "adrenocortical carcinoma",
+    "TCGA-PCPG": "pheochromocytoma and paraganglioma",
+    "TCGA-UVM": "uveal melanoma",
+    "TCGA-MESO": "mesothelioma",
+    "TCGA-UCS": "uterine carcinosarcoma",
+    "TCGA-DLBC": "diffuse large B-cell lymphoma",
+    "TCGA-LAML": "acute myeloid leukemia",
+    "TCGA-CHOL": "cholangiocarcinoma",
+}
+
+
+def expand_cohort_label(code: str | None) -> str:
+    """Turn TCGA-LUSC into 'lung squamous cell carcinoma (TCGA-LUSC)'."""
+    raw = (code or "").strip()
+    if not raw:
+        return ""
+    key = raw.upper()
+    nice = _PROJECT_LABELS.get(key)
+    if nice:
+        return f"{nice} ({key})"
+    return raw
+
+
+def segmentation_disease_label(
+    *,
+    question_disease: str | None = None,
+    gdc_project: str | None = None,
+    tcia_collection: str | None = None,
+    primary_diagnosis: str | None = None,
+) -> str:
+    """Disease context for segmentation model matching.
+
+    The research-question disease is the **matching anchor** (site filter), e.g.
+    ``lung cancer``. Cohort (TCGA-LUSC) and case histology are appended only as
+    secondary specificity for logging / LLM rationale — they must not replace the
+    question site, or organ fallbacks can drift (e.g. histology ``cell`` → kidney).
+    """
+    parts: list[str] = []
+    coarse = (question_disease or "").strip()
+    if coarse:
+        parts.append(coarse)
+
+    cohort = (gdc_project or "").strip() or (tcia_collection or "").strip()
+    if not cohort:
+        cohort = (tcia_collection or "").strip() or (gdc_project or "").strip()
+    if cohort:
+        cohort_label = expand_cohort_label(cohort)
+        if not _label_already_covered(parts, cohort_label):
+            parts.append(cohort_label)
+
+    dx = (primary_diagnosis or "").strip()
+    if dx and dx.lower() not in {"not reported", "unknown", "none", "null"}:
+        if not _label_already_covered(parts, dx):
+            parts.append(dx)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return "; ".join(out) if out else (coarse or "unknown")
+
+
+def _label_already_covered(parts: list[str], candidate: str) -> bool:
+    """True when candidate adds no new site/cohort signal beyond existing parts."""
+    cand = (candidate or "").strip().lower().replace("_", " ")
+    if not cand:
+        return True
+    already = " ".join(parts).lower()
+    if cand in already:
+        return True
+    # Exact cohort codes
+    for token in re.findall(r"tcga-[a-z0-9]+", cand):
+        if token in already:
+            return True
+    return False

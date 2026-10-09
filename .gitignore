@@ -1,10 +1,59 @@
+# --- Python / tooling ---
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+.eggs/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
+venv/
 dist/
 build/
-.mypy_cache/
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- Runtime caches (do not sync) ---
 data_cache/
+.cache/
+**/seg_models/
+**/seg_plans/
+**/radiomics_features.json
+
+# --- Pipeline outputs (do not sync) ---
 outputs/
+results/
+runs/
+artifacts/
+reports/
+*.log
+
+# --- Imaging / model artifacts ---
+*.dcm
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.pkl
+*.pth
+*.pt
+*.onnx
+*.ts
+*.zip
+*.tar
+*.tar.gz
+!.github/**
+
+# --- Office / OS junk ---
+~$*
+*.tmp
+.DS_Store
+Thumbs.db
+desktop.ini

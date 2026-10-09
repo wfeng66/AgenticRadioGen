@@ -3,3 +3,8 @@
 torch
 totalsegmentator
 nibabel
+# Optional tumor models (AutoPET nnU-Net v2, MONAI lung nodule detection)
+nnunetv2
+monai
+huggingface_hub
+gdown

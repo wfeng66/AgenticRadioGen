@@ -275,11 +275,20 @@ def print_summary(payload: dict[str, Any]) -> None:
     print("=" * 60)
 
 
-def build_catalog(name: str, *, download_dicom: bool = True) -> DemoCatalog | LiveCatalog:
+def build_catalog(
+    name: str,
+    *,
+    download_dicom: bool = True,
+    use_llm: bool | None = None,
+) -> DemoCatalog | LiveCatalog:
     if name == "demo":
         return DemoCatalog()
     if name == "live":
-        return LiveCatalog(download_dicom=download_dicom, extract_radiomics=download_dicom)
+        return LiveCatalog(
+            download_dicom=download_dicom,
+            extract_radiomics=download_dicom,
+            use_llm=use_llm,
+        )
     raise ValueError(f"Unknown catalog '{name}'. Use demo or live.")
 
 
@@ -323,7 +332,9 @@ def _run_matcher(
     llm_provider: str | None = None,
     llm_model: str | None = None,
 ) -> tuple[dict[str, Any], ImageBundle | None, OmicsBundle | None]:
-    catalog = build_catalog(catalog_name, download_dicom=download_dicom)
+    catalog = build_catalog(
+        catalog_name, download_dicom=download_dicom, use_llm=use_llm
+    )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     orchestrator = _orchestrator(
         tcga_project=tcga_project,
@@ -589,7 +600,9 @@ def run_stage4(
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
-    catalog = build_catalog(catalog_name, download_dicom=download_dicom)
+    catalog = build_catalog(
+        catalog_name, download_dicom=download_dicom, use_llm=use_llm
+    )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     state = DiscoveryLoop(
         orchestrator=_orchestrator(

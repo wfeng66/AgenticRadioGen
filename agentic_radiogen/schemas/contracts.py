@@ -36,6 +36,7 @@ class ImageSeriesRef(BaseModel):
     patient_id: str
     series_uid: str
     modality: str
+    disease: str | None = None
     local_path: str | None = None
     precomputed_features: dict[str, float] = Field(default_factory=dict)
     volume_summary: dict[str, float] = Field(default_factory=dict)

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from agentic_radiogen.data.catalog import CatalogClient, CatalogRecord, is_paired_record
-from agentic_radiogen.data.disease_match import keywords_from_query, rank_names
+from agentic_radiogen.data.disease_match import (
+    keywords_from_query,
+    rank_names,
+    segmentation_disease_label,
+)
 from agentic_radiogen.data.gate import AlwaysAllowGate, DownloadGate
 from agentic_radiogen.llm.client import LlmClient, resolve_llm_config
 from agentic_radiogen.llm.matcher_plan import plan_match_sources_with_llm
@@ -17,6 +21,19 @@ from agentic_radiogen.util.progress import log
 
 class DownloadDeniedError(RuntimeError):
     pass
+
+
+def _series_seg_disease(rec: CatalogRecord, *, question_disease: str | None = None) -> str:
+    """Segmentation label: question disease first, then cohort/histology."""
+    clinical = rec.clinical or {}
+    return segmentation_disease_label(
+        question_disease=(question_disease or rec.disease or "").strip() or rec.disease,
+        gdc_project=str(clinical.get("_gdc_project") or ""),
+        tcia_collection=str(clinical.get("_tcia_collection") or ""),
+        primary_diagnosis=str(
+            clinical.get("primary_diagnosis") or clinical.get("subtype") or ""
+        ),
+    )
 
 
 class DataMatcherAgent:
@@ -275,11 +292,15 @@ class DataMatcherAgent:
             genes = list(request.genes)
         else:
             genes = sorted({gene for rec in records for gene in rec.mutations})
+        q_disease = str(
+            request.filters.get("disease_query") or request.disease or ""
+        ).strip()
         series = [
             ImageSeriesRef(
                 patient_id=rec.patient_id,
                 series_uid=rec.series_uid,
                 modality=rec.modality,
+                disease=_series_seg_disease(rec, question_disease=q_disease),
                 local_path=rec.local_path,
                 precomputed_features=dict(rec.radiomic_features),
                 volume_summary=dict(rec.volume_summary),

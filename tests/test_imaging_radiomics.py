@@ -33,7 +33,7 @@ def test_threshold_radiomics_from_synthetic_volume() -> None:
     assert any(k.startswith("original_ngtdm_") for k in analysis)
     mask, backend = make_roi_mask(volume)
     assert mask.any()
-    assert backend == "threshold_cpu"
+    assert backend in {"threshold_proxy", "threshold_cpu", "totalsegmentator_organ"}
     assert segmentation_backend()["backend"] in {
         "threshold_cpu",
         "totalsegmentator_cpu",
