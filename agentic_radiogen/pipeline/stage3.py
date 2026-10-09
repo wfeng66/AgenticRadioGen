@@ -23,6 +23,7 @@ def join_and_interpret(
     outputs: SpecialistOutputs,
     *,
     disease: str,
+    question: str = "",
     stats: StatisticalCriticalAgent | None = None,
     literature: LiteratureAgent | None = None,
 ) -> Stage3Result:
@@ -35,5 +36,7 @@ def join_and_interpret(
     stats_agent = stats or StatisticalCriticalAgent()
     literature_agent = literature or LiteratureAgent()
     model = stats_agent.analyze(outputs.radiomics, outputs.genomics)
-    context = literature_agent.interpret(model, disease=disease)
+    context = literature_agent.interpret(
+        model, disease=disease, question=question or disease
+    )
     return Stage3Result(stats=model, literature=context, looped=False)

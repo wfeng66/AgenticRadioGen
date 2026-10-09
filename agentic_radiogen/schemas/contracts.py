@@ -110,6 +110,10 @@ class LiteratureContext(BaseModel):
     unverified: list[str] = Field(default_factory=list)
     proposed_refinements: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
+    # Prior radiomic–gene claims used for annotation (from PubMed+LLM or static corpus).
+    prior_pairs: list[dict] = Field(default_factory=list)
+    search_query: str | None = None
+    literature_source: str | None = None
 
 
 class LoopAction(str, Enum):

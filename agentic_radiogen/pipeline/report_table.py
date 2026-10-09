@@ -234,11 +234,34 @@ def write_associations_csv(
     import csv
     from pathlib import Path
 
-    from agentic_radiogen.agents.literature import LiteratureAgent
+    from agentic_radiogen.agents.literature import LiteratureAgent, LitPair
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    lit = literature if literature is not None else LiteratureAgent()
+    if isinstance(literature, LiteratureAgent):
+        lit = literature
+    else:
+        lit = LiteratureAgent(verbose=False)
+        # Rehydrate prior pairs from a LiteratureContext dump (Stage 4 JSON).
+        if isinstance(literature, dict) and literature.get("prior_pairs"):
+            lit.pairs = [
+                LitPair(
+                    gene=str(p.get("gene") or "").upper(),
+                    radiomic_terms=frozenset(
+                        str(t).lower() for t in (p.get("radiomic_terms") or [])
+                    ),
+                    supports=bool(p.get("supports", True)),
+                    note=p.get("note"),
+                    paper_title=str(p.get("paper_title") or ""),
+                    pmid=p.get("pmid"),
+                    journal=str(p.get("journal") or ""),
+                    year=str(p.get("year") or ""),
+                )
+                for p in literature["prior_pairs"]
+                if p.get("gene")
+            ]
+            lit.prepared = True
+            lit.last_source = str(literature.get("literature_source") or "rehydrated")
     prevalence = mutation_prevalence or {}
     ranked = sorted(
         associations,
@@ -256,6 +279,9 @@ def write_associations_csv(
         "wildtype",
         "category",
         "papers",
+        "journal",
+        "year",
+        "pmid",
         "contradiction_note",
     ]
     with out.open("w", encoding="utf-8", newline="") as fh:
@@ -273,6 +299,10 @@ def write_associations_csv(
             q = float(item.get("q_value", 1.0))
             n = int(item.get("n", 0))
             category, papers, note = lit.classify(img, geno, disease=disease)
+            hits = lit._matching_pairs(img, geno, disease)
+            journals = [h.journal for h in hits if h.journal]
+            years = [h.year for h in hits if h.year]
+            pmids = [str(h.pmid) for h in hits if h.pmid]
             mut_bit = ""
             if counts:
                 mut_bit = f"  [mut: altered={altered}, wildtype={wildtype}]"
@@ -292,6 +322,9 @@ def write_associations_csv(
                     "wildtype": wildtype,
                     "category": category,
                     "papers": "; ".join(papers),
+                    "journal": "; ".join(journals),
+                    "year": "; ".join(years),
+                    "pmid": "; ".join(pmids),
                     "contradiction_note": note or "",
                 }
             )

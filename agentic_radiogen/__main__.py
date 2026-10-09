@@ -208,6 +208,13 @@ def print_summary(payload: dict[str, Any]) -> None:
     if literature:
         print("-" * 60)
         print("Literature (annotation only; does not change associations)")
+        src = literature.get("literature_source")
+        n_prior = len(literature.get("prior_pairs") or [])
+        if src or n_prior:
+            print(f"  Source : {src or '?'} ({n_prior} prior radiomic–gene pairs)")
+        if literature.get("search_query"):
+            q = str(literature["search_query"])
+            print(f"  PubMed : {q[:140]}{'...' if len(q) > 140 else ''}")
         print(
             "  Top 8 by |r| within each category (ascending |r|):\n"
             "    [supported]    disease-matched corpus paper agrees\n"
@@ -531,8 +538,22 @@ def run_stage3(
         "genomics_features": None if outputs.genomics is None else outputs.genomics.feature_names,
         "n_patients": len(outputs.patient_ids),
     }
+    literature = LiteratureAgent(
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+    )
+    literature.prepare(
+        disease=str(payload["question"]["disease"]),
+        question=question_text,
+    )
     try:
-        result = join_and_interpret(outputs, disease=payload["question"]["disease"])
+        result = join_and_interpret(
+            outputs,
+            disease=payload["question"]["disease"],
+            question=question_text,
+            literature=literature,
+        )
     except Stage3Error as exc:
         payload["stats"] = {"status": "blocked", "reason": str(exc)}
         return payload
@@ -590,7 +611,11 @@ def run_stage4(
         imaging=ImagingRadiomicsAgent(),
         genomics=GenomicsAgent(),
         stats=StatisticalCriticalAgent(),
-        literature=LiteratureAgent(),
+        literature=LiteratureAgent(
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        ),
         max_iterations=max_iterations,
         max_patients=max_patients,
         max_genes=max_genes,
@@ -808,6 +833,7 @@ def main() -> None:
                 associations,
                 disease=disease,
                 mutation_prevalence=payload.get("mutation_prevalence") or {},
+                literature=payload.get("literature"),
             )
             print(f"Associations CSV ({n_rows} rows) written to: {csv_path.resolve()}")
     if args.json:

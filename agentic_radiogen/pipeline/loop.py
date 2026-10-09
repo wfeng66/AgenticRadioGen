@@ -85,6 +85,11 @@ class DiscoveryLoop:
         if updates:
             request = request.model_copy(update=updates)
         state = LoopState(question=question, request=request)
+        # Search disease literature + extract radiomic–gene priors before fetch/stats.
+        self.literature.prepare(
+            disease=question.disease,
+            question=question_text,
+        )
         while not state.stopped:
             state = self.step(state)
         return state
@@ -153,6 +158,7 @@ class DiscoveryLoop:
             result = join_and_interpret(
                 outputs,
                 disease=state.question.disease,
+                question=state.question.text,
                 stats=self.stats,
                 literature=self.literature,
             )
