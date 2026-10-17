@@ -264,6 +264,44 @@ def test_nnunet_available_without_local_weights() -> None:
     assert nnunet_lung_available() is True
 
 
+def test_lung_live_order_tries_tumor_models_before_ts_lung() -> None:
+    """nnunet → monai → lungtumormask must precede organ ts_lung on CT."""
+    from agentic_radiogen.agents.segmentation import (
+        _LIVE_RUNNERS,
+        _order_fallback_candidates,
+    )
+    from agentic_radiogen.imaging.tumor_models.segmentation_select import is_selectable
+
+    agent = SegmentationAgent(verbose=False, use_llm=False)
+    primary = agent.choose_model(
+        disease="lung adenocarcinoma TCGA-LUAD", modality="CT", use_cache=False
+    )
+    assert primary.model_id == "nnunet_msd_lung"
+    rest = [s for s in agent.available_models("lung adenocarcinoma", "CT") if s.model_id != primary.model_id]
+    ordered = _order_fallback_candidates(primary, rest)
+    live = [
+        s.model_id
+        for s in ordered
+        if is_selectable(s)
+        and s.runner in _LIVE_RUNNERS
+        and not (s.runner == "nnunet_autopet")
+    ]
+    assert live.index("monai_lung_nodule") < live.index("ts_lung")
+    assert live.index("lungtumormask") < live.index("ts_lung")
+    assert live.index("nnunet_msd_lung") == 0
+
+
+def test_monai_install_error_does_not_cohort_block() -> None:
+    from agentic_radiogen.agents.segmentation import _should_cohort_block
+
+    assert not _should_cohort_block(
+        "monai_lung_nodule", "Failed to install monai for lung_nodule_ct_detection"
+    )
+    assert not _should_cohort_block("lungtumormask", "Failed to install LungTumorMask")
+    assert _should_cohort_block("ts_lung_nodules", "nnU-Net crop IO error")
+    assert _should_cohort_block("nnunet_msd_lung", "download disabled")
+
+
 def test_empty_mask_does_not_block_model_for_cohort(tmp_path) -> None:
     from agentic_radiogen.agents.segmentation import _is_patient_local_failure
 

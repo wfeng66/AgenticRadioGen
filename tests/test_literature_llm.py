@@ -11,6 +11,25 @@ def test_build_radiogenomics_query_includes_disease_and_radiomics() -> None:
     assert "lung cancer" in q
     assert "radiomic" in q.lower()
     assert "mutation" in q.lower()
+    # Must NOT hardcode a gene shortlist — that biases retrieval/LLM.
+    assert "EGFR OR KRAS" not in q
+    assert "TP53" not in q
+    assert "BRCA" not in q
+    # Question mentioning EGFR must not inject that gene into the query.
+    assert "EGFR" not in q
+
+
+def test_build_radiogenomics_query_includes_all_explicit_genes_or_none() -> None:
+    q = build_radiogenomics_query(
+        "lung cancer",
+        genes=["EGFR", "KRAS", "STK11", "KEAP1"],
+    )
+    assert "EGFR" in q and "KRAS" in q and "STK11" in q and "KEAP1" in q
+    # Oversized panel → omit gene clause entirely (all-or-nothing).
+    huge = [f"GENE{i}" for i in range(600)]
+    q2 = build_radiogenomics_query("lung cancer", genes=huge)
+    assert "GENE0" not in q2
+    assert "mutation OR genomic" in q2
 
 
 def test_prepare_with_injected_llm_uses_pubmed_and_extraction(monkeypatch) -> None:

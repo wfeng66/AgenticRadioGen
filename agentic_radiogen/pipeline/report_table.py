@@ -329,3 +329,120 @@ def write_associations_csv(
                 }
             )
     return len(ranked)
+
+
+def write_literature_details(
+    path: str | Any,
+    literature: dict[str, Any] | None,
+    *,
+    mutation_prevalence: dict[str, dict[str, int]] | None = None,
+) -> int:
+    """Write full paper titles / PMIDs for supported (and related) findings.
+
+    Screen summary stays stats-only; this file holds the bibliographic detail.
+    Returns the number of finding blocks written.
+    """
+    from pathlib import Path
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    lit = literature or {}
+    prevalence = mutation_prevalence or {}
+    lines: list[str] = [
+        "Literature details (paper titles / PMIDs)",
+        f"source={lit.get('literature_source') or '?'}",
+        f"prior_pairs={len(lit.get('prior_pairs') or [])}",
+        "",
+    ]
+    if lit.get("search_query"):
+        lines.append(f"PubMed query: {lit['search_query']}")
+        lines.append("")
+
+    def _mut_bit(finding: str) -> str:
+        if "_mut" not in finding or not prevalence:
+            return ""
+        try:
+            right = finding.split("~", 1)[1].strip()
+            gene = right.split("_mut", 1)[0].strip().split()[0]
+        except (IndexError, ValueError):
+            return ""
+        counts = prevalence.get(gene)
+        if not counts:
+            return ""
+        return (
+            f"  [mut: altered={counts.get('altered', 0)}, "
+            f"wildtype={counts.get('wildtype', 0)}]"
+        )
+
+    n_blocks = 0
+    supported = [s for s in (lit.get("supports") or []) if s.get("supported")]
+    if supported:
+        lines.append("[supported]")
+        for item in supported:
+            finding = str(item.get("finding") or "")
+            lines.append(f"  {finding}{_mut_bit(finding)}")
+            for paper in item.get("papers") or []:
+                lines.append(f"    - {paper}")
+            n_blocks += 1
+        lines.append("")
+
+    mapped = list(lit.get("mapped_related") or [])
+    if mapped:
+        lines.append("[mapped]")
+        for item in mapped:
+            finding = str(item.get("finding") or "")
+            lines.append(f"  {finding}{_mut_bit(finding)}")
+            lines.append(
+                f"    lit_gene={item.get('literature_gene')} "
+                f"terms={item.get('literature_radiomic_terms')}"
+            )
+            if item.get("radiomic_reason"):
+                lines.append(f"    radio: {item['radiomic_reason']}")
+            if item.get("gene_reason"):
+                lines.append(f"    gene: {item['gene_reason']}")
+            for paper in item.get("papers") or []:
+                lines.append(f"    - {paper}")
+            n_blocks += 1
+        lines.append("")
+
+    aggregates = list(lit.get("pair_aggregates") or [])
+    if aggregates:
+        lines.append("[aggregate]")
+        for agg in aggregates:
+            lines.append(
+                f"  {agg.get('literature_gene')} + {agg.get('literature_radiomic_terms')} "
+                f"(n_mapped={agg.get('n_mapped')}, best_|r|={agg.get('best_abs_r')})"
+            )
+            if agg.get("paper"):
+                lines.append(f"    - {agg['paper']}")
+            if agg.get("radiomic_map_summary"):
+                lines.append(f"    radio map: {agg['radiomic_map_summary']}")
+            if agg.get("gene_map_summary"):
+                lines.append(f"    gene map: {agg['gene_map_summary']}")
+            for finding in agg.get("mapped_findings") or []:
+                lines.append(f"    · {finding}{_mut_bit(str(finding))}")
+            n_blocks += 1
+        lines.append("")
+
+    priors = list(lit.get("prior_pairs") or [])
+    if priors:
+        lines.append("[prior_pairs]")
+        for p in priors:
+            title = p.get("paper_title") or ""
+            meta = ", ".join(x for x in (p.get("journal"), p.get("year")) if x)
+            pmid = p.get("pmid")
+            ref = title
+            if meta:
+                ref = f"{title} ({meta})" if title else f"({meta})"
+            if pmid:
+                ref = f"{ref} [PMID:{pmid}]".strip()
+            lines.append(
+                f"  {p.get('gene')} + {p.get('radiomic_terms')} "
+                f"supports={p.get('supports')} | {ref}"
+            )
+            if p.get("note"):
+                lines.append(f"    note: {p['note']}")
+        lines.append("")
+
+    out.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return n_blocks

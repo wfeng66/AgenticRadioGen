@@ -44,6 +44,7 @@ class ModelStore:
             "nnunet",
             "nnunet_autopet",
             "monai_bundle",
+            "lungtumormask",
         }:
             # These runners manage their own cache / auto-download.
             return True

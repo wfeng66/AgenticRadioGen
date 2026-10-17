@@ -11,17 +11,26 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentic_radiogen.agents.genomics import GenomicsAgent
+from agentic_radiogen.agents.imaging import ImagingRadiomicsAgent
 from agentic_radiogen.data.pubmed_client import (
     PubMedClient,
     build_radiogenomics_query,
 )
 from agentic_radiogen.llm.client import LlmClient, resolve_llm_config
 from agentic_radiogen.llm.literature_plan import extract_pairs_with_llm
-from agentic_radiogen.schemas.contracts import LiteratureContext, LiteratureSupport, ModelResult
+from agentic_radiogen.schemas.contracts import (
+    LiteratureContext,
+    LiteratureSupport,
+    MappedRelatedPair,
+    ModelResult,
+    PairAggregate,
+)
 from agentic_radiogen.util.progress import log
 
-_LIT_CACHE_VERSION = 2  # includes journal + year on prior pairs
+_LIT_CACHE_VERSION = 3  # unbiased query (no hardcoded gene shortlist); larger max_papers
 _DEFAULT_LIT_CACHE_DIR = Path.cwd() / "data_cache" / "literature"
+_DEFAULT_MAX_PAPERS = 500
 
 
 def normalize_disease_key(disease: str) -> str:
@@ -170,7 +179,7 @@ class LiteratureAgent:
         llm_model: str | None = None,
         llm_client: LlmClient | None = None,
         pubmed: PubMedClient | None = None,
-        max_papers: int = 15,
+        max_papers: int = _DEFAULT_MAX_PAPERS,
         verbose: bool = True,
         use_cache: bool = True,
         cache_dir: str | Path | None = None,
@@ -182,7 +191,7 @@ class LiteratureAgent:
         self._llm_model = llm_model
         self._llm_client = llm_client
         self.pubmed = pubmed or PubMedClient()
-        self.max_papers = max_papers
+        self.max_papers = max(1, int(max_papers))
         self.verbose = verbose
         self.use_cache = use_cache
         self.cache_dir = Path(cache_dir) if cache_dir else _DEFAULT_LIT_CACHE_DIR
@@ -194,14 +203,31 @@ class LiteratureAgent:
         self.last_source: str = "unprepared"
         self.last_rationale: str = ""
         self.last_cache_path: str | None = None
+        self.last_query_genes: list[str] = []
+        # Specialist agents used for soft radiomic/gene mapping when direct support is empty.
+        self.imaging = ImagingRadiomicsAgent()
+        self.genomics = GenomicsAgent()
 
         # Back-compat attribute used by older tests / callers.
         self.corpus = DEFAULT_CORPUS if corpus is None else corpus
 
-    def prepare(self, *, disease: str, question: str = "") -> list[LitPair]:
-        """Search / load prior radiomic–gene pairs for this disease question."""
+    def prepare(
+        self,
+        *,
+        disease: str,
+        question: str = "",
+        genes: list[str] | None = None,
+    ) -> list[LitPair]:
+        """Search / load prior radiomic–gene pairs for this disease question.
+
+        ``genes``: optional explicit panel. If provided, *all* symbols are OR-ed
+        into the PubMed query (or none if the panel is too large). Never pass a
+        hand-picked shortlist like EGFR/KRAS alone — that biases retrieval.
+        """
         disease = (disease or "").strip() or "cancer"
         question = (question or "").strip() or disease
+        gene_panel = [str(g).strip() for g in (genes or []) if str(g).strip()]
+        self.last_query_genes = gene_panel
 
         if self._static_corpus is not None:
             self.pairs = _papers_to_pairs(self._static_corpus)
@@ -264,11 +290,18 @@ class LiteratureAgent:
                 )
                 return self.pairs
 
-        query = build_radiogenomics_query(disease, question)
+        query = build_radiogenomics_query(
+            disease, question, genes=gene_panel or None
+        )
         self.last_search_query = query
+        gene_note = (
+            f", gene_panel={len(gene_panel)}"
+            if gene_panel
+            else ", gene_panel=none (generic mutation terms only)"
+        )
         log(
             f"[literature] Searching PubMed for radiomics–mutation papers "
-            f"({cfg.provider}/{cfg.model})...",
+            f"(max_papers={self.max_papers}{gene_note}; {cfg.provider}/{cfg.model})...",
             enabled=self.verbose,
         )
         try:
@@ -434,9 +467,15 @@ class LiteratureAgent:
         disease: str,
         question: str = "",
         top_per_category: int = 8,
+        imaging: ImagingRadiomicsAgent | None = None,
+        genomics: GenomicsAgent | None = None,
     ) -> LiteratureContext:
         if not self.prepared:
             self.prepare(disease=disease, question=question or disease)
+        if imaging is not None:
+            self.imaging = imaging
+        if genomics is not None:
+            self.genomics = genomics
 
         supported_assocs: list = []
         unverified_assocs: list = []
@@ -494,7 +533,26 @@ class LiteratureAgent:
             title = conflicting[0].paper_title if conflicting else ""
             contradictions.append(f"{finding}: {note or title}")
 
-        if not supports and unverified:
+        mapped_related: list[MappedRelatedPair] = []
+        pair_aggregates: list[PairAggregate] = []
+        if not supports and self.pairs:
+            mapped_related, pair_aggregates = self._soft_map_and_aggregate(
+                result.associations,
+                disease=disease,
+                top_per_category=top_per_category,
+            )
+            if mapped_related:
+                refinements.append(
+                    f"No direct literature support; imaging+genomics agents mapped "
+                    f"{len(mapped_related)} associations onto {len(pair_aggregates)} "
+                    f"literature claim(s)"
+                )
+            else:
+                refinements.append(
+                    "Literature support is weak; imaging+genomics agents found no "
+                    "soft maps to prior pairs; require human review before another fetch"
+                )
+        elif not supports and unverified:
             refinements.append(
                 "Literature support is weak; require human review before another fetch"
             )
@@ -519,7 +577,125 @@ class LiteratureAgent:
             ],
             search_query=self.last_search_query,
             literature_source=self.last_source,
+            mapped_related=mapped_related,
+            pair_aggregates=pair_aggregates,
         )
+
+    def _soft_map_and_aggregate(
+        self,
+        associations: list,
+        *,
+        disease: str,
+        top_per_category: int = 8,
+        max_scan: int = 5000,
+    ) -> tuple[list[MappedRelatedPair], list[PairAggregate]]:
+        """When direct support is empty, map cohort pairs onto literature priors.
+
+        ImagingRadiomicsAgent expands radiomic families (texture→gldm/…);
+        GenomicsAgent relates genes (exact / alias / family). Matching pairs are
+        aggregated under each literature claim.
+        """
+        _ = disease
+        if not associations or not self.pairs:
+            return [], []
+
+        # Prefer stronger |r| when scanning a huge association list.
+        ranked = sorted(associations, key=lambda a: abs(float(a.effect_size)), reverse=True)
+        scan = ranked[: max(0, max_scan)]
+
+        mapped: list[MappedRelatedPair] = []
+        buckets: dict[str, list[MappedRelatedPair]] = {}
+        bucket_meta: dict[str, LitPair] = {}
+
+        for prior in self.pairs:
+            key = self._aggregate_key(prior)
+            bucket_meta[key] = prior
+            buckets.setdefault(key, [])
+
+        for assoc in scan:
+            for prior in self.pairs:
+                radio_ok, radio_reason, radio_score = self.imaging.relate_to_literature_terms(
+                    assoc.imaging_feature, prior.radiomic_terms
+                )
+                if not radio_ok:
+                    continue
+                gene_ok, gene_reason, gene_score = self.genomics.relate_to_literature_gene(
+                    assoc.genomic_feature, prior.gene
+                )
+                if not gene_ok:
+                    continue
+                key = self._aggregate_key(prior)
+                item = MappedRelatedPair(
+                    finding=self._finding_label(assoc),
+                    imaging_feature=assoc.imaging_feature,
+                    genomic_feature=assoc.genomic_feature,
+                    literature_gene=prior.gene,
+                    literature_radiomic_terms=sorted(prior.radiomic_terms),
+                    radiomic_reason=radio_reason,
+                    gene_reason=gene_reason,
+                    radiomic_score=float(radio_score),
+                    gene_score=float(gene_score),
+                    effect_size=float(assoc.effect_size),
+                    q_value=float(assoc.q_value),
+                    papers=[format_paper_ref(prior)],
+                    aggregate_key=key,
+                )
+                mapped.append(item)
+                buckets[key].append(item)
+
+        # De-duplicate identical association↔prior rows (keep highest combined score)
+        dedup: dict[tuple[str, str, str], MappedRelatedPair] = {}
+        for item in mapped:
+            k = (item.imaging_feature, item.genomic_feature, item.aggregate_key)
+            prev = dedup.get(k)
+            if prev is None or (item.radiomic_score + item.gene_score) > (
+                prev.radiomic_score + prev.gene_score
+            ):
+                dedup[k] = item
+        mapped = sorted(
+            dedup.values(),
+            key=lambda m: (abs(m.effect_size), m.radiomic_score + m.gene_score),
+        )
+        # Keep strongest mapped findings for display
+        mapped_display = mapped[-top_per_category:] if top_per_category > 0 else mapped
+
+        aggregates: list[PairAggregate] = []
+        for key, items in buckets.items():
+            if not items:
+                continue
+            # Unique associations under this literature claim
+            by_assoc: dict[tuple[str, str], MappedRelatedPair] = {}
+            for item in items:
+                ak = (item.imaging_feature, item.genomic_feature)
+                prev = by_assoc.get(ak)
+                if prev is None or abs(item.effect_size) > abs(prev.effect_size):
+                    by_assoc[ak] = item
+            uniq = sorted(by_assoc.values(), key=lambda m: abs(m.effect_size))
+            prior = bucket_meta[key]
+            best = uniq[-1]
+            radio_summaries = sorted({m.radiomic_reason for m in uniq if m.radiomic_reason})
+            gene_summaries = sorted({m.gene_reason for m in uniq if m.gene_reason})
+            aggregates.append(
+                PairAggregate(
+                    literature_gene=prior.gene,
+                    literature_radiomic_terms=sorted(prior.radiomic_terms),
+                    paper=format_paper_ref(prior),
+                    supports_claim=bool(prior.supports),
+                    n_mapped=len(uniq),
+                    best_abs_r=abs(float(best.effect_size)),
+                    mapped_findings=[m.finding for m in uniq[-top_per_category:]],
+                    radiomic_map_summary="; ".join(radio_summaries[:3]),
+                    gene_map_summary="; ".join(gene_summaries[:3]),
+                )
+            )
+        aggregates.sort(key=lambda a: (a.n_mapped, a.best_abs_r))
+        return mapped_display, aggregates
+
+    @staticmethod
+    def _aggregate_key(prior: LitPair) -> str:
+        terms = ",".join(sorted(prior.radiomic_terms))
+        pmid = prior.pmid or prior.paper_title or "prior"
+        return f"{prior.gene}|{terms}|{pmid}"
 
     def classify(
         self,
@@ -551,58 +727,32 @@ class LiteratureAgent:
     def _matching_pairs(
         self, imaging_feature: str, genomic_feature: str, disease: str
     ) -> list[LitPair]:
-        gene = genomic_feature
-        if gene.endswith("_mut") or gene.endswith("_expr"):
-            gene = gene.rsplit("_", 1)[0]
-        gene = gene.upper().replace("HER2", "ERBB2")
-        img_tokens = self._imaging_tokens(imaging_feature)
+        gene = self.genomics.gene_symbol(genomic_feature)
         disease_tokens = self._disease_tokens(disease)
         hits: list[LitPair] = []
         for pair in self.pairs:
-            if pair.gene.upper().replace("HER2", "ERBB2") != gene:
+            if self.genomics.normalize_gene(pair.gene) != gene:
                 continue
             # Optional disease filter when the prior pair carries disease tags
             pair_diseases = {t for t in pair.radiomic_terms if t in _DISEASE_TAGS}
             if pair_diseases and not (pair_diseases & disease_tokens):
                 continue
-            if self._radiomic_overlap(pair.radiomic_terms, img_tokens):
+            related, _, _ = self.imaging.relate_to_literature_terms(
+                imaging_feature, pair.radiomic_terms
+            )
+            if related:
                 hits.append(pair)
         return hits
 
-    @staticmethod
-    def _radiomic_overlap(pair_terms: frozenset[str], img_tokens: set[str]) -> bool:
-        generic = {
-            "original",
-            "mut",
-            "expr",
-            "cancer",
-            "tumor",
-            "tumour",
-            "radiomic",
-            "radiomics",
-            "feature",
-            "features",
-            "imaging",
-            "ct",
-            "mri",
-            "mr",
-            *_DISEASE_TAGS,
-        }
-        specific = {t.lower() for t in pair_terms} - generic
-        if not specific:
-            return False
-        # Match if any specific term appears in imaging feature tokens or as substring
-        for term in specific:
-            if term in img_tokens:
-                return True
-            if any(term in tok or tok in term for tok in img_tokens if len(term) >= 3):
-                return True
-        return False
+    def _radiomic_overlap(self, pair_terms: frozenset[str], img_tokens: set[str]) -> bool:
+        """Back-compat helper; prefer ImagingRadiomicsAgent.relate_to_literature_terms."""
+        # Reconstruct a synthetic feature name from tokens for the imaging agent.
+        fake_feature = "_".join(sorted(img_tokens)) if img_tokens else ""
+        related, _, _ = self.imaging.relate_to_literature_terms(fake_feature, pair_terms)
+        return related
 
-    @staticmethod
-    def _imaging_tokens(imaging_feature: str) -> set[str]:
-        parts = imaging_feature.lower().replace("-", "_").split("_")
-        return {p for p in parts if p}
+    def _imaging_tokens(self, imaging_feature: str) -> set[str]:
+        return self.imaging.feature_tokens(imaging_feature)
 
     @staticmethod
     def _finding_label(assoc) -> str:

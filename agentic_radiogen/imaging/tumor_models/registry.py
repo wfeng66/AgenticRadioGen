@@ -28,7 +28,7 @@ class TumorModelSpec:
     runner: str
     # totalsegmentator_organ | totalsegmentator_task | threshold_proxy
     # | torchscript | huggingface | nnunet | nnunet_autopet | monai_bundle
-    # | promptable | fine_tune
+    # | lungtumormask | promptable | fine_tune
     description: str
     organ_keywords: tuple[str, ...] = ()
     weight_filename: str = ""
@@ -110,7 +110,8 @@ DEFAULT_MODELS: tuple[TumorModelSpec, ...] = (
         description=(
             "MONAI Model Zoo lung_nodule_ct_detection (LUNA16 RetinaNet). Detects "
             "pulmonary nodules/masses on CT and rasterizes boxes to a lesion mask. "
-            "Auto-downloads from HuggingFace MONAI/lung_nodule_ct_detection."
+            "Auto-downloads from HuggingFace MONAI/lung_nodule_ct_detection. "
+            "Note: this is detection RetinaNet — not Swin UNETR (Swin is fine_tune only)."
         ),
         source="huggingface",
         hf_repo="MONAI/lung_nodule_ct_detection",
@@ -119,6 +120,27 @@ DEFAULT_MODELS: tuple[TumorModelSpec, ...] = (
         operational_type="ready_inference",
         direct_inference=True,
         extra={"bundle_name": "lung_nodule_ct_detection"},
+    ),
+    TumorModelSpec(
+        model_id="lungtumormask",
+        diseases=("lung", "nsclc", "sclc", "luad", "lusc", "pulmonary", "nodule"),
+        modalities=("CT",),
+        runner="lungtumormask",
+        description=(
+            "LungTumorMask (VemundFredriksen): end-to-end CT lung-tumor segmentor. "
+            "Used when nnU-Net Task006 / MONAI nodule detection return empty or fail. "
+            "Auto-installs wheel with --no-deps (official torch<=1.11 pin is incompatible "
+            "with modern envs)."
+        ),
+        source="url",
+        download_url=(
+            "https://github.com/VemundFredriksen/LungTumorMask/releases/download/"
+            "v1.3.1/lungtumormask-1.3.1-py2.py3-none-any.whl"
+        ),
+        is_tumor_model=True,
+        priority=14,
+        operational_type="ready_inference",
+        direct_inference=True,
     ),
     TumorModelSpec(
         model_id="nnunet_autopet",

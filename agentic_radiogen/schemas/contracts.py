@@ -106,6 +106,38 @@ class LiteratureSupport(BaseModel):
     contradiction: str | None = None
 
 
+class MappedRelatedPair(BaseModel):
+    """Association linked to a literature claim via specialist soft-mapping."""
+
+    finding: str
+    imaging_feature: str
+    genomic_feature: str
+    literature_gene: str
+    literature_radiomic_terms: list[str] = Field(default_factory=list)
+    radiomic_reason: str = ""
+    gene_reason: str = ""
+    radiomic_score: float = 0.0
+    gene_score: float = 0.0
+    effect_size: float = 0.0
+    q_value: float = 1.0
+    papers: list[str] = Field(default_factory=list)
+    aggregate_key: str = ""
+
+
+class PairAggregate(BaseModel):
+    """Literature claim with all cohort associations mapped under it."""
+
+    literature_gene: str
+    literature_radiomic_terms: list[str] = Field(default_factory=list)
+    paper: str = ""
+    supports_claim: bool = True
+    n_mapped: int = 0
+    best_abs_r: float = 0.0
+    mapped_findings: list[str] = Field(default_factory=list)
+    radiomic_map_summary: str = ""
+    gene_map_summary: str = ""
+
+
 class LiteratureContext(BaseModel):
     supports: list[LiteratureSupport] = Field(default_factory=list)
     unverified: list[str] = Field(default_factory=list)
@@ -115,6 +147,9 @@ class LiteratureContext(BaseModel):
     prior_pairs: list[dict] = Field(default_factory=list)
     search_query: str | None = None
     literature_source: str | None = None
+    # Soft maps from ImagingRadiomicsAgent + GenomicsAgent when direct support is empty.
+    mapped_related: list[MappedRelatedPair] = Field(default_factory=list)
+    pair_aggregates: list[PairAggregate] = Field(default_factory=list)
 
 
 class LoopAction(str, Enum):

@@ -5,11 +5,15 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from agentic_radiogen.data.http_json import RemoteApiError, get_bytes, get_json
 
 _EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+# NCBI esearch allows retmax up to 10_000 per request.
+_MAX_RETMAX = 10_000
+# Above this, OR-ing every symbol blows PubMed query length; omit gene clause.
+_MAX_GENES_IN_QUERY = 500
 
 
 @dataclass(frozen=True)
@@ -39,18 +43,19 @@ class PubMedClient:
         self,
         query: str,
         *,
-        max_results: int = 20,
+        max_results: int = 500,
     ) -> list[str]:
         """Return PubMed IDs for a free-text query."""
         q = (query or "").strip()
         if not q:
             return []
+        retmax = max(1, min(int(max_results), _MAX_RETMAX))
         data = self._get(
             f"{_EUTILS}/esearch.fcgi",
             params={
                 "db": "pubmed",
                 "term": q,
-                "retmax": str(max(1, min(int(max_results), 50))),
+                "retmax": str(retmax),
                 "retmode": "json",
                 "sort": "relevance",
             },
@@ -63,26 +68,44 @@ class PubMedClient:
         return [str(x) for x in idlist if str(x).strip()]
 
     def fetch(self, pmids: list[str]) -> list[PubMedArticle]:
-        """Fetch title + abstract for PubMed IDs."""
+        """Fetch title + abstract for PubMed IDs (batched)."""
         ids = [p for p in pmids if p]
         if not ids:
             return []
-        raw = self._get_bytes(
-            f"{_EUTILS}/efetch.fcgi",
-            params={
-                "db": "pubmed",
-                "id": ",".join(ids),
-                "retmode": "xml",
-            },
-            timeout=self.timeout,
-        )
-        return _parse_pubmed_xml(raw)
+        # efetch is happier with modest batches
+        out: list[PubMedArticle] = []
+        batch_size = 200
+        for i in range(0, len(ids), batch_size):
+            chunk = ids[i : i + batch_size]
+            raw = self._get_bytes(
+                f"{_EUTILS}/efetch.fcgi",
+                params={
+                    "db": "pubmed",
+                    "id": ",".join(chunk),
+                    "retmode": "xml",
+                },
+                timeout=self.timeout,
+            )
+            out.extend(_parse_pubmed_xml(raw))
+        return out
 
 
-def build_radiogenomics_query(disease: str, question: str | None = None) -> str:
-    """Build a PubMed query biased toward radiomics ↔ mutation papers."""
+def build_radiogenomics_query(
+    disease: str,
+    question: str | None = None,
+    *,
+    genes: Iterable[str] | None = None,
+) -> str:
+    """Build a PubMed query biased toward radiomics ↔ mutation papers.
+
+    Specific gene symbols are included only when ``genes`` is a non-empty
+    explicit panel (all of them, or none if the panel is too large for PubMed).
+    Never hardcode a shortlist like EGFR/KRAS — that biases retrieval and the LLM.
+    """
     disease = (disease or "").strip() or "cancer"
-    # Keep disease tokens; drop ultra-generic words from the free-text question.
+    gene_clause = _gene_or_clause(genes)
+
+    # Keep only non-gene topical cues from the free-text question (no EGFR/KRAS/…).
     extras = ""
     if question:
         stop = {
@@ -101,6 +124,8 @@ def build_radiogenomics_query(disease: str, question: str | None = None) -> str:
             "genomic",
             "alterations",
             "alteration",
+            "mutation",
+            "mutations",
             "in",
             "of",
             "and",
@@ -119,16 +144,60 @@ def build_radiogenomics_query(disease: str, question: str | None = None) -> str:
             "do",
             "does",
         }
+        # Gene-like tokens from the question must not bias the search unless they
+        # are part of an explicit ``genes`` panel (handled above).
         words = re.findall(r"[A-Za-z0-9\-+]+", question.lower())
-        keep = [w for w in words if w not in stop and len(w) > 2]
-        # Prefer mutation/radiomics cues from the question if present.
-        cues = [w for w in keep if w in {"radiomic", "radiomics", "mutation", "mutations", "egfr", "kras", "her2", "erbb2"}]
-        if cues:
-            extras = " " + " ".join(sorted(set(cues))[:6])
-    return (
-        f'({disease}) AND (radiomic OR radiomics OR "texture analysis" OR "imaging biomarker") '
-        f"AND (mutation OR genomic OR genotype OR EGFR OR KRAS OR TP53 OR HER2 OR BRCA){extras}"
+        keep = [
+            w
+            for w in words
+            if w not in stop
+            and len(w) > 2
+            and w
+            in {
+                "radiomic",
+                "radiomics",
+                "texture",
+                "biomarker",
+                "genotype",
+                "genomics",
+            }
+        ]
+        if keep:
+            extras = " " + " ".join(sorted(set(keep))[:6])
+
+    mutation_block = (
+        gene_clause
+        if gene_clause
+        else "(mutation OR genomic OR genotype OR radiogenomic OR radiogenomics)"
     )
+    return (
+        f"({disease}) AND (radiomic OR radiomics OR \"texture analysis\" OR "
+        f"\"imaging biomarker\") AND {mutation_block}{extras}"
+    )
+
+
+def _gene_or_clause(genes: Iterable[str] | None) -> str:
+    if not genes:
+        return ""
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in genes:
+        g = str(raw or "").strip().upper().replace("HER2", "ERBB2")
+        if g.endswith("_MUT") or g.endswith("_EXPR"):
+            g = g.rsplit("_", 1)[0]
+        if not g or g in seen:
+            continue
+        # Skip tokens that look like free text, not gene symbols
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9\-]{0,14}", g):
+            continue
+        seen.add(g)
+        symbols.append(g)
+    if not symbols:
+        return ""
+    if len(symbols) > _MAX_GENES_IN_QUERY:
+        # All-or-nothing: too many symbols → omit gene clause entirely.
+        return ""
+    return "(" + " OR ".join(symbols) + ")"
 
 
 def _parse_pubmed_xml(raw: bytes) -> list[PubMedArticle]:

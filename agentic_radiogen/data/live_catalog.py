@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +22,17 @@ from agentic_radiogen.data.tcia_client import (
 from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 from agentic_radiogen.util.progress import log, progress_enabled, progress_iter
 
+_SEGM_LOG_FIELDS = (
+    "patient_id",
+    "image_path",
+    "diagnosis",
+    "segmentation_model",
+    "models_attempted",
+    "mask_path",
+    "n_mask_voxels",
+    "status",
+)
+
 
 @dataclass
 class LiveCatalog:
@@ -32,10 +44,14 @@ class LiveCatalog:
     extract_radiomics: bool = True
     use_llm: bool | None = None
     show_progress: bool | None = None
+    store_segm: bool = False
+    segm_dir: Path = field(default_factory=lambda: Path.cwd() / "segm_rslt")
     query_count: int = 0
     fetch_count: int = 0
     last_source_counts: dict[str, int] = field(default_factory=dict)
     last_imaging_notes: list[str] = field(default_factory=list)
+    last_segmentation_log: list[dict[str, str]] = field(default_factory=list)
+    last_segmentation_log_path: str | None = None
     last_intermediate: dict = field(default_factory=dict)
     last_question_text: str = ""
     _record_cache: dict[str, CatalogRecord] = field(default_factory=dict)
@@ -607,6 +623,8 @@ class LiveCatalog:
     def fetch_records(self, patient_ids: list[str]) -> list[CatalogRecord]:
         self.fetch_count += 1
         self.last_imaging_notes = []
+        self.last_segmentation_log = []
+        self.last_segmentation_log_path = None
         verbose = self._progress_on()
         if not patient_ids:
             return []
@@ -641,13 +659,17 @@ class LiveCatalog:
             self.last_intermediate["discover_genes"] = True
             self.last_intermediate["gene_source"] = "cohort"
         else:
+            src = str(self.last_intermediate.get("gene_source") or "explicit")
+            if src not in {"literature", "explicit"}:
+                src = "explicit"
             log(
-                f"[fetch] Literature gene panel for {len(patient_ids)} patients "
-                f"({', '.join(genes[:6])}{'...' if len(genes) > 6 else ''})",
+                f"[fetch] Gene panel ({src}) for {len(patient_ids)} patients "
+                f"({len(genes)} genes: {', '.join(genes[:8])}"
+                f"{'...' if len(genes) > 8 else ''})",
                 enabled=verbose,
             )
             self.last_intermediate["discover_genes"] = False
-            self.last_intermediate["gene_source"] = "literature"
+            self.last_intermediate["gene_source"] = src
             self.last_intermediate["genes"] = list(genes)
         flags = self.gdc.mutation_flags(patient_ids, genes) if genes else {
             pid: {} for pid in patient_ids
@@ -700,6 +722,13 @@ class LiveCatalog:
                                 or ""
                             ),
                         )
+                        diagnosis = str(
+                            rec.clinical.get("primary_diagnosis")
+                            or rec.clinical.get("subtype")
+                            or seg_disease
+                            or rec.disease
+                            or ""
+                        )
                         extracted = extract_series_features(
                             series_dir,
                             disease=seg_disease,
@@ -708,6 +737,9 @@ class LiveCatalog:
                             or self.last_question_text
                             or seg_disease,
                             use_llm=self.use_llm,
+                            store_segm=self.store_segm,
+                            segm_dir=self.segm_dir,
+                            patient_id=pid,
                         )
                         radiomic_features = {
                             k: float(v)
@@ -721,9 +753,31 @@ class LiveCatalog:
                         }
                         cache_note = "cached" if extracted.get("from_cache") else "computed"
                         seg = extracted.get("segmentation_backend") or "?"
+                        model_id = (
+                            extracted.get("segmentation_model_id")
+                            or extracted.get("segmentation_backend")
+                            or "?"
+                        )
+                        status = str(extracted.get("segm_status") or "success")
+                        n_vox = extracted.get("n_mask_voxels", "")
+                        self.last_segmentation_log.append(
+                            {
+                                "patient_id": pid,
+                                "image_path": str(Path(series_dir).resolve()),
+                                "diagnosis": diagnosis,
+                                "segmentation_model": str(model_id),
+                                "models_attempted": str(
+                                    extracted.get("models_attempted") or model_id or ""
+                                ),
+                                "mask_path": str(extracted.get("mask_path") or ""),
+                                "n_mask_voxels": str(n_vox),
+                                "status": status,
+                            }
+                        )
                         self.last_imaging_notes.append(
                             f"{pid}: radiomics ok ({cache_note}, seg={seg}, "
-                            f"disease={seg_disease}, {Path(series_dir).name})"
+                            f"model={model_id}, disease={seg_disease}, "
+                            f"{Path(series_dir).name})"
                         )
                         ok += 1
                     else:
@@ -732,6 +786,27 @@ class LiveCatalog:
                         )
                         skipped += 1
                 except Exception as exc:
+                    diagnosis = str(
+                        rec.clinical.get("primary_diagnosis")
+                        or rec.clinical.get("subtype")
+                        or rec.disease
+                        or ""
+                    )
+                    img_path = local_path or ""
+                    if rec.series_uid and not img_path:
+                        img_path = f"series_uid={rec.series_uid}"
+                    self.last_segmentation_log.append(
+                        {
+                            "patient_id": pid,
+                            "image_path": str(img_path),
+                            "diagnosis": diagnosis,
+                            "segmentation_model": "",
+                            "models_attempted": "",
+                            "mask_path": "",
+                            "n_mask_voxels": "0",
+                            "status": f"failure: {exc}",
+                        }
+                    )
                     self.last_imaging_notes.append(f"{pid}: imaging failed: {exc}")
                     failed += 1
             else:
@@ -760,19 +835,44 @@ class LiveCatalog:
             self._record_cache[pid] = updated
             fetched.append(updated)
 
+        segm_log_path = self._write_segmentation_log()
         self.last_intermediate = {
             **self.last_intermediate,
             "fetch_requested": len(patient_ids),
             "radiomics_ok": ok,
             "radiomics_failed": failed,
             "imaging_skipped": skipped,
+            "segmentation_log_path": segm_log_path,
+            "segmentation_log_n": len(self.last_segmentation_log),
         }
         log(
             f"[fetch] Done: radiomics_ok={ok}, failed={failed}, skipped={skipped} "
             f"(of {len(patient_ids)} patients)",
             enabled=verbose,
         )
+        if segm_log_path:
+            log(
+                f"[fetch] Segmentation log ({len(self.last_segmentation_log)} rows) → "
+                f"{segm_log_path}",
+                enabled=verbose,
+            )
         return fetched
+
+    def _write_segmentation_log(self) -> str | None:
+        """Write one-row-per-image segmentation CSV under ``segm_rslt``."""
+        rows = list(self.last_segmentation_log)
+        if not rows:
+            return None
+        out_dir = Path(self.segm_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "segmentation_log.csv"
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(_SEGM_LOG_FIELDS))
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in _SEGM_LOG_FIELDS})
+        self.last_segmentation_log_path = str(path.resolve())
+        return self.last_segmentation_log_path
 
     def _best_series_per_patient(
         self,

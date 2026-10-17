@@ -31,8 +31,10 @@ def test_threshold_radiomics_from_synthetic_volume() -> None:
     assert any(k.startswith("original_glszm_") for k in analysis)
     assert any(k.startswith("original_gldm_") for k in analysis)
     assert any(k.startswith("original_ngtdm_") for k in analysis)
-    mask, backend = make_roi_mask(volume)
+    mask, backend, model_id, attempted = make_roi_mask(volume)
+    assert model_id
     assert mask.any()
+    assert attempted
     assert backend in {"threshold_proxy", "threshold_cpu", "totalsegmentator_organ"}
     assert segmentation_backend()["backend"] in {
         "threshold_cpu",

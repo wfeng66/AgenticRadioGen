@@ -35,6 +35,8 @@ class SegmentationResult:
     is_tumor_model: bool
     note: str = ""
     organ_keywords: tuple[str, ...] = ()
+    # What was tried this call, e.g. ("nnunet_msd_lung:empty", "monai_lung_nodule:ok")
+    attempts: tuple[str, ...] = ()
 
 
 # Runners that can produce a mask today without prompts / extra wiring.
@@ -47,8 +49,25 @@ _LIVE_RUNNERS = frozenset(
         "nnunet",
         "nnunet_autopet",
         "monai_bundle",
+        "lungtumormask",
     }
 )
+
+# Only these may be skipped for the rest of a cohort after a hard crash.
+# Auto-download tumor models (nnU-Net / MONAI / LungTumorMask) must keep being
+# tried — a one-shot install/CUDA glitch was causing nnunet→ts_lung with monai
+# never attempted again (CSV then only showed winners).
+_COHORT_BLOCK_MODELS = frozenset({"ts_lung_nodules"})
+
+
+def _should_cohort_block(model_id: str, message: str) -> bool:
+    if model_id in _COHORT_BLOCK_MODELS:
+        return True
+    m = (message or "").lower()
+    # Explicit no-download session: retrying every patient is pointless.
+    if "download disabled" in m or "install disabled" in m:
+        return True
+    return False
 
 
 def _is_patient_local_failure(message: str) -> bool:
@@ -264,6 +283,7 @@ class SegmentationAgent:
         candidates = live
 
         errors: list[str] = list(skipped)
+        attempts: list[str] = [f"skip:{s}" for s in skipped]
         for spec in candidates:
             try:
                 result = self._try_spec(
@@ -273,6 +293,7 @@ class SegmentationAgent:
                     modality=modality,
                     spacing_zyx=spacing_zyx,
                 )
+                attempts.append(f"{spec.model_id}:ok")
                 # Only rewrite plan cache for durable fallbacks (not one empty-mask case).
                 if (
                     result.model_id != primary.model_id
@@ -288,10 +309,22 @@ class SegmentationAgent:
                             f"using {spec.model_id}"
                         ),
                     )
-                return result
+                return SegmentationResult(
+                    mask=result.mask,
+                    backend=result.backend,
+                    model_id=result.model_id,
+                    is_tumor_model=result.is_tumor_model,
+                    note=result.note,
+                    organ_keywords=result.organ_keywords,
+                    attempts=tuple(attempts),
+                )
             except Exception as exc:
                 msg = str(exc)
+                short = msg.replace("\n", " ").strip()
+                if len(short) > 160:
+                    short = short[:157] + "..."
                 errors.append(f"{spec.model_id}: {exc}")
+                attempts.append(f"{spec.model_id}:fail:{short}")
                 # Empty ROI / thin series are patient-specific — do NOT block the
                 # model for the rest of the cohort (that forced everyone to threshold).
                 if _is_patient_local_failure(msg):
@@ -300,12 +333,20 @@ class SegmentationAgent:
                         f"for this case ({exc}); trying next (model stays enabled)",
                         enabled=self.verbose,
                     )
-                else:
+                elif _should_cohort_block(spec.model_id, msg):
                     self._failed_model_ids.add(spec.model_id)
                     self._block_model(spec.model_id, msg)
                     log(
                         f"[segmentation] Model '{spec.model_id}' unavailable ({exc}); "
-                        f"trying next",
+                        f"cohort-blocked, trying next",
+                        enabled=self.verbose,
+                    )
+                else:
+                    # Install/CUDA/transient errors: keep trying on later patients so
+                    # monai_lung_nodule / lungtumormask are not skipped after one glitch.
+                    log(
+                        f"[segmentation] Model '{spec.model_id}' failed ({exc}); "
+                        f"trying next (model stays enabled for later patients)",
                         enabled=self.verbose,
                     )
 
@@ -313,6 +354,7 @@ class SegmentationAgent:
 
         mask = _threshold_mask(volume)
         note = "; ".join(errors[:3])
+        attempts.append("threshold_proxy:ok")
         log(
             f"[segmentation] All models failed for disease='{disease}'; "
             f"using threshold_proxy",
@@ -324,6 +366,7 @@ class SegmentationAgent:
             model_id="threshold_proxy",
             is_tumor_model=False,
             note=note or "fallback",
+            attempts=tuple(attempts),
         )
 
     @classmethod
@@ -415,6 +458,12 @@ class SegmentationAgent:
             log(
                 f"[segmentation] Using MONAI bundle '{spec.model_id}' "
                 f"(lung_nodule_ct_detection; auto-download on first use if needed)",
+                enabled=self.verbose,
+            )
+        elif spec.runner == "lungtumormask":
+            log(
+                f"[segmentation] Using LungTumorMask '{spec.model_id}' "
+                f"(pip CLI; auto-install wheel on first use if needed)",
                 enabled=self.verbose,
             )
         elif spec.runner in {"totalsegmentator_organ", "totalsegmentator_task"}:

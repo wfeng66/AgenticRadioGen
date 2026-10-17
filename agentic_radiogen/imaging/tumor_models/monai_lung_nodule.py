@@ -222,10 +222,12 @@ def _infer_programmatic(
         import torch
         from monai.apps.detection.networks.retinanet_detector import RetinaNetDetector
         from monai.apps.detection.networks.retinanet_network import (
-            retinanet_resnet50_fpn_feature_extractor,
+            RetinaNet,
+            resnet_fpn_feature_extractor,
         )
         from monai.apps.detection.utils.anchor_utils import AnchorGeneratorWithAnchorShape
         from monai.data import MetaTensor
+        from monai.networks.nets import resnet
         from monai.transforms import (
             EnsureChannelFirst,
             ScaleIntensityRange,
@@ -234,7 +236,8 @@ def _infer_programmatic(
     except ImportError as exc:
         raise RuntimeError(
             "MONAI detection extras required "
-            "(pip install 'monai[nibabel]' with detection support)"
+            "(pip install 'monai[nibabel]' with detection support): "
+            f"{exc}"
         ) from exc
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -249,21 +252,35 @@ def _infer_programmatic(
 
     t = torch.from_numpy(vol_xyz.astype(np.float32))
     meta = MetaTensor(t, affine=_affine_from_spacing(spacing_xyz))
-    img = EnsureChannelFirst()(meta)
+    # Volume has no channel axis; MONAI 1.6 requires an explicit channel_dim.
+    img = EnsureChannelFirst(channel_dim="no_channel")(meta)
     img = Spacing(pixdim=(0.703125, 0.703125, 1.25), mode="bilinear")(img)
     img = ScaleIntensityRange(
         a_min=-1024.0, a_max=300.0, b_min=0.0, b_max=1.0, clip=True
     )(img)
     img = img.to(device)
 
+    # Match lung_nodule_ct_detection configs/inference.json (MONAI ≥1.3 API:
+    # resnet_fpn_feature_extractor + resnet50; not the removed
+    # retinanet_resnet50_fpn_feature_extractor helper).
     anchor_generator = AnchorGeneratorWithAnchorShape(
         feature_map_scales=(1, 2, 4),
         base_anchor_shapes=((6, 8, 4), (8, 6, 5), (10, 10, 6)),
     )
-    feature_extractor = retinanet_resnet50_fpn_feature_extractor(
-        spatial_dims=3, n_input_channels=1
+    backbone = resnet.resnet50(
+        pretrained=False,
+        progress=False,
+        spatial_dims=3,
+        n_input_channels=1,
+        conv1_t_stride=(2, 2, 1),
+        conv1_t_size=(7, 7, 7),
     )
-    from monai.apps.detection.networks.retinanet_network import RetinaNet
+    feature_extractor = resnet_fpn_feature_extractor(
+        backbone=backbone,
+        spatial_dims=3,
+        pretrained_backbone=False,
+        returned_layers=(1, 2),
+    )
 
     network = RetinaNet(
         spatial_dims=3,
@@ -271,6 +288,7 @@ def _infer_programmatic(
         num_anchors=3,
         feature_extractor=feature_extractor,
         size_divisible=(16, 16, 8),
+        use_list_output=False,
     ).to(device)
     state = torch.load(str(ckpt), map_location=device, weights_only=False)
     if isinstance(state, dict) and "model" in state:
@@ -286,6 +304,7 @@ def _infer_programmatic(
         num_classes=1,
         size_divisible=(16, 16, 8),
     )
+    detector.eval()  # inference without GT boxes (training path requires targets)
     detector.set_target_keys(box_key="box", label_key="label")
     detector.set_box_selector_parameters(
         score_thresh=float(score_thresh),

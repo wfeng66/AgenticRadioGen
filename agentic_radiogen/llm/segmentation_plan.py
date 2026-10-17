@@ -18,7 +18,7 @@ from agentic_radiogen.imaging.tumor_models.registry import (
 from agentic_radiogen.llm.client import LlmClient
 from agentic_radiogen.util.progress import log
 
-_PLAN_CACHE_VERSION = 9  # AutoPET + MONAI lung nodule in catalog; tumor-before-organ
+_PLAN_CACHE_VERSION = 10  # + LungTumorMask CT tumor fallback
 _DEFAULT_PLAN_CACHE = Path.cwd() / "data_cache" / "seg_plans"
 
 
@@ -53,14 +53,18 @@ Catalog operational_type meanings:
 Rules:
 - Prefer the MOST SPECIFIC anatomy/histology cues over a coarse phrase like "lung cancer".
 - For lung cancer / LUAD / LUSC on CT, prefer ready tumor models in this order of fit:
-  1) nnunet_msd_lung — large primary NSCLC masses (Zenodo Task006; auto-download).
-  2) monai_lung_nodule — pulmonary nodules/masses (MONAI Model Zoo RetinaNet; CT).
-  3) nnunet_autopet — only when PET (or PET+CT) is available; metabolic / infiltrating
+  1) nnunet_msd_lung — large primary NSCLC masses (Zenodo Task006 / MSD Lung; auto-download).
+  2) monai_lung_nodule — pulmonary nodules/masses (MONAI Model Zoo RetinaNet detection; CT).
+  3) lungtumormask — VemundFredriksen LungTumorMask end-to-end CT tumor segmentor
+     (pip CLI; good when 1–2 return empty).
+  4) nnunet_autopet — only when PET (or PET+CT) is available; metabolic / infiltrating
      lesions (lab-midas AutoPET). Do NOT pick for CT-only cases.
 - Do NOT pick ts_lung_nodules unless explicitly enabled.
-- Swin UNETR / STU-Net are fine_tune only — never for live segmentation.
+- Swin UNETR / STU-Net are fine_tune only — never for live segmentation
+  (we do NOT run a live MONAI Swin UNETR lung_tumor bundle).
 - Organ models (ts_*) are last-resort anatomy fallbacks after tumor models fail
-  at runtime — do not prefer ts_lung over nnunet_msd_lung / monai_lung_nodule.
+  at runtime — do not prefer ts_lung over nnunet_msd_lung / monai_lung_nodule /
+  lungtumormask.
 - You may pick totalsegmentator_organ with custom organ_keywords when needed.
 - Never pick fine_tune for live segmentation.
 - Set is_tumor_model to match the catalog entry.

@@ -64,8 +64,9 @@ class OrchestratorAgent:
         llm_model: str | None = None,
         llm_client: LlmClient | None = None,
     ) -> None:
-        # genes: None => all genes in paired genomics cohort
+        # genes: None/"all" => all mutated genes in paired genomics cohort
         # genes: "auto" => literature/profile candidate genes
+        # genes: "TP53" or "EGFR,KRAS" => explicit panel only
         self.tcga_project = tcga_project
         self.tcia_collection = tcia_collection
         self.modality = modality
@@ -191,11 +192,15 @@ class OrchestratorAgent:
                 tcia_collection=self.tcia_collection,
                 modality=self.modality or question.modality,
             )
-        mode = self._gene_mode(self.genes)
+        mode, explicit_genes = self._parse_gene_spec(self.genes)
         if mode == "literature":
             genes = list(profile.candidate_genes)
             discover = False
             gene_source = "literature"
+        elif mode == "explicit":
+            genes = list(explicit_genes)
+            discover = False
+            gene_source = "explicit"
         else:
             genes = []
             discover = True
@@ -242,23 +247,45 @@ class OrchestratorAgent:
         return self.plan(self.parse(text, disease=disease))
 
     @staticmethod
-    def _gene_mode(genes: str | list[str] | None) -> str:
+    def _normalize_gene_symbol(raw: str) -> str:
+        g = str(raw or "").strip().upper().replace("HER2", "ERBB2")
+        if g.endswith("_MUT") or g.endswith("_EXPR"):
+            g = g.rsplit("_", 1)[0]
+        return g
+
+    @classmethod
+    def _parse_gene_spec(cls, genes: str | list[str] | None) -> tuple[str, list[str]]:
+        """Return (mode, explicit_genes).
+
+        mode: cohort | literature | explicit
+        """
         if genes is None:
-            return "cohort"
-        if isinstance(genes, str):
-            token = genes.strip().lower()
-        elif len(genes) == 1:
-            token = str(genes[0]).strip().lower()
-        else:
-            raise ValueError(
-                "Manual gene lists are not supported. "
-                "Omit --genes for all cohort mutations, or pass --genes auto for literature genes."
-            )
-        if token in {"", "cohort", "all"}:
-            return "cohort"
-        if token == "auto":
-            return "literature"
-        raise ValueError(
-            f"Unknown --genes value '{genes}'. Use --genes auto (literature) "
-            "or omit --genes (all genes in genomics cohort)."
-        )
+            return "cohort", []
+        if isinstance(genes, list):
+            tokens = [cls._normalize_gene_symbol(g) for g in genes if str(g).strip()]
+            tokens = [g for g in tokens if g]
+            if not tokens or (len(tokens) == 1 and tokens[0] in {"ALL", "COHORT"}):
+                return "cohort", []
+            if len(tokens) == 1 and tokens[0] == "AUTO":
+                return "literature", []
+            return "explicit", tokens
+
+        text = str(genes).strip()
+        if not text or text.lower() in {"all", "cohort"}:
+            return "cohort", []
+        if text.lower() == "auto":
+            return "literature", []
+        parts = [cls._normalize_gene_symbol(p) for p in text.split(",")]
+        parts = [p for p in parts if p]
+        if not parts:
+            return "cohort", []
+        if len(parts) == 1 and parts[0] in {"ALL", "COHORT"}:
+            return "cohort", []
+        if len(parts) == 1 and parts[0] == "AUTO":
+            return "literature", []
+        return "explicit", parts
+
+    @classmethod
+    def _gene_mode(cls, genes: str | list[str] | None) -> str:
+        mode, _ = cls._parse_gene_spec(genes)
+        return mode

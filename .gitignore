@@ -32,6 +32,8 @@ results/
 runs/
 artifacts/
 reports/
+outputs/
+segm_rslt/
 *.log
 
 # --- Imaging / model artifacts ---
@@ -50,6 +52,12 @@ reports/
 *.tar
 *.tar.gz
 !.github/**
+*.pptx
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
 
 # --- Office / OS junk ---
 ~$*

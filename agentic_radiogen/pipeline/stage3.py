@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agentic_radiogen.agents.genomics import GenomicsAgent
+from agentic_radiogen.agents.imaging import ImagingRadiomicsAgent
 from agentic_radiogen.agents.literature import LiteratureAgent
 from agentic_radiogen.agents.statistics import StatisticalCriticalAgent
 from agentic_radiogen.pipeline.stage2 import SpecialistOutputs
@@ -26,6 +28,8 @@ def join_and_interpret(
     question: str = "",
     stats: StatisticalCriticalAgent | None = None,
     literature: LiteratureAgent | None = None,
+    imaging: ImagingRadiomicsAgent | None = None,
+    genomics: GenomicsAgent | None = None,
 ) -> Stage3Result:
     """Stats joins both matrices; literature interprets. This stage does not loop."""
     if outputs.radiomics is None or outputs.genomics is None:
@@ -37,6 +41,10 @@ def join_and_interpret(
     literature_agent = literature or LiteratureAgent()
     model = stats_agent.analyze(outputs.radiomics, outputs.genomics)
     context = literature_agent.interpret(
-        model, disease=disease, question=question or disease
+        model,
+        disease=disease,
+        question=question or disease,
+        imaging=imaging,
+        genomics=genomics,
     )
     return Stage3Result(stats=model, literature=context, looped=False)

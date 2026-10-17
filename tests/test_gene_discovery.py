@@ -27,9 +27,13 @@ def test_genes_auto_uses_literature_panel() -> None:
     assert request.filters.get("gene_source") == "literature"
 
 
-def test_manual_gene_list_is_rejected() -> None:
-    with pytest.raises(ValueError, match="Manual gene lists"):
-        OrchestratorAgent(genes=["EGFR", "KRAS"]).parse_and_plan("lung cancer imaging")
+def test_manual_gene_list_is_accepted_as_explicit_panel() -> None:
+    request = OrchestratorAgent(genes=["EGFR", "KRAS"]).parse_and_plan(
+        "lung cancer imaging"
+    )
+    assert request.genes == ["EGFR", "KRAS"]
+    assert request.filters.get("gene_source") == "explicit"
+    assert request.filters.get("discover_genes") is False
 
 
 def test_named_gene_in_question_does_not_restrict_cohort_mode() -> None:

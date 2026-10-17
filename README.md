@@ -103,7 +103,7 @@ Useful flags:
 | `--max-patients N` | Cap after full i&g intersection |
 | `--modality CT` / `MR` | Override default modality |
 | `--tcga-project` / `--tcia-collection` | Force fixed GDC/TCIA sources |
-| `--genes auto` | Literature gene panel instead of all cohort mutations |
+| `--genes` | Gene panel: `all` (default), `auto` (literature), one symbol (`TP53`), or comma list (`EGFR,KRAS`) |
 | `--list-diseases` | Example disease phrases |
 | `--no-llm` | Force rule-based orchestrator/matcher |
 | `--llm` | Force free-tier LLM for planning + source matching |

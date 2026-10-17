@@ -24,6 +24,7 @@ from agentic_radiogen.pipeline.report_table import (
     print_patient_table,
     resolve_patient_table,
     write_associations_csv,
+    write_literature_details,
 )
 from agentic_radiogen.data.disease_match import format_dataset_extraction_note
 from agentic_radiogen.pipeline.stage2 import extract_parallel
@@ -44,10 +45,22 @@ def print_summary(payload: dict[str, Any]) -> None:
     gene_source = (request.get("filters") or {}).get("gene_source")
     intermediate = payload.get("intermediate") or {}
     discovered = intermediate.get("genes") or request.get("genes") or []
-    if gene_source == "literature" or request.get("genes"):
+    if gene_source == "explicit" or (
+        request.get("genes") and gene_source not in {None, "cohort", "literature"}
+    ):
         panel = request.get("genes") or discovered
-        print(f"Genes   : literature panel ({len(panel)}): {', '.join(panel[:12])}"
-              f"{'...' if len(panel) > 12 else ''}")
+        print(
+            f"Genes   : explicit panel ({len(panel)}): {', '.join(panel[:12])}"
+            f"{'...' if len(panel) > 12 else ''}"
+        )
+    elif gene_source == "literature" or (
+        request.get("genes") and gene_source == "literature"
+    ):
+        panel = request.get("genes") or discovered
+        print(
+            f"Genes   : literature panel ({len(panel)}): {', '.join(panel[:12])}"
+            f"{'...' if len(panel) > 12 else ''}"
+        )
     elif discovered:
         print(
             f"Genes   : cohort mutations ({len(discovered)}): {', '.join(discovered[:12])}"
@@ -216,10 +229,13 @@ def print_summary(payload: dict[str, Any]) -> None:
             q = str(literature["search_query"])
             print(f"  PubMed : {q[:140]}{'...' if len(q) > 140 else ''}")
         print(
-            "  Top 8 by |r| within each category (ascending |r|):\n"
+            "  Top 8 by |r| within each category (ascending |r|; stats only on screen;\n"
+            "  paper titles/PMIDs go to --out *.literature.txt / JSON / CSV):\n"
             "    [supported]    disease-matched corpus paper agrees\n"
             "    [unverified]   no disease-matched paper in corpus\n"
             "    [contradicted] corpus paper argues against this pair\n"
+            "    [mapped]       no direct support; imaging+gene agents soft-mapped to lit\n"
+            "    [aggregate]    literature claim with related cohort pairs grouped\n"
             "    [note]         process reminder (not a finding class)"
         )
 
@@ -243,9 +259,10 @@ def print_summary(payload: dict[str, Any]) -> None:
         if supported_items:
             print("  [supported]")
             for item in supported_items:
-                print(f"    {_with_mut_counts(item.get('finding') or '')}")
-                for paper in item.get("papers") or []:
-                    print(f"             - {paper}")
+                finding = _with_mut_counts(item.get("finding") or "")
+                n_papers = len(item.get("papers") or [])
+                suffix = f"  [n_papers={n_papers}]" if n_papers else ""
+                print(f"    {finding}{suffix}")
         unverified_items = list(literature.get("unverified") or [])
         if unverified_items:
             print("  [unverified]")
@@ -256,6 +273,26 @@ def print_summary(payload: dict[str, Any]) -> None:
             print("  [contradicted]")
             for item in contra_items:
                 print(f"    {_with_mut_counts(str(item))}")
+        mapped_items = list(literature.get("mapped_related") or [])
+        if mapped_items:
+            print("  [mapped]")
+            for item in mapped_items:
+                finding = item.get("finding") or ""
+                lit_gene = item.get("literature_gene") or "?"
+                print(
+                    f"    {_with_mut_counts(str(finding))}  "
+                    f"[mapped→{lit_gene}]"
+                )
+        aggregates = list(literature.get("pair_aggregates") or [])
+        if aggregates:
+            print("  [aggregate]")
+            for agg in aggregates:
+                terms = agg.get("literature_radiomic_terms") or []
+                print(
+                    f"    {agg.get('literature_gene')} + {terms} "
+                    f"(n_mapped={agg.get('n_mapped')}, "
+                    f"best_|r|={float(agg.get('best_abs_r') or 0):.3f})"
+                )
         for item in literature.get("proposed_refinements") or []:
             print(f"  [note] {item}")
 
@@ -272,6 +309,14 @@ def print_summary(payload: dict[str, Any]) -> None:
     note = format_dataset_extraction_note(payload.get("intermediate") or {})
     if note:
         print(note)
+    segm_log = payload.get("segmentation_log_path") or (
+        (payload.get("intermediate") or {}).get("segmentation_log_path")
+    )
+    if segm_log:
+        n_seg = len(payload.get("segmentation_log") or []) or (
+            (payload.get("intermediate") or {}).get("segmentation_log_n")
+        )
+        print(f"Segmentation log: {segm_log} ({n_seg} rows)")
     print("=" * 60)
 
 
@@ -280,6 +325,7 @@ def build_catalog(
     *,
     download_dicom: bool = True,
     use_llm: bool | None = None,
+    store_segm: bool = False,
 ) -> DemoCatalog | LiveCatalog:
     if name == "demo":
         return DemoCatalog()
@@ -288,6 +334,8 @@ def build_catalog(
             download_dicom=download_dicom,
             extract_radiomics=download_dicom,
             use_llm=use_llm,
+            store_segm=store_segm,
+            segm_dir=Path.cwd() / "segm_rslt",
         )
     raise ValueError(f"Unknown catalog '{name}'. Use demo or live.")
 
@@ -328,12 +376,16 @@ def _run_matcher(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
 ) -> tuple[dict[str, Any], ImageBundle | None, OmicsBundle | None]:
     catalog = build_catalog(
-        catalog_name, download_dicom=download_dicom, use_llm=use_llm
+        catalog_name,
+        download_dicom=download_dicom,
+        use_llm=use_llm,
+        store_segm=store_segm,
     )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     orchestrator = _orchestrator(
@@ -392,6 +444,9 @@ def _run_matcher(
         "clinical": omics.clinical,
         "imaging_notes": getattr(catalog, "last_imaging_notes", []),
     }
+    payload["segmentation_log"] = getattr(catalog, "last_segmentation_log", [])
+    payload["segmentation_log_path"] = getattr(catalog, "last_segmentation_log_path", None)
+    payload["intermediate"] = getattr(catalog, "last_intermediate", {})
     return payload, images, omics
 
 
@@ -409,6 +464,7 @@ def run_stage1(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -427,6 +483,7 @@ def run_stage1(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
@@ -448,6 +505,7 @@ def run_stage2(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -466,6 +524,7 @@ def run_stage2(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
@@ -512,6 +571,7 @@ def run_stage3(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -530,6 +590,7 @@ def run_stage3(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
@@ -594,6 +655,8 @@ def run_stage4(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 1,
+    max_papers: int | None = None,
+    store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -601,7 +664,10 @@ def run_stage4(
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
     catalog = build_catalog(
-        catalog_name, download_dicom=download_dicom, use_llm=use_llm
+        catalog_name,
+        download_dicom=download_dicom,
+        use_llm=use_llm,
+        store_segm=store_segm,
     )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     state = DiscoveryLoop(
@@ -628,11 +694,13 @@ def run_stage4(
             use_llm=use_llm,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            max_papers=max_papers if max_papers is not None else 500,
         ),
         max_iterations=max_iterations,
         max_patients=max_patients,
         max_genes=max_genes,
         min_altered=min_altered,
+        max_papers=max_papers,
     ).run(question_text, disease=disease)
     patient_table = resolve_patient_table(
         state.radiomics,
@@ -680,12 +748,17 @@ def run_stage4(
         "imaging_notes": getattr(catalog, "last_imaging_notes", []),
         "intermediate": getattr(catalog, "last_intermediate", {}),
         "segmentation": segmentation_backend(),
+        "segmentation_log": getattr(catalog, "last_segmentation_log", []),
+        "segmentation_log_path": getattr(catalog, "last_segmentation_log_path", None),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Agentic radiogenomics. Stage 4 joins stats with optional literature annotation (data-driven; literature does not alter the cohort)."
+        description=(
+            "Agentic radiogenomics. Stage 4 joins stats with optional literature "
+            "annotation (data-driven; literature does not alter the cohort)."
+        ),
     )
     parser.add_argument(
         "--stage",
@@ -717,10 +790,16 @@ def main() -> None:
     parser.add_argument("--modality", default=None, help="Override imaging modality (CT, MR, ...).")
     parser.add_argument(
         "--genes",
-        choices=("auto",),
-        default=None,
-        help="Gene panel mode. Default: all genes mutated in the paired genomics cohort. "
-        "--genes auto: literature/profile candidate genes only.",
+        default="all",
+        help="Genes to explore vs radiomics. Default 'all' = every mutated gene in the "
+        "paired cohort. Pass one symbol (e.g. TP53), a comma-separated list "
+        "(e.g. EGFR,KRAS,TP53), or 'auto' for the literature/profile panel.",
+    )
+    parser.add_argument(
+        "--store-segm",
+        action="store_true",
+        help="Save each patient's segmentation mask under ./segm_rslt/ "
+        "(NIfTI {patient_id}.nii.gz). Default: off.",
     )
     parser.add_argument(
         "--llm",
@@ -764,6 +843,13 @@ def main() -> None:
     parser.add_argument("--max-patients", type=int, default=24)
     parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument(
+        "--max-papers",
+        type=int,
+        default=500,
+        help="Max PubMed papers to fetch for literature annotation "
+        "(default 500; NCBI esearch caps at 10000).",
+    )
+    parser.add_argument(
         "--out",
         default=None,
         help="Write full JSON to this path and a sibling .csv of all associations "
@@ -805,7 +891,8 @@ def main() -> None:
         tcga_project=args.tcga_project,
         tcia_collection=args.tcia_collection,
         modality=args.modality,
-        genes=args.genes,
+        genes=(args.genes or "all").strip() or "all",
+        store_segm=bool(args.store_segm),
         use_llm=use_llm,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
@@ -822,6 +909,7 @@ def main() -> None:
             payload = run_stage4(
                 args.question,
                 max_iterations=args.max_iterations,
+                max_papers=args.max_papers,
                 **common,
             )
     except (RemoteApiError, ValueError, KeyError) as exc:
@@ -849,6 +937,41 @@ def main() -> None:
                 literature=payload.get("literature"),
             )
             print(f"Associations CSV ({n_rows} rows) written to: {csv_path.resolve()}")
+        if payload.get("literature"):
+            lit_path = out_path.with_name(out_path.stem + ".literature.txt")
+            n_lit = write_literature_details(
+                lit_path,
+                payload.get("literature"),
+                mutation_prevalence=payload.get("mutation_prevalence") or {},
+            )
+            print(
+                f"Literature details ({n_lit} finding blocks) written to: "
+                f"{lit_path.resolve()}"
+            )
+        seg_rows = list(payload.get("segmentation_log") or [])
+        if seg_rows:
+            import csv as _csv
+
+            seg_csv = out_path.with_name(out_path.stem + ".segmentation.csv")
+            fields = [
+                "patient_id",
+                "image_path",
+                "diagnosis",
+                "segmentation_model",
+                "models_attempted",
+                "mask_path",
+                "n_mask_voxels",
+                "status",
+            ]
+            with seg_csv.open("w", encoding="utf-8", newline="") as fh:
+                writer = _csv.DictWriter(fh, fieldnames=fields)
+                writer.writeheader()
+                for row in seg_rows:
+                    writer.writerow({k: row.get(k, "") for k in fields})
+            print(
+                f"Segmentation log ({len(seg_rows)} rows) written to: "
+                f"{seg_csv.resolve()}"
+            )
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
 

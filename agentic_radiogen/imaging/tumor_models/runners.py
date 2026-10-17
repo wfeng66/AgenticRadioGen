@@ -80,6 +80,15 @@ def run_model(
             allow_download=allow_download,
             verbose=verbose,
         )
+    if spec.runner == "lungtumormask":
+        from agentic_radiogen.imaging.tumor_models.lungtumormask import run_lungtumormask
+
+        return run_lungtumormask(
+            volume,
+            spacing_zyx=spacing_zyx,
+            allow_download=allow_download,
+            verbose=verbose,
+        )
     if spec.runner == "fine_tune":
         raise RuntimeError(
             f"Model '{spec.model_id}' is a fine-tune backbone "

@@ -60,6 +60,7 @@ class DiscoveryLoop:
         max_patients: int | None = None,
         max_genes: int | None = None,
         min_altered: int | None = None,
+        max_papers: int | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.matcher = matcher
@@ -71,6 +72,8 @@ class DiscoveryLoop:
         self.max_patients = max_patients
         self.max_genes = max_genes
         self.min_altered = min_altered
+        if max_papers is not None:
+            self.literature.max_papers = max(1, int(max_papers))
 
     def run(self, question_text: str, disease: str | None = None) -> LoopState:
         question = self.orchestrator.parse(question_text, disease=disease)
@@ -85,10 +88,12 @@ class DiscoveryLoop:
         if updates:
             request = request.model_copy(update=updates)
         state = LoopState(question=question, request=request)
-        # Search disease literature + extract radiomic–gene priors before fetch/stats.
+        # Explicit gene panel → OR all into PubMed; cohort discovery → no gene shortlist.
+        lit_genes = list(request.genes) if request.genes else None
         self.literature.prepare(
             disease=question.disease,
             question=question_text,
+            genes=lit_genes,
         )
         while not state.stopped:
             state = self.step(state)
@@ -161,6 +166,8 @@ class DiscoveryLoop:
                 question=state.question.text,
                 stats=self.stats,
                 literature=self.literature,
+                imaging=self.imaging,
+                genomics=self.genomics,
             )
         except Stage3Error as exc:
             return self._stop(state, str(exc))
@@ -170,7 +177,9 @@ class DiscoveryLoop:
             f"[loop] Stats ready: {n_assoc} associations "
             f"(sorted by |r| ascending; strongest last); "
             f"literature supports={len(result.literature.supports)} "
-            f"unverified={len(result.literature.unverified)}"
+            f"unverified={len(result.literature.unverified)} "
+            f"mapped={len(result.literature.mapped_related)} "
+            f"aggregates={len(result.literature.pair_aggregates)}"
         )
         directive = self.decide(result.literature, state.request)
         state.iterations += 1

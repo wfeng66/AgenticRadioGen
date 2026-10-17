@@ -173,3 +173,42 @@ def test_write_associations_csv_one_row_per_feature(tmp_path) -> None:
     assert "supported" in text or "unverified" in text
     assert "contradicted" in text  # KRAS intensity conflict in default corpus
     assert "[mut: altered=10, wildtype=57]" in text
+
+
+def test_write_literature_details_stores_paper_titles(tmp_path) -> None:
+    from agentic_radiogen.pipeline.report_table import write_literature_details
+
+    path = tmp_path / "run.literature.txt"
+    n = write_literature_details(
+        path,
+        {
+            "literature_source": "pubmed_llm",
+            "supports": [
+                {
+                    "finding": "original_glcm_Entropy ~ EGFR_mut (r=0.5, p=1e-3, q=1e-2, n=20)",
+                    "supported": True,
+                    "papers": [
+                        "Demo EGFR texture paper (Demo Journal, 2020) [PMID:111]"
+                    ],
+                }
+            ],
+            "prior_pairs": [
+                {
+                    "gene": "EGFR",
+                    "radiomic_terms": ["texture"],
+                    "supports": True,
+                    "paper_title": "Demo EGFR texture paper",
+                    "pmid": "111",
+                    "journal": "Demo Journal",
+                    "year": "2020",
+                }
+            ],
+        },
+        mutation_prevalence={"EGFR": {"altered": 8, "wildtype": 12}},
+    )
+    assert n >= 1
+    text = path.read_text(encoding="utf-8")
+    assert "[supported]" in text
+    assert "PMID:111" in text
+    assert "Demo EGFR texture paper" in text
+    assert "altered=8" in text

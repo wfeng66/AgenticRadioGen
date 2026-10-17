@@ -150,6 +150,10 @@ class DataMatcherAgent:
                 keyword_match=bool(request.filters.get("keyword_match")),
                 matcher_backend=self._matcher_backend,
             )
+        # Persist gene_source so fetch logs distinguish literature vs explicit --genes.
+        intermediate = getattr(self.catalog, "last_intermediate", None)
+        if isinstance(intermediate, dict) and request.filters.get("gene_source"):
+            intermediate["gene_source"] = request.filters.get("gene_source")
         # Preview already selected TCIA ∩ GDC IDs; do not drop them again after fetch.
         records = list(self.catalog.fetch_records(preview.patient_ids))
         fetched_ids = {record.patient_id for record in records}

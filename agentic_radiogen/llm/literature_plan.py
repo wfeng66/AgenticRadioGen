@@ -59,18 +59,63 @@ Rules:
 """
 
 
+_BATCH_SIZE = 20  # abstracts per LLM call (keeps prompts within context limits)
+
+
 def extract_pairs_with_llm(
     articles: list[PubMedArticle],
     *,
     disease: str,
     question: str,
     client: LlmClient | None = None,
+    batch_size: int = _BATCH_SIZE,
 ) -> LiteratureExtraction:
-    """Ask the LLM to pull radiomic–gene pairs from fetched abstracts."""
+    """Ask the LLM to pull radiomic–gene pairs from fetched abstracts (batched)."""
     llm = client or LlmClient()
     if not articles:
         return LiteratureExtraction(pairs=[], rationale="No PubMed articles to extract from")
 
+    all_pairs: list[ExtractedLitPair] = []
+    rationales: list[str] = []
+    size = max(1, int(batch_size))
+    for start in range(0, len(articles), size):
+        chunk = articles[start : start + size]
+        data = _extract_batch(
+            chunk,
+            disease=disease,
+            question=question,
+            client=llm,
+            batch_index=start // size + 1,
+            batch_total=(len(articles) + size - 1) // size,
+        )
+        all_pairs.extend(_parse_pairs(data.get("pairs") or []))
+        rat = str(data.get("rationale") or "").strip()
+        if rat:
+            rationales.append(rat)
+
+    # De-duplicate by (gene, pmid, frozenset terms)
+    dedup: dict[tuple[str, str, tuple[str, ...]], ExtractedLitPair] = {}
+    for p in all_pairs:
+        key = (p.gene, p.pmid or "", tuple(sorted(p.radiomic_terms)))
+        dedup[key] = p
+    merged = list(dedup.values())
+    rationale = (
+        f"Extracted from {len(articles)} abstracts in "
+        f"{(len(articles) + size - 1) // size} batches; {len(merged)} unique pairs. "
+        + ("; ".join(rationales[:3]) if rationales else "")
+    ).strip()
+    return LiteratureExtraction(pairs=merged, rationale=rationale)
+
+
+def _extract_batch(
+    articles: list[PubMedArticle],
+    *,
+    disease: str,
+    question: str,
+    client: LlmClient,
+    batch_index: int,
+    batch_total: int,
+) -> dict[str, Any]:
     blocks: list[str] = []
     for i, art in enumerate(articles, start=1):
         abs_txt = (art.abstract or "").strip()
@@ -84,16 +129,18 @@ def extract_pairs_with_llm(
         )
     user = (
         f"Disease focus: {disease}\n"
-        f"Research question: {question.strip()}\n\n"
+        f"Research question: {question.strip()}\n"
+        f"Batch: {batch_index}/{batch_total}\n\n"
         "Articles:\n"
         + "\n\n".join(blocks)
         + "\n\nRespond with JSON keys: pairs, rationale."
     )
-    # Abstracts are longer than orchestrator prompts; allow a bit more time.
-    data: dict[str, Any] = llm.complete_json(system=_SYSTEM, user=user, timeout=60)
-    raw_pairs = data.get("pairs") or []
+    return client.complete_json(system=_SYSTEM, user=user, timeout=90)
+
+
+def _parse_pairs(raw_pairs: Any) -> list[ExtractedLitPair]:
     if not isinstance(raw_pairs, list):
-        raw_pairs = []
+        return []
     pairs: list[ExtractedLitPair] = []
     for item in raw_pairs:
         if not isinstance(item, dict):
@@ -111,7 +158,6 @@ def extract_pairs_with_llm(
                 if str(t).strip()
             }
         )
-        # Keep human-readable variants too for matching
         terms_readable = sorted(
             {
                 str(t).strip().lower().replace("-", "_")
@@ -132,7 +178,4 @@ def extract_pairs_with_llm(
                 pmid=str(item.get("pmid") or "").strip(),
             )
         )
-    return LiteratureExtraction(
-        pairs=pairs,
-        rationale=str(data.get("rationale") or "").strip(),
-    )
+    return pairs
