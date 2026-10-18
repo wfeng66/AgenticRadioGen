@@ -20,9 +20,10 @@ from agentic_radiogen.imaging.tumor_models.registry import (
 from agentic_radiogen.imaging.tumor_models.runners import run_model
 from agentic_radiogen.imaging.tumor_models.store import ModelStore
 from agentic_radiogen.llm.client import LlmClient, resolve_llm_config
+from agentic_radiogen.imaging.mask_qc import mask_qc_failure
 from agentic_radiogen.llm.segmentation_plan import (
+    plan_segmentation_order_with_llm,
     plan_segmentation_rules,
-    plan_segmentation_with_llm,
 )
 from agentic_radiogen.util.progress import log
 
@@ -91,21 +92,31 @@ def _is_patient_local_failure(message: str) -> bool:
         "unsuitable for ct-only",
         "requires pet+ct",
         "requires pet",
+        "mask too small",
+        "too few dimensions",
+        "outside lung parenchyma",
+        "false positive",
+        "qc failed",
     )
     return any(n in m for n in needles)
 
 
 def _order_fallback_candidates(
-    primary: TumorModelSpec, rest: list[TumorModelSpec]
+    ranked: list[TumorModelSpec] | TumorModelSpec,
+    rest: list[TumorModelSpec],
 ) -> list[TumorModelSpec]:
-    """Keep primary first; then other tumor models; organs / threshold last.
+    """Keep LLM/rules ranked models first; then other tumors; organs last.
 
-    Empty-mask from Task006 must try MONAI / AutoPET before ``ts_lung``.
+    ``ranked`` may be a single primary (legacy) or an ordered list from the LLM.
     Preserve disease-ranked order from ``list_models_for_disease`` within each
     group (do not re-sort organs by catalog priority — that put ts_kidney
     ahead of ts_lung after a weak false match).
     """
-    seen = {primary.model_id}
+    if isinstance(ranked, TumorModelSpec):
+        primary_list = [ranked]
+    else:
+        primary_list = list(ranked)
+    seen = {s.model_id for s in primary_list}
     tumors: list[TumorModelSpec] = []
     organs: list[TumorModelSpec] = []
     for spec in rest:
@@ -121,7 +132,7 @@ def _order_fallback_candidates(
         else:
             # promptable / fine_tune etc. — after tumors, before organs
             tumors.append(spec)
-    return [primary, *tumors, *organs]
+    return [*primary_list, *tumors, *organs]
 
 
 class SegmentationAgent:
@@ -164,7 +175,25 @@ class SegmentationAgent:
         cache_dir: str | Path | None = None,
         use_cache: bool = True,
     ) -> TumorModelSpec:
-        """LLM (or rules) selects a catalog model for this disease."""
+        """LLM (or rules) selects the primary catalog model for this disease."""
+        return self.choose_model_order(
+            disease=disease,
+            modality=modality,
+            question=question,
+            cache_dir=cache_dir,
+            use_cache=use_cache,
+        )[0]
+
+    def choose_model_order(
+        self,
+        *,
+        disease: str,
+        modality: str = "CT",
+        question: str = "",
+        cache_dir: str | Path | None = None,
+        use_cache: bool = True,
+    ) -> list[TumorModelSpec]:
+        """LLM (or rules) returns a ranked catalog model list for this disease."""
         disease = (disease or "").strip() or "unknown"
         modality = (modality or "CT").strip().upper()
         want_llm = self._want_llm()
@@ -178,7 +207,7 @@ class SegmentationAgent:
             )
             if client.available:
                 try:
-                    spec, plan = plan_segmentation_with_llm(
+                    specs, plan = plan_segmentation_order_with_llm(
                         disease=disease,
                         modality=modality,
                         question=question,
@@ -190,7 +219,7 @@ class SegmentationAgent:
                         blocked_model_ids=self._blocked_ids(),
                     )
                     self.last_plan_rationale = plan.rationale
-                    return spec
+                    return specs
                 except Exception as exc:
                     log(
                         f"[segmentation] LLM model choice failed ({exc}); using rules",
@@ -200,30 +229,40 @@ class SegmentationAgent:
         from agentic_radiogen.imaging.tumor_models.registry import list_models_for_disease
         from agentic_radiogen.imaging.tumor_models.registry import get_model
 
+        from agentic_radiogen.llm.segmentation_plan import expand_ranked_tumor_specs
+
         picks = list_models_for_disease(
             disease, modality, models=self.models, direct_only=True
         )
-        spec = None
+        specs: list[TumorModelSpec] = []
         for cand in picks:
             if cand.model_id in blocked:
                 continue
             if cand.operational_type == "fine_tune":
                 continue
-            spec = cand
-            break
-        if spec is None:
+            specs.append(cand)
+        if not specs:
             spec = plan_segmentation_rules(
                 disease=disease, modality=modality, models=self.models
             )
             if spec.model_id in blocked:
                 spec = get_model("threshold_proxy", models=self.models)  # type: ignore[assignment]
-        assert spec is not None
+            assert spec is not None
+            specs = [spec]
+        specs = expand_ranked_tumor_specs(
+            specs,
+            disease=disease,
+            modality=modality,
+            models=self.models,
+            blocked=blocked,
+        )
         self.last_plan_rationale = "rules heuristic (LLM off or preferred model blocked)"
         log(
-            f"[segmentation] Rules chose '{spec.model_id}' for disease='{disease}'",
+            f"[segmentation] Rules ranked {[s.model_id for s in specs[:5]]} "
+            f"for disease='{disease}'",
             enabled=self.verbose,
         )
-        return spec
+        return specs
 
     def segment(
         self,
@@ -237,21 +276,23 @@ class SegmentationAgent:
         disease = (disease or "").strip() or "unknown"
         modality = (modality or "CT").strip().upper()
 
-        primary = self.choose_model(
+        ranked = self.choose_model_order(
             disease=disease, modality=modality, question=question
         )
-        # Try LLM/rules choice first, then other tumor models, then organ/threshold.
+        primary = ranked[0]
+        # Try LLM/rules ranked order first, then other tumor models, then organs.
+        ranked_ids = {s.model_id for s in ranked}
         rest: list[TumorModelSpec] = []
         for spec in self.available_models(disease, modality):
-            if spec.model_id != primary.model_id:
+            if spec.model_id not in ranked_ids:
                 rest.append(spec)
         for mid in ("totalsegmentator_organ", "threshold_proxy"):
             from agentic_radiogen.imaging.tumor_models.registry import get_model
 
             extra = get_model(mid, models=self.models)
-            if extra and extra.model_id != primary.model_id:
+            if extra and extra.model_id not in ranked_ids:
                 rest.append(extra)
-        candidates = _order_fallback_candidates(primary, rest)
+        candidates = _order_fallback_candidates(ranked, rest)
 
         # Only attempt backends that can produce a mask in this process.
         live: list[TumorModelSpec] = []
@@ -294,21 +335,8 @@ class SegmentationAgent:
                     spacing_zyx=spacing_zyx,
                 )
                 attempts.append(f"{spec.model_id}:ok")
-                # Only rewrite plan cache for durable fallbacks (not one empty-mask case).
-                if (
-                    result.model_id != primary.model_id
-                    and result.model_id != "threshold_proxy"
-                    and result.is_tumor_model
-                ):
-                    self._remember_working_plan(
-                        disease=disease,
-                        modality=modality,
-                        spec=spec,
-                        rationale=(
-                            f"fallback after {primary.model_id} failed; "
-                            f"using {spec.model_id}"
-                        ),
-                    )
+                # Do NOT rewrite the disease plan cache from a single-patient
+                # fallback — that collapsed every LUAD case onto monai/lungtumormask.
                 return SegmentationResult(
                     mask=result.mask,
                     backend=result.backend,
@@ -384,33 +412,6 @@ class SegmentationAgent:
         )
 
         persist_blocked(model_id, reason=reason)
-
-    def _remember_working_plan(
-        self,
-        *,
-        disease: str,
-        modality: str,
-        spec: TumorModelSpec,
-        rationale: str,
-    ) -> None:
-        """Rewrite seg-plan cache so later patients skip a known-broken primary."""
-        try:
-            from agentic_radiogen.llm.segmentation_plan import write_segmentation_plan_cache
-
-            write_segmentation_plan_cache(
-                disease=disease,
-                modality=modality,
-                model_id=spec.model_id,
-                organ_keywords=list(spec.organ_keywords),
-                is_tumor_model=spec.is_tumor_model,
-                rationale=rationale,
-            )
-            log(
-                f"[segmentation] Updated plan cache → {spec.model_id} ({rationale})",
-                enabled=self.verbose,
-            )
-        except Exception:
-            pass
 
     def _want_llm(self) -> bool:
         if self._use_llm is True or self._llm_client is not None:
@@ -497,10 +498,14 @@ class SegmentationAgent:
             modality=modality,
             pet_volume=pet_volume,
         )
-        if not np.asarray(mask).any():
+        mask_b = np.asarray(mask, dtype=bool)
+        if not mask_b.any():
             raise RuntimeError(f"Model '{spec.model_id}' returned an empty mask")
+        qc = mask_qc_failure(volume, mask_b, disease=disease)
+        if qc:
+            raise RuntimeError(f"Model '{spec.model_id}' QC failed: {qc}")
         return SegmentationResult(
-            mask=np.asarray(mask, dtype=bool),
+            mask=mask_b,
             backend=spec.model_id,
             model_id=spec.model_id,
             is_tumor_model=spec.is_tumor_model,

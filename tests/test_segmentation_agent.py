@@ -207,6 +207,151 @@ def test_llm_can_select_nnunet_msd_lung(tmp_path) -> None:
     assert spec.is_tumor_model is True
 
 
+def test_llm_ranked_model_ids_order(tmp_path) -> None:
+    """LLM may put monai first for nodule-like LUAD; order must be preserved."""
+    class FakeLlm:
+        available = True
+        config = type("C", (), {"provider": "fake", "model": "m"})()
+
+        def complete_json(self, *, system, user, timeout=None):
+            assert "model_ids" in system or "RANKED" in system
+            return {
+                "model_ids": [
+                    "monai_lung_nodule",
+                    "lungtumormask",
+                    "nnunet_msd_lung",
+                ],
+                "model_id": "monai_lung_nodule",
+                "organ_keywords": [],
+                "rationale": "Small-nodule LUAD → try detection model first",
+                "is_tumor_model": True,
+            }
+
+    agent = SegmentationAgent(
+        store=ModelStore(root=tmp_path / "seg", verbose=False),
+        verbose=False,
+        use_llm=True,
+        llm_client=FakeLlm(),  # type: ignore[arg-type]
+        allow_download=False,
+    )
+    ordered = agent.choose_model_order(
+        disease="lung adenocarcinoma (TCGA-LUAD)",
+        modality="CT",
+        use_cache=False,
+    )
+    ids = [s.model_id for s in ordered]
+    assert ids[:3] == [
+        "monai_lung_nodule",
+        "lungtumormask",
+        "nnunet_msd_lung",
+    ]
+
+
+def test_singleton_monai_cache_ignored_for_luad(tmp_path) -> None:
+    """Poisoned cache with only monai must not lock all LUAD patients onto it."""
+    from agentic_radiogen.llm.segmentation_plan import (
+        _PLAN_CACHE_VERSION,
+        plan_segmentation_order_with_llm,
+    )
+
+    cache_dir = tmp_path / "seg_plans"
+    cache_dir.mkdir()
+    # Same disease token as live LUAD label.
+    path = cache_dir / "lung_cancer_lung_adenocarcinoma_tcga_luad__ct.json"
+    path.write_text(
+        __import__("json").dumps(
+            {
+                "version": _PLAN_CACHE_VERSION,
+                "disease": "lung cancer; lung adenocarcinoma (TCGA-LUAD)",
+                "modality": "CT",
+                "model_id": "monai_lung_nodule",
+                "model_ids": ["monai_lung_nodule"],
+                "rationale": "poisoned singleton",
+                "is_tumor_model": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeLlm:
+        available = True
+        config = type("C", (), {"provider": "fake", "model": "m"})()
+        calls = 0
+
+        def complete_json(self, *, system, user, timeout=None):
+            FakeLlm.calls += 1
+            return {
+                "model_ids": [
+                    "nnunet_msd_lung",
+                    "lungtumormask",
+                    "monai_lung_nodule",
+                ],
+                "model_id": "nnunet_msd_lung",
+                "organ_keywords": [],
+                "rationale": "LUAD primary mass → nnU-Net first",
+                "is_tumor_model": True,
+            }
+
+    specs, plan = plan_segmentation_order_with_llm(
+        disease="lung cancer; lung adenocarcinoma (TCGA-LUAD)",
+        modality="CT",
+        client=FakeLlm(),  # type: ignore[arg-type]
+        use_cache=True,
+        cache_dir=cache_dir,
+        verbose=False,
+    )
+    assert FakeLlm.calls == 1  # cache ignored → LLM re-asked
+    assert specs[0].model_id == "nnunet_msd_lung"
+    assert "monai_lung_nodule" in plan.model_ids
+    assert "lungtumormask" in plan.model_ids
+
+
+def test_qc_failure_tries_next_model(tmp_path) -> None:
+    """Wall FP / QC reject must not stop the chain as success."""
+    from agentic_radiogen.imaging.tumor_models.registry import get_model
+
+    vol = np.full((24, 64, 64), -100.0, dtype=np.float32)
+    vol[:, 16:48, 16:48] = -800.0
+    wall = np.zeros_like(vol, dtype=bool)
+    wall[10:14, 2:8, 30:36] = True
+    inside = np.zeros_like(vol, dtype=bool)
+    inside[10:16, 24:36, 24:36] = True
+
+    agent = SegmentationAgent(
+        store=ModelStore(root=tmp_path / "seg", verbose=False),
+        verbose=False,
+        use_llm=False,
+        allow_download=False,
+    )
+    monai = get_model("monai_lung_nodule")
+    nnunet = get_model("nnunet_msd_lung")
+    assert monai is not None and nnunet is not None
+
+    def _fake_try(spec, volume, *, disease, modality="CT", spacing_zyx=None, pet_volume=None):
+        from agentic_radiogen.agents.segmentation import SegmentationResult
+        from agentic_radiogen.imaging.mask_qc import mask_qc_failure
+
+        mask = wall if spec.model_id == "monai_lung_nodule" else inside
+        qc = mask_qc_failure(volume, mask, disease=disease)
+        if qc:
+            raise RuntimeError(f"Model '{spec.model_id}' QC failed: {qc}")
+        return SegmentationResult(
+            mask=mask,
+            backend=spec.model_id,
+            model_id=spec.model_id,
+            is_tumor_model=True,
+            note="fake",
+        )
+
+    agent._try_spec = _fake_try  # type: ignore[method-assign]
+    agent.choose_model_order = lambda **_k: [monai, nnunet]  # type: ignore[method-assign]
+    result = agent.segment(
+        vol, disease="lung adenocarcinoma (TCGA-LUAD)", modality="CT"
+    )
+    assert result.model_id == "nnunet_msd_lung"
+    assert "monai_lung_nodule:fail" in "|".join(result.attempts)
+
+
 def test_llm_can_select_promptable_sam_med3d(tmp_path) -> None:
     class FakeLlm:
         available = True

@@ -33,6 +33,23 @@ _SEGM_LOG_FIELDS = (
     "status",
 )
 
+# Lung / chest cohorts: drop abd/pelvis/WB series before thickest-non-scout ranking.
+_LUNG_SITE_RE = (
+    "lung",
+    "nsclc",
+    "luad",
+    "lusc",
+    "pulmonary",
+    "chest",
+    "thorax",
+    "bronchus",
+)
+
+
+def _wants_chest_ct(*texts: str) -> bool:
+    blob = " ".join(t for t in texts if t).lower()
+    return any(tok in blob for tok in _LUNG_SITE_RE)
+
 
 @dataclass
 class LiveCatalog:
@@ -361,8 +378,14 @@ class LiveCatalog:
                 enabled=verbose,
             )
 
+        chest_only = _wants_chest_ct(
+            *tcia_collections, *gdc_projects, *keywords
+        )
         tcia_patients = self._best_series_per_patient(
-            tcia_collections, modality, verbose=verbose
+            tcia_collections,
+            modality,
+            verbose=verbose,
+            chest_only=chest_only,
         )
         log(
             f"[match] (1) Imaging patients with {modality} in selected TCIA "
@@ -478,8 +501,12 @@ class LiveCatalog:
             f"[match] Querying TCIA collection={tcia_collection} modality={modality}",
             enabled=verbose,
         )
+        chest_only = _wants_chest_ct(profile_name, tcia_collection, gdc_project)
         tcia_patients = self._best_series_per_patient(
-            [tcia_collection], modality, verbose=verbose
+            [tcia_collection],
+            modality,
+            verbose=verbose,
+            chest_only=chest_only,
         )
         log(
             f"[match] (1) Imaging patients with {modality} in {tcia_collection}: "
@@ -580,10 +607,21 @@ class LiveCatalog:
             f"gdc-only={self.last_source_counts['gdc_only_dropped']})",
             enabled=verbose,
         )
+        series_policy = (
+            "thickest non-scout chest series"
+            if _wants_chest_ct(
+                disease,
+                disease_query,
+                *tcia_collections,
+                *gdc_projects,
+                *keywords,
+            )
+            else "thickest non-scout series"
+        )
         log(
             f"[match] Assigned volumetric {modality} series per patient: "
             f"ImageCount>=8: {n_ge8}, 1-7: {n_thin}, unknown: {n_unk} "
-            f"(prefer thickest non-scout series, not first TCIA row)",
+            f"(prefer {series_policy}, not first TCIA row)",
             enabled=verbose,
         )
         self._record_cache.clear()
@@ -880,21 +918,37 @@ class LiveCatalog:
         modality: str,
         *,
         verbose: bool = False,
+        chest_only: bool = False,
     ) -> dict[str, TciaSeries]:
-        """One CT series per patient: thickest non-scout (not first NBIA row)."""
+        """One CT series per patient: thickest non-scout (not first NBIA row).
+
+        When ``chest_only`` is True (lung cohorts), non-chest series (abd/pelvis,
+        whole-body, renal, …) are dropped first; patients with only those series
+        are omitted from the imaging ID list.
+        """
         by_patient: dict[str, list[TciaSeries]] = {}
         for coll in collections:
             for item in self._series(coll, modality):
                 by_patient.setdefault(item.patient_id, []).append(item)
         chosen: dict[str, TciaSeries] = {}
         thin = 0
+        dropped_non_chest = 0
         for pid, cands in by_patient.items():
-            best = prefer_volumetric_series(cands)
+            best = prefer_volumetric_series(cands, chest_only=chest_only)
             if best is None:
+                if chest_only and cands:
+                    dropped_non_chest += 1
                 continue
             chosen[pid] = best
             if 0 < int(best.image_count) < 8:
                 thin += 1
+        if chest_only and verbose:
+            log(
+                f"[match] Chest-only series filter: kept {len(chosen)} patients, "
+                f"dropped {dropped_non_chest} with no usable chest CT "
+                f"(non-chest / scout / ImageCount<8)",
+                enabled=True,
+            )
         if thin and verbose:
             log(
                 f"[match] WARNING: {thin} patients still have ImageCount<8 after "

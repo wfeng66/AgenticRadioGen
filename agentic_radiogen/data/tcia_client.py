@@ -17,6 +17,30 @@ _SCOUT_RE = re.compile(
     re.I,
 )
 
+# Body-site series that are not chest/lung CTs (abd/pelvis, whole-body, renal, …).
+# Used when ranking series for lung radiogenomics so ImageCount alone cannot
+# prefer ABD/PEL or CT WB over CHEST / LUNG series.
+_NON_CHEST_RE = re.compile(
+    r"(?:"
+    r"\babd(?:omen)?\b|"
+    r"\bpel(?:vis)?\b|"
+    r"\bwhole\s*body\b|"
+    r"\bwb\b|"
+    r"\brenal\b|"
+    r"\bkidney\b"
+    r")",
+    re.I,
+)
+
+# Positive chest/lung markers override abd/pelvis tokens (e.g. "Chest/Abd").
+_CHEST_RE = re.compile(
+    r"\b(?:chest|lung|thorax|thoracic|pe\s*study)\b",
+    re.I,
+)
+
+# Minimum ImageCount for a usable 3D CT when chest_only filtering is on.
+_MIN_CHEST_SLICES = 8
+
 
 @dataclass(frozen=True)
 class TciaSeries:
@@ -129,22 +153,60 @@ class TciaClient:
         return dest
 
 
-def prefer_volumetric_series(candidates: list[TciaSeries]) -> TciaSeries | None:
+def is_scout_series(series: TciaSeries) -> bool:
+    """True for scout / localizer / topogram-style series."""
+    return bool(_SCOUT_RE.search(series.series_description or ""))
+
+
+def is_non_chest_series(series: TciaSeries) -> bool:
+    """True when SeriesDescription clearly indicates a non-chest body site.
+
+    Combined labels like ``Chest/Abd`` are treated as chest-eligible because a
+    chest keyword is present.
+    """
+    desc = series.series_description or ""
+    if _CHEST_RE.search(desc):
+        return False
+    return bool(_NON_CHEST_RE.search(desc))
+
+
+def prefer_volumetric_series(
+    candidates: list[TciaSeries],
+    *,
+    chest_only: bool = False,
+) -> TciaSeries | None:
     """Pick the best CT series for 3D tumor segmentation / radiomics.
 
-    Prefers non-scout series with the largest ImageCount. This is why nnU-Net
-    was falling back: ``setdefault`` kept the first (often 2-slice scout) series.
+    When ``chest_only`` is True:
+    1. Drop clearly non-chest series (abd/pelvis, whole-body, renal, …), but
+       keep combined chest series such as ``Chest/Abd``.
+    2. Drop scouts/topograms and series with ImageCount < 8.
+    3. If nothing remains, return ``None`` (omit the patient).
+
+    Among the remainder (or all candidates when ``chest_only`` is False), prefer
+    non-scout series with the largest ImageCount.
     """
     if not candidates:
         return None
+    pool = candidates
+    if chest_only:
+        pool = [
+            s
+            for s in candidates
+            if not is_non_chest_series(s)
+            and not is_scout_series(s)
+            and int(s.image_count or 0) >= _MIN_CHEST_SLICES
+        ]
+        if not pool:
+            return None
 
     def _score(s: TciaSeries) -> tuple:
-        scout = 1 if _SCOUT_RE.search(s.series_description or "") else 0
+        scout = 1 if is_scout_series(s) else 0
         # Unknown count (0) ranks below known thin series only slightly; prefer known thick.
         count = int(s.image_count or 0)
         return (scout, -count, s.series_uid)
 
-    return sorted(candidates, key=_score)[0]
+    return sorted(pool, key=_score)[0]
 
 
 def _image_count(row: dict[str, Any]) -> int:
