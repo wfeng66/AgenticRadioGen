@@ -18,12 +18,13 @@ from agentic_radiogen.imaging.tumor_models.registry import (
 from agentic_radiogen.llm.client import LlmClient
 from agentic_radiogen.util.progress import log
 
-_PLAN_CACHE_VERSION = 12  # reject singleton caches; expand with catalog tumors
+_PLAN_CACHE_VERSION = 13  # include monai_vista3d in lung ready-tumor expansion
 _DEFAULT_PLAN_CACHE = Path.cwd() / "data_cache" / "seg_plans"
 
 # Ready CT lung tumor models that must remain in the try-list for LUAD/LUSC.
 _LUNG_READY_TUMOR_IDS = (
     "nnunet_msd_lung",
+    "monai_vista3d",
     "monai_lung_nodule",
     "lungtumormask",
 )
@@ -91,6 +92,8 @@ Rules:
   - nnunet_msd_lung — large primary NSCLC masses (MSD Lung / Zenodo Task006).
     Prefer FIRST for TCGA-LUAD / TCGA-LUSC / primary lung adenocarcinoma or squamous
     carcinoma on CT (typical solid primary masses — not a nodule-detection task).
+  - monai_vista3d — NVIDIA/MONAI VISTA-3D CT foundation model (lung tumor class 23).
+    Strong alternate when nnU-Net is empty; good for primary lung tumors on CT.
   - monai_lung_nodule — pulmonary *nodules* (MONAI RetinaNet / LUNA16). Use early only
     when the disease/question clearly implies nodule detection; do NOT default this as
     the sole/first model for LUAD/LUSC primary masses.

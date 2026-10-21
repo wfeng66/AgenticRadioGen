@@ -28,7 +28,7 @@ class TumorModelSpec:
     runner: str
     # totalsegmentator_organ | totalsegmentator_task | threshold_proxy
     # | torchscript | huggingface | nnunet | nnunet_autopet | monai_bundle
-    # | lungtumormask | promptable | fine_tune
+    # | monai_vista3d | lungtumormask | promptable | fine_tune
     description: str
     organ_keywords: tuple[str, ...] = ()
     weight_filename: str = ""
@@ -101,6 +101,36 @@ DEFAULT_MODELS: tuple[TumorModelSpec, ...] = (
         priority=5,
         operational_type="ready_inference",
         direct_inference=True,
+    ),
+    TumorModelSpec(
+        model_id="monai_vista3d",
+        diseases=(
+            "lung",
+            "nsclc",
+            "sclc",
+            "luad",
+            "lusc",
+            "pulmonary",
+            "hepatic",
+            "pancrea",
+            "colon",
+            "tumor",
+        ),
+        modalities=("CT",),
+        runner="monai_vista3d",
+        description=(
+            "NVIDIA/MONAI VISTA-3D foundation segmentor (CT). Automatic class prompt "
+            "for lung tumor (label 23) and other supported lesions. Strong MSD06 "
+            "lung-tumor Dice in the VISTA paper; auto-downloads MONAI/vista3d. "
+            "Force with --seg-model monai_vista3d."
+        ),
+        source="huggingface",
+        hf_repo="MONAI/vista3d",
+        is_tumor_model=True,
+        priority=8,
+        operational_type="ready_inference",
+        direct_inference=True,
+        extra={"bundle_name": "vista3d", "default_label": "23"},
     ),
     TumorModelSpec(
         model_id="monai_lung_nodule",

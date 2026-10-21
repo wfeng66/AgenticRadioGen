@@ -67,12 +67,16 @@ def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None
                 "SeriesInstanceUID": "1.2.840.test.4244",
                 "Modality": "CT",
                 "Collection": "TCGA-LUAD",
+                "SeriesDescription": "CHEST",
+                "ImageCount": 120,
             },
             {
                 "PatientID": "TCGA-05-4249",
                 "SeriesInstanceUID": "1.2.840.test.4249",
                 "Modality": "CT",
                 "Collection": "TCGA-LUAD",
+                "SeriesDescription": "CHEST",
+                "ImageCount": 100,
             },
         ]
 
@@ -117,7 +121,12 @@ def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None
                             "case": {"submitter_id": "TCGA-05-4244"},
                             "ssm": {
                                 "consequence": [
-                                    {"transcript": {"gene": {"symbol": "EGFR"}}}
+                                    {
+                                        "transcript": {
+                                            "gene": {"symbol": "EGFR"},
+                                            "consequence_type": "missense_variant",
+                                        }
+                                    }
                                 ]
                             },
                         }

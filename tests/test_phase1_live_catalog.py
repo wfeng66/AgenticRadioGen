@@ -100,7 +100,12 @@ def _gdc_poster(_url: str, payload: dict) -> dict:
                         "case": {"submitter_id": "TCGA-05-4244"},
                         "ssm": {
                             "consequence": [
-                                {"transcript": {"gene": {"symbol": "EGFR"}}}
+                                {
+                                    "transcript": {
+                                        "gene": {"symbol": "EGFR"},
+                                        "consequence_type": "missense_variant",
+                                    }
+                                }
                             ]
                         },
                     }
@@ -143,18 +148,24 @@ def _tcia_getter(_url: str, params: dict) -> list[dict]:
             "SeriesInstanceUID": "1.2.840.ct.4244",
             "Modality": "CT",
             "Collection": "TCGA-LUAD",
+            "SeriesDescription": "CHEST",
+            "ImageCount": 120,
         },
         {
             "PatientID": "TCGA-05-4249",
             "SeriesInstanceUID": "1.2.840.ct.4249",
             "Modality": "CT",
             "Collection": "TCGA-LUAD",
+            "SeriesDescription": "CHEST",
+            "ImageCount": 100,
         },
         {
             "PatientID": "TCGA-88-NOGDC",
             "SeriesInstanceUID": "1.2.840.ct.orphan",
             "Modality": "CT",
             "Collection": "TCGA-LUAD",
+            "SeriesDescription": "CHEST",
+            "ImageCount": 90,
         },
     ]
 

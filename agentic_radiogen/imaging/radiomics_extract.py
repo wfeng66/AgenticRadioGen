@@ -33,6 +33,7 @@ def extract_series_features(
     store_segm: bool = False,
     segm_dir: str | Path | None = None,
     patient_id: str | None = None,
+    force_model_id: str | None = None,
 ) -> dict[str, Any]:
     root = Path(series_dir)
     cache_path = root / _RADIOMICS_CACHE
@@ -40,9 +41,17 @@ def extract_series_features(
     segm_out = Path(segm_dir) if segm_dir else Path.cwd() / "segm_rslt"
     stem = _segm_stem(patient_id=patient_id, series_dir=root)
     existing_mask = _resolve_existing_mask(segm_out, stem)
+    # Forced model must recompute (ignore stale monai/etc. cache + mask).
+    if force_model_id and existing_mask is not None:
+        try:
+            existing_mask.unlink()
+        except OSError:
+            pass
+        existing_mask = None
     need_mask = bool(store_segm) and existing_mask is None
+    allow_cache = use_cache and not force_model_id
 
-    if use_cache and cache_path.exists() and not need_mask:
+    if allow_cache and cache_path.exists() and not need_mask:
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if (
@@ -89,6 +98,7 @@ def extract_series_features(
         segm_dir=segm_out,
         patient_id=patient_id,
         series_dir=root,
+        force_model_id=force_model_id,
     )
     mask_saved = str(summary.get("mask_path") or "")
     if not mask_saved and existing_mask:
@@ -218,6 +228,7 @@ def extract_radiomics_from_volume(
     segm_dir: str | Path | None = None,
     patient_id: str | None = None,
     series_dir: str | Path | None = None,
+    force_model_id: str | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Extract classical radiomics with PyRadiomics on a SegmentationAgent mask."""
     mask, backend, model_id, models_attempted = make_roi_mask(
@@ -227,6 +238,7 @@ def extract_radiomics_from_volume(
         question=question,
         use_llm=use_llm,
         spacing_zyx=spacing_zyx,
+        force_model_id=force_model_id,
     )
     n_mask_voxels = int(np.asarray(mask).astype(bool).sum())
     if n_mask_voxels <= 0:

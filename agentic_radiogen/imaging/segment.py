@@ -49,12 +49,13 @@ def make_roi_mask(
     question: str = "",
     use_llm: bool | None = None,
     spacing_zyx: tuple[float, float, float] | None = None,
+    force_model_id: str | None = None,
 ) -> tuple[np.ndarray, str, str, str]:
     """Create a segmentation mask via ``SegmentationAgent``.
 
     Returns ``(mask, backend, model_id, models_attempted)``.
-    ``models_attempted`` is a ``|``-joined trail of tried/skipped backends.
     Feature extraction is separate (ImagingRadiomicsAgent / PyRadiomics).
+    ``force_model_id`` skips LLM/rules ranking and runs only that catalog model.
     """
     from agentic_radiogen.agents.segmentation import SegmentationAgent
 
@@ -64,6 +65,7 @@ def make_roi_mask(
         modality=modality,
         question=question,
         spacing_zyx=spacing_zyx,
+        force_model_id=force_model_id,
     )
     attempted = "|".join(result.attempts) if result.attempts else result.model_id
     return result.mask, result.backend, result.model_id, attempted

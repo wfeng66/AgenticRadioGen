@@ -53,6 +53,7 @@ def test_lung_catalog_includes_all_operational_types() -> None:
     # Ready lesion, organ fallback, foundation, promptable — all selectable in catalog.
     assert "ts_lung_nodules" in ids
     assert "nnunet_msd_lung" in ids
+    assert "monai_vista3d" in ids
     assert "monai_lung_nodule" in ids
     assert "nnunet_autopet" in ids
     assert "ts_lung" in ids
@@ -63,6 +64,10 @@ def test_lung_catalog_includes_all_operational_types() -> None:
     from agentic_radiogen.imaging.tumor_models.segmentation_select import is_selectable
 
     assert not is_selectable(get_model("ts_lung_nodules"))  # type: ignore[arg-type]
+    vista = get_model("monai_vista3d")
+    assert vista is not None
+    assert vista.runner == "monai_vista3d"
+    assert vista.direct_inference is True
 
 
 def test_catalog_lists_foundation_and_promptable() -> None:
@@ -245,6 +250,42 @@ def test_llm_ranked_model_ids_order(tmp_path) -> None:
         "lungtumormask",
         "nnunet_msd_lung",
     ]
+
+
+def test_force_model_id_skips_agent_ranking(tmp_path) -> None:
+    vol = np.zeros((8, 16, 16), dtype=np.float32)
+    vol[:, 4:12, 4:12] = 40.0
+    agent = SegmentationAgent(
+        store=ModelStore(root=tmp_path / "seg", verbose=False),
+        verbose=False,
+        use_llm=False,
+        allow_download=False,
+    )
+    called: list[str] = []
+
+    def _fake_try(spec, volume, *, disease, modality="CT", spacing_zyx=None, pet_volume=None):
+        from agentic_radiogen.agents.segmentation import SegmentationResult
+
+        called.append(spec.model_id)
+        mask = np.zeros_like(volume, dtype=bool)
+        mask[2:6, 6:12, 6:12] = True
+        return SegmentationResult(
+            mask=mask,
+            backend=spec.model_id,
+            model_id=spec.model_id,
+            is_tumor_model=True,
+            note="forced",
+        )
+
+    agent._try_spec = _fake_try  # type: ignore[method-assign]
+    result = agent.segment(
+        vol,
+        disease="lung adenocarcinoma (TCGA-LUAD)",
+        modality="CT",
+        force_model_id="nnunet_msd_lung",
+    )
+    assert result.model_id == "nnunet_msd_lung"
+    assert called == ["nnunet_msd_lung"]
 
 
 def test_singleton_monai_cache_ignored_for_luad(tmp_path) -> None:

@@ -22,6 +22,47 @@ _CASE_FIELDS = ",".join(
     ]
 )
 
+# Prespecified MAF Variant_Classification set used for binary gene labels
+# (same definition as TP53 cohort labeling from somatic MAF).
+QUALIFYING_MAF_VARIANT_CLASSIFICATIONS: frozenset[str] = frozenset(
+    {
+        "Missense_Mutation",
+        "Nonsense_Mutation",
+        "Frame_Shift_Del",
+        "Frame_Shift_Ins",
+        "Splice_Site",
+        "In_Frame_Del",
+        "In_Frame_Ins",
+        "Nonstop_Mutation",
+        "Translation_Start_Site",
+    }
+)
+
+# GDC SSM API uses Sequence Ontology consequence_type; map the MAF classes above.
+QUALIFYING_CONSEQUENCE_TYPES: frozenset[str] = frozenset(
+    {
+        "missense_variant",  # Missense_Mutation
+        "stop_gained",  # Nonsense_Mutation
+        "frameshift_variant",  # Frame_Shift_Del / Frame_Shift_Ins
+        "splice_acceptor_variant",  # Splice_Site
+        "splice_donor_variant",  # Splice_Site
+        "inframe_deletion",  # In_Frame_Del
+        "inframe_insertion",  # In_Frame_Ins
+        "stop_lost",  # Nonstop_Mutation
+        "start_lost",  # Translation_Start_Site
+    }
+)
+
+_SSM_FIELDS = ",".join(
+    [
+        "case.submitter_id",
+        "case.observation.mutation_status",
+        "case.observation.sample.tumor_sample_barcode",
+        "ssm.consequence.transcript.gene.symbol",
+        "ssm.consequence.transcript.consequence_type",
+    ]
+)
+
 
 @dataclass(frozen=True)
 class GdcCase:
@@ -223,12 +264,39 @@ class GdcClient:
         page_size: int = 2000,
         max_hits: int = 200000,
     ) -> dict[str, set[str]]:
-        """Map patient_id → mutated gene symbols observed in GDC SSM data."""
+        """Map patient_id → genes with a qualifying somatic variant (MAF-style).
+
+        A patient is mutant for a gene when any remaining SSM occurrence has a
+        ``Variant_Classification``-equivalent consequence in
+        ``QUALIFYING_CONSEQUENCE_TYPES`` and ``mutation_status`` somatic.
+        Silent / intron / UTR-only calls do not label mutant.
+        """
         observed: dict[str, set[str]] = {pid: set() for pid in submitter_ids}
         if not submitter_ids:
             return observed
+        # Also index by 12-char TCGA patient IDs so aliquot barcodes resolve.
+        by_patient = {pid: pid for pid in submitter_ids}
+        for pid in submitter_ids:
+            short = _tcga_patient_id(pid)
+            if short and short not in by_patient:
+                by_patient[short] = pid
         filters: list[dict[str, Any]] = [
-            {"op": "in", "content": {"field": "case.submitter_id", "value": submitter_ids}}
+            {"op": "in", "content": {"field": "case.submitter_id", "value": submitter_ids}},
+            # GDC open SSM quality gate (analogous to somatic-MAF Mutation_Status).
+            {
+                "op": "in",
+                "content": {
+                    "field": "case.observation.mutation_status",
+                    "value": ["somatic", "Somatic"],
+                },
+            },
+            {
+                "op": "in",
+                "content": {
+                    "field": "ssm.consequence.transcript.consequence_type",
+                    "value": sorted(QUALIFYING_CONSEQUENCE_TYPES),
+                },
+            },
         ]
         if genes:
             filters.append(
@@ -243,8 +311,8 @@ class GdcClient:
         offset = 0
         while offset < max_hits:
             payload = {
-                "filters": {"op": "and", "content": filters} if len(filters) > 1 else filters[0],
-                "fields": "case.submitter_id,ssm.consequence.transcript.gene.symbol",
+                "filters": {"op": "and", "content": filters},
+                "fields": _SSM_FIELDS,
                 "size": min(page_size, max_hits - offset),
                 "from": offset,
             }
@@ -253,11 +321,11 @@ class GdcClient:
             if not hits:
                 break
             for hit in hits:
-                case = hit.get("case") or {}
-                pid = str(case.get("submitter_id") or "")
-                if pid not in observed:
+                pid = _patient_id_from_hit(hit)
+                key = by_patient.get(pid) or by_patient.get(_tcga_patient_id(pid))
+                if key is None:
                     continue
-                observed[pid].update(_gene_symbols(hit))
+                observed[key].update(_qualifying_gene_symbols(hit))
             total = (
                 ((data.get("data") or {}).get("pagination") or {}).get("total")
                 if isinstance(data, dict)
@@ -312,11 +380,45 @@ def _clinical_from_hit(hit: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in clinical.items() if v is not None and v != ""}
 
 
-def _gene_symbols(hit: dict[str, Any]) -> set[str]:
+def _tcga_patient_id(raw: str) -> str:
+    """Map a TCGA aliquot/sample barcode to the 12-char patient ID."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("TCGA-") and len(s) >= 12:
+        return s[:12]
+    return s
+
+
+def _patient_id_from_hit(hit: dict[str, Any]) -> str:
+    case = hit.get("case") or {}
+    submitter = str(case.get("submitter_id") or "").strip()
+    if submitter:
+        return _tcga_patient_id(submitter)
+    observation = case.get("observation") or {}
+    sample = observation.get("sample") or {}
+    barcode = str(sample.get("tumor_sample_barcode") or "").strip()
+    return _tcga_patient_id(barcode)
+
+
+def _is_qualifying_consequence(consequence_type: str) -> bool:
+    ct = (consequence_type or "").strip()
+    if not ct:
+        return False
+    if ct in QUALIFYING_CONSEQUENCE_TYPES:
+        return True
+    # Accept MAF-style names if a caller/fixture supplies them directly.
+    return ct in QUALIFYING_MAF_VARIANT_CLASSIFICATIONS
+
+
+def _qualifying_gene_symbols(hit: dict[str, Any]) -> set[str]:
+    """Gene symbols with at least one qualifying coding/splice consequence."""
     symbols: set[str] = set()
     ssm = hit.get("ssm") or {}
     for consequence in ssm.get("consequence") or []:
         transcript = (consequence or {}).get("transcript") or {}
+        if not _is_qualifying_consequence(str(transcript.get("consequence_type") or "")):
+            continue
         gene = transcript.get("gene") or {}
         symbol = gene.get("symbol")
         if symbol:

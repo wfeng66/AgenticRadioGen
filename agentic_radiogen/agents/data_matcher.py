@@ -98,9 +98,24 @@ class DataMatcherAgent:
             )
             if is_paired_record(record)
         ]
-        # Full intersection first; only then apply --max-patients.
+        # Full intersection first; then optional --patient-id filter, then --max-patients.
         available = len(hits)
-        selected = hits[: request.max_patients]
+        if request.patient_ids:
+            wanted = [str(p).strip() for p in request.patient_ids if str(p).strip()]
+            by_id = {r.patient_id: r for r in hits}
+            missing = [p for p in wanted if p not in by_id]
+            if missing:
+                raise KeyError(
+                    "Requested --patient-id not in paired TCIA∩GDC cohort: "
+                    + ", ".join(missing)
+                )
+            selected = [by_id[p] for p in wanted]
+            log(
+                f"[match] --patient-id override: keeping {len(selected)} of "
+                f"{available} paired patients ({', '.join(wanted)})"
+            )
+        else:
+            selected = hits[: request.max_patients]
         patient_ids = [r.patient_id for r in selected]
         coll = request.tcia_collection
         proj = request.tcga_project
@@ -109,9 +124,14 @@ class DataMatcherAgent:
             coll = intermediate.get("tcia_collection") or coll
             proj = intermediate.get("gdc_project") or proj
             intermediate["matcher_backend"] = self._matcher_backend
+            if request.patient_ids:
+                intermediate["patient_ids_override"] = list(patient_ids)
+            if request.force_seg_model:
+                intermediate["force_seg_model"] = request.force_seg_model
         log(
             f"[match] Available paired (full TCIA ∩ GDC)={available}; "
-            f"selecting {len(patient_ids)} after --max-patients={request.max_patients} "
+            f"selecting {len(patient_ids)} after "
+            f"{'--patient-id' if request.patient_ids else f'--max-patients={request.max_patients}'} "
             f"for {coll} ∩ {proj} (matcher={self._matcher_backend})"
         )
         counts = getattr(self.catalog, "last_source_counts", None)

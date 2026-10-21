@@ -326,6 +326,7 @@ def build_catalog(
     download_dicom: bool = True,
     use_llm: bool | None = None,
     store_segm: bool = False,
+    force_seg_model: str | None = None,
 ) -> DemoCatalog | LiveCatalog:
     if name == "demo":
         return DemoCatalog()
@@ -336,6 +337,7 @@ def build_catalog(
             use_llm=use_llm,
             store_segm=store_segm,
             segm_dir=Path.cwd() / "segm_rslt",
+            force_seg_model=force_seg_model,
         )
     raise ValueError(f"Unknown catalog '{name}'. Use demo or live.")
 
@@ -380,12 +382,15 @@ def _run_matcher(
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    patient_ids: list[str] | None = None,
+    force_seg_model: str | None = None,
 ) -> tuple[dict[str, Any], ImageBundle | None, OmicsBundle | None]:
     catalog = build_catalog(
         catalog_name,
         download_dicom=download_dicom,
         use_llm=use_llm,
         store_segm=store_segm,
+        force_seg_model=force_seg_model,
     )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     orchestrator = _orchestrator(
@@ -403,6 +408,8 @@ def _run_matcher(
             "max_patients": max_patients,
             "max_genes": max_genes,
             "min_altered": min_altered,
+            "patient_ids": list(patient_ids or []),
+            "force_seg_model": force_seg_model,
         }
     )
     matcher = DataMatcherAgent(
@@ -468,6 +475,8 @@ def run_stage1(
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    patient_ids: list[str] | None = None,
+    force_seg_model: str | None = None,
 ) -> dict[str, Any]:
     payload, _, _ = _run_matcher(
         question_text,
@@ -487,6 +496,8 @@ def run_stage1(
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        patient_ids=patient_ids,
+        force_seg_model=force_seg_model,
     )
     return payload
 
@@ -509,6 +520,8 @@ def run_stage2(
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    patient_ids: list[str] | None = None,
+    force_seg_model: str | None = None,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -528,6 +541,8 @@ def run_stage2(
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        patient_ids=patient_ids,
+        force_seg_model=force_seg_model,
     )
     payload["joined"] = False
     if images is None or omics is None:
@@ -575,6 +590,8 @@ def run_stage3(
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    patient_ids: list[str] | None = None,
+    force_seg_model: str | None = None,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -594,6 +611,8 @@ def run_stage3(
         use_llm=use_llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        patient_ids=patient_ids,
+        force_seg_model=force_seg_model,
     )
     payload["joined"] = True
     payload["looped"] = False
@@ -660,6 +679,8 @@ def run_stage4(
     use_llm: bool | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    patient_ids: list[str] | None = None,
+    force_seg_model: str | None = None,
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
@@ -668,6 +689,7 @@ def run_stage4(
         download_dicom=download_dicom,
         use_llm=use_llm,
         store_segm=store_segm,
+        force_seg_model=force_seg_model,
     )
     gate = AlwaysAllowGate() if catalog_name == "demo" else FlagGate(approve_download)
     state = DiscoveryLoop(
@@ -687,7 +709,7 @@ def run_stage4(
             llm_provider=llm_provider,
             llm_model=llm_model,
         ),
-        imaging=ImagingRadiomicsAgent(),
+        imaging=ImagingRadiomicsAgent(force_model_id=force_seg_model),
         genomics=GenomicsAgent(),
         stats=StatisticalCriticalAgent(),
         literature=LiteratureAgent(
@@ -701,6 +723,8 @@ def run_stage4(
         max_genes=max_genes,
         min_altered=min_altered,
         max_papers=max_papers,
+        patient_ids=patient_ids,
+        force_seg_model=force_seg_model,
     ).run(question_text, disease=disease)
     patient_table = resolve_patient_table(
         state.radiomics,
@@ -802,6 +826,20 @@ def main() -> None:
         "(NIfTI {patient_id}.nii.gz). Default: off.",
     )
     parser.add_argument(
+        "--patient-id",
+        default=None,
+        help="Restrict cohort to one or more patient IDs (comma-separated), "
+        "e.g. TCGA-17-Z021 or TCGA-17-Z021,TCGA-92-7340. "
+        "Must be in the paired TCIA∩GDC set for the question.",
+    )
+    parser.add_argument(
+        "--seg-model",
+        default=None,
+        help="Force a catalog segmentation model (skip LLM/rules ranking), "
+        "e.g. nnunet_msd_lung, monai_vista3d, lungtumormask, monai_lung_nodule, "
+        "ts_lung. Recomputes radiomics (ignores per-series cache) for those patients.",
+    )
+    parser.add_argument(
         "--llm",
         action="store_true",
         default=None,
@@ -882,6 +920,12 @@ def main() -> None:
         use_llm = True
     else:
         use_llm = None  # auto: LLM when GEMINI_API_KEY / GROQ_API_KEY is set
+    patient_ids = None
+    if args.patient_id:
+        patient_ids = [
+            p.strip() for p in str(args.patient_id).split(",") if p.strip()
+        ]
+    force_seg_model = (args.seg_model or "").strip() or None
     common = dict(
         disease=args.disease,
         catalog_name=args.catalog,
@@ -896,6 +940,8 @@ def main() -> None:
         use_llm=use_llm,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
+        patient_ids=patient_ids,
+        force_seg_model=force_seg_model,
     )
 
     try:

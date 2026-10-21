@@ -19,6 +19,7 @@ def run_model(
     verbose: bool = True,
     modality: str = "CT",
     pet_volume: np.ndarray | None = None,
+    disease: str | None = None,
 ) -> np.ndarray:
     """Return boolean mask with same shape as ``volume``."""
     if spec.runner == "threshold_proxy":
@@ -79,6 +80,18 @@ def run_model(
             spacing_zyx=spacing_zyx,
             allow_download=allow_download,
             verbose=verbose,
+        )
+    if spec.runner == "monai_vista3d":
+        from agentic_radiogen.imaging.tumor_models.monai_vista3d import (
+            run_monai_vista3d_mask,
+        )
+
+        return run_monai_vista3d_mask(
+            volume,
+            spacing_zyx=spacing_zyx,
+            allow_download=allow_download,
+            verbose=verbose,
+            disease=disease,
         )
     if spec.runner == "lungtumormask":
         from agentic_radiogen.imaging.tumor_models.lungtumormask import run_lungtumormask

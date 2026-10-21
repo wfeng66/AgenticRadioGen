@@ -84,6 +84,9 @@ class ImagingRadiomicsAgent:
     Also maps PyRadiomics feature names ↔ literature radiomic terms.
     """
 
+    def __init__(self, *, force_model_id: str | None = None) -> None:
+        self.force_model_id = (force_model_id or "").strip() or None
+
     def extract(self, bundle: ImageBundle) -> RadiomicMatrix:
         if not bundle.series:
             raise ValueError("ImageBundle has no series")
@@ -203,7 +206,11 @@ class ImagingRadiomicsAgent:
             modality = getattr(series, "modality", None) or "CT"
             row.update(
                 self._from_local_path(
-                    series.local_path, disease=disease, modality=modality
+                    series.local_path,
+                    disease=disease,
+                    modality=modality,
+                    force_model_id=self.force_model_id,
+                    patient_id=getattr(series, "patient_id", None),
                 )
             )
         if series.volume_summary:
@@ -226,13 +233,19 @@ class ImagingRadiomicsAgent:
         *,
         disease: str | None = None,
         modality: str = "CT",
+        force_model_id: str | None = None,
+        patient_id: str | None = None,
     ) -> dict[str, float]:
         path = Path(local_path)
         if path.is_dir():
             from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 
             extracted = extract_series_features(
-                path, disease=disease, modality=modality
+                path,
+                disease=disease,
+                modality=modality,
+                force_model_id=force_model_id,
+                patient_id=patient_id,
             )
             return {
                 k: float(v)
@@ -244,7 +257,11 @@ class ImagingRadiomicsAgent:
             from agentic_radiogen.imaging.radiomics_extract import extract_radiomics_from_volume
 
             features, _ = extract_radiomics_from_volume(
-                volume, disease=disease, modality=modality
+                volume,
+                disease=disease,
+                modality=modality,
+                force_model_id=force_model_id,
+                patient_id=patient_id,
             )
             return {
                 k: float(v)

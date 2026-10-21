@@ -63,6 +63,7 @@ class LiveCatalog:
     show_progress: bool | None = None
     store_segm: bool = False
     segm_dir: Path = field(default_factory=lambda: Path.cwd() / "segm_rslt")
+    force_seg_model: str | None = None
     query_count: int = 0
     fetch_count: int = 0
     last_source_counts: dict[str, int] = field(default_factory=dict)
@@ -767,6 +768,11 @@ class LiveCatalog:
                             or rec.disease
                             or ""
                         )
+                        force_model = (
+                            self.force_seg_model
+                            or str(self.last_intermediate.get("force_seg_model") or "")
+                            or None
+                        )
                         extracted = extract_series_features(
                             series_dir,
                             disease=seg_disease,
@@ -778,6 +784,7 @@ class LiveCatalog:
                             store_segm=self.store_segm,
                             segm_dir=self.segm_dir,
                             patient_id=pid,
+                            force_model_id=force_model,
                         )
                         radiomic_features = {
                             k: float(v)

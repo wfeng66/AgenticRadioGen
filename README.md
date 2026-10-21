@@ -101,6 +101,8 @@ Useful flags:
 | `--approve-download` | Required for live fetch (human gate) |
 | `--no-dicom` | Metadata/mutations only (skip DICOM + radiomics) |
 | `--max-patients N` | Cap after full i&g intersection |
+| `--patient-id ID` | Restrict to one patient (or comma-separated IDs) |
+| `--seg-model ID` | Force segmentation model (skip agent ranking), e.g. `nnunet_msd_lung` |
 | `--modality CT` / `MR` | Override default modality |
 | `--tcga-project` / `--tcia-collection` | Force fixed GDC/TCIA sources |
 | `--genes` | Gene panel: `all` (default), `auto` (literature), one symbol (`TP53`), or comma list (`EGFR,KRAS`) |
@@ -181,6 +183,50 @@ python -m agentic_radiogen --stage 4 --catalog demo --json --out outputs/run.jso
 5. Apply `--max-patients` after the full intersection.
 
 Non-TCGA imaging collections often cannot pair with GDC (no shared IDs), so they may rank high by keyword but contribute little to `i&g`.
+
+---
+
+## Segmentation models (force with `--seg-model`)
+
+Common ids: `nnunet_msd_lung`, `monai_vista3d`, `monai_lung_nodule`, `lungtumormask`, `ts_lung`.
+
+Example — one patient with NVIDIA/MONAI VISTA-3D (lung tumor class 23):
+
+```bash
+python -m agentic_radiogen \
+  --stage 4 --catalog live --approve-download --store-segm \
+  --patient-id TCGA-17-Z021 \
+  --seg-model monai_vista3d \
+  --question "Which imaging features are associated with mutations in lung cancer?" \
+  --out outputs/z021_vista3d.json
+```
+
+### Manual setup: MONAI VISTA-3D (`monai_vista3d`)
+
+First use can auto-download the bundle. For a controlled / offline install:
+
+```bash
+# 1) Dependencies (GPU PyTorch recommended; install torch for your CUDA first)
+pip install 'monai[nibabel,fire]' huggingface_hub nibabel
+
+# 2) Download the official MONAI bundle (either works)
+python -m monai.bundle download vista3d \
+  --bundle_dir ~/.cache/agentic_radiogen/monai_vista3d
+
+# or from Hugging Face:
+# huggingface-cli download MONAI/vista3d \
+#   --local-dir ~/.cache/agentic_radiogen/monai_vista3d/vista3d
+
+# 3) Optional: point the app at the bundle (folder that contains configs/ + models/)
+export AGENTIC_RADIOGEN_VISTA3D_BUNDLE=~/.cache/agentic_radiogen/monai_vista3d/vista3d
+
+# Optional overrides:
+# export AGENTIC_RADIOGEN_VISTA3D_CACHE=~/.cache/agentic_radiogen/monai_vista3d
+# export AGENTIC_RADIOGEN_VISTA3D_LABEL=23   # lung tumor (default); 26=hepatic, 24=pancreatic, 27=colon
+```
+
+On Windows / WSL with a project under `/mnt/...`, the default cache is
+`~/.cache/agentic_radiogen/monai_vista3d` (avoids slow `/mnt` I/O).
 
 ---
 

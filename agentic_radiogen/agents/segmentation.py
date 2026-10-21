@@ -50,6 +50,7 @@ _LIVE_RUNNERS = frozenset(
         "nnunet",
         "nnunet_autopet",
         "monai_bundle",
+        "monai_vista3d",
         "lungtumormask",
     }
 )
@@ -272,27 +273,48 @@ class SegmentationAgent:
         modality: str = "CT",
         question: str = "",
         spacing_zyx: tuple[float, float, float] | None = None,
+        force_model_id: str | None = None,
     ) -> SegmentationResult:
         disease = (disease or "").strip() or "unknown"
         modality = (modality or "CT").strip().upper()
+        force_id = (force_model_id or "").strip() or None
 
-        ranked = self.choose_model_order(
-            disease=disease, modality=modality, question=question
-        )
-        primary = ranked[0]
-        # Try LLM/rules ranked order first, then other tumor models, then organs.
-        ranked_ids = {s.model_id for s in ranked}
-        rest: list[TumorModelSpec] = []
-        for spec in self.available_models(disease, modality):
-            if spec.model_id not in ranked_ids:
-                rest.append(spec)
-        for mid in ("totalsegmentator_organ", "threshold_proxy"):
+        if force_id:
             from agentic_radiogen.imaging.tumor_models.registry import get_model
 
-            extra = get_model(mid, models=self.models)
-            if extra and extra.model_id not in ranked_ids:
-                rest.append(extra)
-        candidates = _order_fallback_candidates(ranked, rest)
+            forced = get_model(force_id, models=self.models)
+            if forced is None:
+                raise ValueError(
+                    f"Unknown --seg-model '{force_id}'. "
+                    f"Common ids: nnunet_msd_lung, monai_vista3d, "
+                    f"monai_lung_nodule, lungtumormask, ts_lung, threshold_proxy"
+                )
+            ranked = [forced]
+            primary = forced
+            self.last_plan_rationale = f"forced by --seg-model={force_id}"
+            log(
+                f"[segmentation] Forced model '{force_id}' (agent ranking skipped)",
+                enabled=self.verbose,
+            )
+            candidates = ranked
+        else:
+            ranked = self.choose_model_order(
+                disease=disease, modality=modality, question=question
+            )
+            primary = ranked[0]
+            # Try LLM/rules ranked order first, then other tumor models, then organs.
+            ranked_ids = {s.model_id for s in ranked}
+            rest: list[TumorModelSpec] = []
+            for spec in self.available_models(disease, modality):
+                if spec.model_id not in ranked_ids:
+                    rest.append(spec)
+            for mid in ("totalsegmentator_organ", "threshold_proxy"):
+                from agentic_radiogen.imaging.tumor_models.registry import get_model
+
+                extra = get_model(mid, models=self.models)
+                if extra and extra.model_id not in ranked_ids:
+                    rest.append(extra)
+            candidates = _order_fallback_candidates(ranked, rest)
 
         # Only attempt backends that can produce a mask in this process.
         live: list[TumorModelSpec] = []
@@ -305,6 +327,20 @@ class SegmentationAgent:
         if mod_u == "MRI":
             mod_u = "MR"
         for spec in candidates:
+            if force_id:
+                # Explicit --seg-model: do not cohort-skip; still need a live runner.
+                if spec.runner not in _LIVE_RUNNERS:
+                    skipped.append(
+                        f"{spec.model_id}: runner={spec.runner} not live yet"
+                    )
+                    continue
+                if spec.runner == "nnunet_autopet" and mod_u not in {"PT", "PET"}:
+                    skipped.append(
+                        f"{spec.model_id}: skipped (needs PET+CT; modality={modality})"
+                    )
+                    continue
+                live.append(spec)
+                continue
             if spec.model_id in self._failed_model_ids:
                 skipped.append(f"{spec.model_id}: skipped (failed earlier this run)")
                 continue
@@ -355,7 +391,13 @@ class SegmentationAgent:
                 attempts.append(f"{spec.model_id}:fail:{short}")
                 # Empty ROI / thin series are patient-specific — do NOT block the
                 # model for the rest of the cohort (that forced everyone to threshold).
-                if _is_patient_local_failure(msg):
+                if force_id:
+                    log(
+                        f"[segmentation] Forced model '{spec.model_id}' failed "
+                        f"({exc}); no fallback (--seg-model)",
+                        enabled=self.verbose,
+                    )
+                elif _is_patient_local_failure(msg):
                     log(
                         f"[segmentation] Model '{spec.model_id}' empty/unsuitable "
                         f"for this case ({exc}); trying next (model stays enabled)",
@@ -377,6 +419,12 @@ class SegmentationAgent:
                         f"trying next (model stays enabled for later patients)",
                         enabled=self.verbose,
                     )
+
+        if force_id:
+            detail = "; ".join(errors[:3]) or "no live runner"
+            raise RuntimeError(
+                f"Forced segmentation model '{force_id}' failed for this case: {detail}"
+            )
 
         from agentic_radiogen.imaging.segment import _threshold_mask
 
@@ -461,6 +509,12 @@ class SegmentationAgent:
                 f"(lung_nodule_ct_detection; auto-download on first use if needed)",
                 enabled=self.verbose,
             )
+        elif spec.runner == "monai_vista3d":
+            log(
+                f"[segmentation] Using MONAI VISTA-3D '{spec.model_id}' "
+                f"(NVIDIA/MONAI foundation CT segmentor; label_prompt lung tumor=23)",
+                enabled=self.verbose,
+            )
         elif spec.runner == "lungtumormask":
             log(
                 f"[segmentation] Using LungTumorMask '{spec.model_id}' "
@@ -497,6 +551,7 @@ class SegmentationAgent:
             verbose=self.verbose,
             modality=modality,
             pet_volume=pet_volume,
+            disease=disease,
         )
         mask_b = np.asarray(mask, dtype=bool)
         if not mask_b.any():

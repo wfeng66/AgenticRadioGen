@@ -30,6 +30,9 @@ class DataRequest(BaseModel):
     max_genes: int | None = None
     min_altered: int = 1
     estimated_patient_count: int | None = None
+    # Optional CLI overrides: restrict cohort and/or force a segmentation backend.
+    patient_ids: list[str] = Field(default_factory=list)
+    force_seg_model: str | None = None
 
 
 class ImageSeriesRef(BaseModel):

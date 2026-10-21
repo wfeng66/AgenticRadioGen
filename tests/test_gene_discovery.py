@@ -53,25 +53,53 @@ def test_discover_genes_returns_all_cohort_genes_by_default() -> None:
                     {
                         "case": {"submitter_id": "P1"},
                         "ssm": {
-                            "consequence": [{"transcript": {"gene": {"symbol": "TP53"}}}]
+                            "consequence": [
+                                {
+                                    "transcript": {
+                                        "gene": {"symbol": "TP53"},
+                                        "consequence_type": "missense_variant",
+                                    }
+                                }
+                            ]
                         },
                     },
                     {
                         "case": {"submitter_id": "P2"},
                         "ssm": {
-                            "consequence": [{"transcript": {"gene": {"symbol": "TP53"}}}]
+                            "consequence": [
+                                {
+                                    "transcript": {
+                                        "gene": {"symbol": "TP53"},
+                                        "consequence_type": "stop_gained",
+                                    }
+                                }
+                            ]
                         },
                     },
                     {
                         "case": {"submitter_id": "P1"},
                         "ssm": {
-                            "consequence": [{"transcript": {"gene": {"symbol": "ALK"}}}]
+                            "consequence": [
+                                {
+                                    "transcript": {
+                                        "gene": {"symbol": "ALK"},
+                                        "consequence_type": "frameshift_variant",
+                                    }
+                                }
+                            ]
                         },
                     },
                     {
                         "case": {"submitter_id": "P3"},
                         "ssm": {
-                            "consequence": [{"transcript": {"gene": {"symbol": "RARE"}}}]
+                            "consequence": [
+                                {
+                                    "transcript": {
+                                        "gene": {"symbol": "RARE"},
+                                        "consequence_type": "missense_variant",
+                                    }
+                                }
+                            ]
                         },
                     },
                 ],

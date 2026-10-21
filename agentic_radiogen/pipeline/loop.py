@@ -61,6 +61,8 @@ class DiscoveryLoop:
         max_genes: int | None = None,
         min_altered: int | None = None,
         max_papers: int | None = None,
+        patient_ids: list[str] | None = None,
+        force_seg_model: str | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.matcher = matcher
@@ -72,6 +74,8 @@ class DiscoveryLoop:
         self.max_patients = max_patients
         self.max_genes = max_genes
         self.min_altered = min_altered
+        self.patient_ids = list(patient_ids or [])
+        self.force_seg_model = force_seg_model
         if max_papers is not None:
             self.literature.max_papers = max(1, int(max_papers))
 
@@ -85,6 +89,10 @@ class DiscoveryLoop:
             updates["max_genes"] = self.max_genes
         if self.min_altered is not None:
             updates["min_altered"] = self.min_altered
+        if self.patient_ids:
+            updates["patient_ids"] = list(self.patient_ids)
+        if self.force_seg_model:
+            updates["force_seg_model"] = self.force_seg_model
         if updates:
             request = request.model_copy(update=updates)
         state = LoopState(question=question, request=request)
