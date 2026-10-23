@@ -3,10 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
 from agentic_radiogen.schemas.contracts import (
     Association,
@@ -16,6 +14,7 @@ from agentic_radiogen.schemas.contracts import (
     ModelResult,
     RadiomicMatrix,
 )
+from agentic_radiogen.stats.predictors import normalize_model_name, predict_proba_mutation
 
 
 def _fdr_bh(p_values: list[float]) -> list[float]:
@@ -56,6 +55,9 @@ def _concordance_index(times: np.ndarray, events: np.ndarray, scores: np.ndarray
 
 class StatisticalCriticalAgent:
     """Joins radiomic and genomic matrices. This is the first merge point."""
+
+    def __init__(self, model: str = "random_forest") -> None:
+        self.model_name = normalize_model_name(model)
 
     def analyze(
         self,
@@ -109,6 +111,10 @@ class StatisticalCriticalAgent:
             assoc.q_value = q
 
         diagnostics = self._diagnostics(radio_df)
+        diagnostics.caveats.append(
+            f"Mutation AUROC uses nonlinear model '{self.model_name}' "
+            "(not logistic/linear regression)"
+        )
         metrics: list[ModelMetrics] = []
         for target in genomic_targets:
             metrics.append(self._predict_mutation(radio_df, geno_df, target))
@@ -125,6 +131,7 @@ class StatisticalCriticalAgent:
                     n_train=len(shared),
                     n_test=0,
                     target="OS",
+                    model=self.model_name,
                 )
             )
 
@@ -164,19 +171,21 @@ class StatisticalCriticalAgent:
             caveats=caveats,
         )
 
-    @staticmethod
     def _predict_mutation(
-        radio_df: pd.DataFrame, geno_df: pd.DataFrame, target: str
+        self, radio_df: pd.DataFrame, geno_df: pd.DataFrame, target: str
     ) -> ModelMetrics:
         y = geno_df[target].to_numpy(dtype=float)
         mask = np.isfinite(y)
         y = y[mask]
+        empty = ModelMetrics(
+            auroc=None, n_train=0, n_test=0, target=target, model=self.model_name
+        )
         if len(y) < 4:
-            return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
+            return empty
         classes, counts = np.unique(y.astype(int), return_counts=True)
         if len(classes) < 2 or int(counts.min()) < 2:
             # Rare / single-mutant cohorts cannot support a stratified holdout AUROC.
-            return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
+            return empty
         X = radio_df.to_numpy(dtype=float)[mask]
         # Stratify only when every class can appear in both train and test.
         can_stratify = int(counts.min()) >= 2 and len(y) >= 6
@@ -189,17 +198,32 @@ class StatisticalCriticalAgent:
                 stratify=y.astype(int) if can_stratify else None,
             )
         except ValueError:
-            return ModelMetrics(auroc=None, n_train=0, n_test=0, target=target)
+            return empty
         if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-            return ModelMetrics(auroc=None, n_train=len(y_train), n_test=len(y_test), target=target)
-        scaler = StandardScaler()
-        clf = LogisticRegression(max_iter=200)
-        clf.fit(scaler.fit_transform(X_train), y_train)
-        proba = clf.predict_proba(scaler.transform(X_test))[:, 1]
-        auroc = float(roc_auc_score(y_test, proba))
+            return ModelMetrics(
+                auroc=None,
+                n_train=len(y_train),
+                n_test=len(y_test),
+                target=target,
+                model=self.model_name,
+            )
+        try:
+            proba = predict_proba_mutation(
+                self.model_name, X_train, y_train, X_test
+            )
+            auroc = float(roc_auc_score(y_test, proba))
+        except Exception:
+            return ModelMetrics(
+                auroc=None,
+                n_train=len(y_train),
+                n_test=len(y_test),
+                target=target,
+                model=self.model_name,
+            )
         return ModelMetrics(
             auroc=auroc,
             n_train=len(y_train),
             n_test=len(y_test),
             target=target,
+            model=self.model_name,
         )

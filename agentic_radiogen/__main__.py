@@ -198,12 +198,14 @@ def print_summary(payload: dict[str, Any]) -> None:
         if printable_metrics:
             print(
                 "Metrics (genes with computable AUROC/C-index only)\n"
-                "  AUROC=mutation prediction from radiomics; "
+                "  AUROC=mutation prediction from radiomics (--model); "
                 "C-index=survival concordance if OS present; "
                 "n_train/n_test=split sizes"
             )
             for item in printable_metrics:
                 bits = [f"target={item.get('target')}"]
+                if item.get("model"):
+                    bits.append(f"model={item['model']}")
                 if item.get("auroc") is not None:
                     bits.append(f"AUROC={item['auroc']:.3f}")
                 if item.get("c_index") is not None:
@@ -592,6 +594,7 @@ def run_stage3(
     llm_model: str | None = None,
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
+    stats_model: str = "random_forest",
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -643,6 +646,7 @@ def run_stage3(
             outputs,
             disease=payload["question"]["disease"],
             question=question_text,
+            stats=StatisticalCriticalAgent(model=stats_model),
             literature=literature,
         )
     except Stage3Error as exc:
@@ -681,6 +685,7 @@ def run_stage4(
     llm_model: str | None = None,
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
+    stats_model: str = "random_forest",
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
@@ -711,7 +716,7 @@ def run_stage4(
         ),
         imaging=ImagingRadiomicsAgent(force_model_id=force_seg_model),
         genomics=GenomicsAgent(),
-        stats=StatisticalCriticalAgent(),
+        stats=StatisticalCriticalAgent(model=stats_model),
         literature=LiteratureAgent(
             use_llm=use_llm,
             llm_provider=llm_provider,
@@ -840,6 +845,26 @@ def main() -> None:
         "ts_lung. Recomputes radiomics (ignores per-series cache) for those patients.",
     )
     parser.add_argument(
+        "--model",
+        default="random_forest",
+        choices=(
+            "lstm",
+            "svm",
+            "random_forest",
+            "xgboost",
+            "vgg19",
+            "resnext",
+            "se_cnn",
+            "ridge_reg",
+            "elastic_net",
+            "poly_reg",
+        ),
+        help="Model for radiomics→mutation AUROC metrics (default: random_forest). "
+        "Linear: ridge_reg, elastic_net, poly_reg (degree-2 + Ridge). "
+        "Deep (lstm, vgg19, resnext, se_cnn) need PyTorch. "
+        "Exploratory Pearson associations are unchanged.",
+    )
+    parser.add_argument(
         "--llm",
         action="store_true",
         default=None,
@@ -942,6 +967,7 @@ def main() -> None:
         llm_model=args.llm_model,
         patient_ids=patient_ids,
         force_seg_model=force_seg_model,
+        stats_model=str(args.model or "random_forest"),
     )
 
     try:

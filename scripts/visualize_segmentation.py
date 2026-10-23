@@ -131,6 +131,7 @@ def visualize(
     slice_index: int | None = None,
     out: Path | None = None,
     title: str = "",
+    img_size: str = "small",
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -163,7 +164,8 @@ def visualize(
             "WARNING: chosen slice has no mask; pass --slice with a nonempty index."
         )
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    figsize = {"small": (8, 2.7), "mid": (12, 4), "big": (18, 6)}[img_size]
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
     axes[0].imshow(img, cmap="gray", origin="lower")
     axes[0].set_title("Image")
     axes[1].imshow(msk, cmap="Reds", origin="lower", vmin=0, vmax=1)
@@ -201,6 +203,12 @@ def main() -> None:
     parser.add_argument("--patient-id", default=None, help="Patient id from the log CSV")
     parser.add_argument("--slice", type=int, default=None, dest="slice_index")
     parser.add_argument("--out", type=Path, default=None, help="Save PNG instead of showing")
+    parser.add_argument(
+        "--img_size",
+        choices=("small", "mid", "big"),
+        default="small",
+        help="Visualization size",
+    )
     args = parser.parse_args()
 
     image_path = args.image
@@ -228,6 +236,7 @@ def main() -> None:
         slice_index=args.slice_index,
         out=args.out,
         title=title,
+        img_size=args.img_size,
     )
 
 

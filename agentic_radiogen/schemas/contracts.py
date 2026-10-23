@@ -86,6 +86,7 @@ class ModelMetrics(BaseModel):
     n_train: int = 0
     n_test: int = 0
     target: str | None = None
+    model: str | None = None
 
 
 class ModelDiagnostics(BaseModel):
