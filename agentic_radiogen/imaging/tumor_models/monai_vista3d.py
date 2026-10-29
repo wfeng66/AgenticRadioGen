@@ -8,7 +8,7 @@ Manual setup (optional — first use can auto-download):
 
     pip install 'monai[nibabel,fire]' huggingface_hub nibabel
     python -m monai.bundle download vista3d \\
-      --bundle_dir ~/.cache/agentic_radiogen/monai_vista3d
+      --bundle_dir data_cache/seg_models/monai_vista3d
     # or point at an existing bundle:
     export AGENTIC_RADIOGEN_VISTA3D_BUNDLE=/path/to/vista3d
 
@@ -48,14 +48,7 @@ def cache_root() -> Path:
     env = (os.environ.get("AGENTIC_RADIOGEN_VISTA3D_CACHE") or "").strip()
     if env:
         return Path(env).expanduser()
-    default = _DEFAULT_CACHE
-    try:
-        resolved = str(default.resolve()).replace("\\", "/")
-        if resolved.startswith("/mnt/"):
-            return Path.home() / ".cache" / "agentic_radiogen" / "monai_vista3d"
-    except Exception:
-        pass
-    return default
+    return _DEFAULT_CACHE
 
 
 def vista3d_bundle_dir() -> Path | None:

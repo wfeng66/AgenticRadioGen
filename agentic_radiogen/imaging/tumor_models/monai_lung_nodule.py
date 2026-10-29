@@ -31,14 +31,7 @@ def cache_root() -> Path:
     env = (os.environ.get("AGENTIC_RADIOGEN_MONAI_LUNG_CACHE") or "").strip()
     if env:
         return Path(env).expanduser()
-    default = _DEFAULT_CACHE
-    try:
-        resolved = str(default.resolve()).replace("\\", "/")
-        if resolved.startswith("/mnt/"):
-            return Path.home() / ".cache" / "agentic_radiogen" / "monai_lung_nodule"
-    except Exception:
-        pass
-    return default
+    return _DEFAULT_CACHE
 
 
 def monai_bundle_dir() -> Path | None:

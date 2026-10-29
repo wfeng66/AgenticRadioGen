@@ -57,6 +57,16 @@ def run_model(
             allow_download=allow_download,
             verbose=verbose,
         )
+    if spec.runner == "nnunet_task998":
+        from agentic_radiogen.imaging.tumor_models.nnunet_task998 import (
+            run_nnunet_task998_mask,
+        )
+
+        return run_nnunet_task998_mask(
+            volume,
+            spacing_zyx=spacing_zyx,
+            verbose=verbose,
+        )
     if spec.runner == "nnunet_autopet":
         from agentic_radiogen.imaging.tumor_models.nnunet_autopet import (
             run_nnunet_autopet_mask,

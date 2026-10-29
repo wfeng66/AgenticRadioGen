@@ -48,6 +48,7 @@ _LIVE_RUNNERS = frozenset(
         "threshold_proxy",
         "torchscript",
         "nnunet",
+        "nnunet_task998",
         "nnunet_autopet",
         "monai_bundle",
         "monai_vista3d",
@@ -66,6 +67,8 @@ def _should_cohort_block(model_id: str, message: str) -> bool:
     if model_id in _COHORT_BLOCK_MODELS:
         return True
     m = (message or "").lower()
+    if model_id == "nnunet_task998_lungct" and "weights not found" in m:
+        return True
     # Explicit no-download session: retrying every patient is pointless.
     if "download disabled" in m or "install disabled" in m:
         return True
@@ -495,6 +498,12 @@ class SegmentationAgent:
             log(
                 f"[segmentation] Using nnU-Net '{spec.model_id}' "
                 f"(auto-download Task006 from Zenodo on first use if needed)",
+                enabled=self.verbose,
+            )
+        elif spec.runner == "nnunet_task998":
+            log(
+                f"[segmentation] Using nnU-Net Task998 '{spec.model_id}' "
+                f"(requires manually installed weights)",
                 enabled=self.verbose,
             )
         elif spec.runner == "nnunet_autopet":

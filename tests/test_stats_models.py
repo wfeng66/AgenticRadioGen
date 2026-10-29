@@ -16,6 +16,7 @@ from agentic_radiogen.stats.predictors import (
 
 def test_normalize_model_aliases() -> None:
     assert normalize_model_name("XGBoost") == "xgboost"
+    assert normalize_model_name("GAT") == "gat"
     assert normalize_model_name("random forest") == "random_forest"
     assert normalize_model_name("SE-CNN") == "se_cnn"
     assert normalize_model_name("ResNeXt") == "resnext"
@@ -74,6 +75,7 @@ def test_stats_agent_records_model_name() -> None:
 def test_model_choices_cover_cli() -> None:
     assert set(MODEL_CHOICES) == {
         "lstm",
+        "gat",
         "svm",
         "random_forest",
         "xgboost",
@@ -86,7 +88,7 @@ def test_model_choices_cover_cli() -> None:
     }
 
 
-@pytest.mark.parametrize("name", ["lstm", "vgg19", "resnext", "se_cnn"])
+@pytest.mark.parametrize("name", ["lstm", "gat", "vgg19", "resnext", "se_cnn"])
 def test_torch_models_optional(name: str) -> None:
     torch = pytest.importorskip("torch")
     _ = torch

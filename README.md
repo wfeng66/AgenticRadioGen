@@ -64,6 +64,13 @@ pip install -e ".[dev]"
 pip install -e ".[imaging-gpu]"
 ```
 
+Segmentation-model checkpoints are stored under the project's
+`data_cache/seg_models/` directory by default (for example,
+`data_cache/seg_models/nnunet_msd_lung/`). In WSL this is the same project
+directory mounted under `/mnt/<drive>/...`, rather than the separate
+`/home/<user>/.cache/agentic_radiogen/` tree. Existing model-specific cache
+environment variables can still override the default location.
+
 ---
 
 ## Quick start (demo, no download)
@@ -109,6 +116,73 @@ Useful flags:
 | `--list-diseases` | Example disease phrases |
 | `--no-llm` | Force rule-based orchestrator/matcher |
 | `--llm` | Force free-tier LLM for planning + source matching |
+
+### Optional nnU-Net Task998 lung CT model
+
+The package supports `nnunet_task998_lungct`, an nnU-Net v1 lung tumor CT model.
+Unlike Task006, its weights are **not downloaded automatically**. Use Linux or
+WSL2 for the nnU-Net v1 environment.
+
+1. Create a separate Python 3.10 environment and install this package, PyTorch,
+   and nnU-Net v1:
+
+   ```bash
+   cd /mnt/g/Research/Projects/AgenticRadioGen
+   python3.10 -m venv .venv-task998
+   source .venv-task998/bin/activate
+   python -m pip install --upgrade pip
+   python -m pip install "numpy==1.26.4"
+   python -m pip install -e .
+   ```
+
+   Install a PyTorch build suitable for your CPU/CUDA setup using the
+   [official PyTorch instructions](https://pytorch.org/get-started/locally/),
+   then install nnU-Net v1 and NIfTI support:
+
+   ```bash
+   python -m pip install "nnunet==1.7.1" nibabel
+   ```
+
+2. Sign in to Kaggle and download the model archive from
+   [CT Lung Tumor Segmentation model](https://www.kaggle.com/models/dejankuhn/ct-lung-tumor-segmentation-model).
+   Review Kaggle's current access and usage terms before using the weights.
+   The archive contains `Task998_LungCTSegmentation` at its root. Extract it
+   into the repository's `data_cache/seg_models/` directory, retaining its
+   trainer folder and checkpoint files. For the archive currently present at
+   that path, from the repository root run:
+
+   ```bash
+   tar -xzf data_cache/seg_models/ct-lung-tumor-segmentation-model-pytorch-v1-v1.tar.gz \
+     -C data_cache/seg_models/
+   ```
+
+   The resulting layout should include:
+
+   ```text
+   data_cache/seg_models/Task998_LungCTSegmentation/
+     nnUNetTrainerV2__nnUNetPlansv2.1/
+       plans.pkl
+       fold_0/model_final_checkpoint.model
+       fold_0/model_final_checkpoint.model.pkl
+   ```
+
+   The runner searches recursively under `data_cache/seg_models/` by default.
+   If you extracted the task elsewhere, set
+   `AGENTIC_RADIOGEN_TASK998_MODEL_DIR` to the directory containing the task
+   folder (or the task folder itself).
+
+3. Activate `.venv-task998` and explicitly select the model:
+
+   ```bash
+   python -m agentic_radiogen --stage 2 --catalog live --approve-download \
+     --seg-model nnunet_task998_lungct \
+     --question "Segment lung tumor on CT"
+   ```
+
+The segmentation log records the selected model and mask path for use with
+`scripts/visualize_segmentation.py`. Automatic installation of nnU-Net weights
+is not attempted; if the expected checkpoint files are absent, the pipeline
+reports where to install them.
 
 ### Optional LLM (free tier)
 

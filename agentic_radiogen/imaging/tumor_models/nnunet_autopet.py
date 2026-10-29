@@ -28,14 +28,7 @@ def cache_root() -> Path:
     env = (os.environ.get("AGENTIC_RADIOGEN_AUTOPET_CACHE") or "").strip()
     if env:
         return Path(env).expanduser()
-    default = _DEFAULT_CACHE
-    try:
-        resolved = str(default.resolve()).replace("\\", "/")
-        if resolved.startswith("/mnt/"):
-            return Path.home() / ".cache" / "agentic_radiogen" / "nnunet_autopet"
-    except Exception:
-        pass
-    return default
+    return _DEFAULT_CACHE
 
 
 def download_url() -> str:

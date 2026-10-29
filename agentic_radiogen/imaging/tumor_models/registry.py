@@ -27,7 +27,8 @@ class TumorModelSpec:
     modalities: tuple[str, ...]
     runner: str
     # totalsegmentator_organ | totalsegmentator_task | threshold_proxy
-    # | torchscript | huggingface | nnunet | nnunet_autopet | monai_bundle
+    # | torchscript | huggingface | nnunet | nnunet_autopet | nnunet_task998
+    # | monai_bundle
     # | monai_vista3d | lungtumormask | promptable | fine_tune
     description: str
     organ_keywords: tuple[str, ...] = ()
@@ -84,6 +85,21 @@ def _ts(
 
 DEFAULT_MODELS: tuple[TumorModelSpec, ...] = (
     # --- 1. Ready-to-use lesion / tumor (direct inference) ---
+    TumorModelSpec(
+        model_id="nnunet_task998_lungct",
+        diseases=("lung", "nsclc", "sclc", "luad", "lusc", "pulmonary"),
+        modalities=("CT",),
+        runner="nnunet_task998",
+        description=(
+            "nnU-Net v1 Task998_LungCTSegmentation (Kaggle CT Lung Tumor "
+            "Segmentation model). Requires manual download/setup of weights."
+        ),
+        source="kaggle",
+        is_tumor_model=True,
+        priority=8,
+        operational_type="ready_inference",
+        direct_inference=True,
+    ),
     TumorModelSpec(
         model_id="nnunet_msd_lung",
         diseases=("lung", "nsclc", "sclc", "luad", "lusc", "pulmonary"),

@@ -841,14 +841,16 @@ def main() -> None:
         "--seg-model",
         default=None,
         help="Force a catalog segmentation model (skip LLM/rules ranking), "
-        "e.g. nnunet_msd_lung, monai_vista3d, lungtumormask, monai_lung_nodule, "
-        "ts_lung. Recomputes radiomics (ignores per-series cache) for those patients.",
+        "e.g. nnunet_msd_lung, nnunet_task998_lungct, monai_vista3d, "
+        "lungtumormask, monai_lung_nodule, ts_lung. Recomputes radiomics "
+        "(ignores per-series cache) for those patients.",
     )
     parser.add_argument(
         "--model",
         default="random_forest",
         choices=(
             "lstm",
+            "gat",
             "svm",
             "random_forest",
             "xgboost",
@@ -861,7 +863,7 @@ def main() -> None:
         ),
         help="Model for radiomics→mutation AUROC metrics (default: random_forest). "
         "Linear: ridge_reg, elastic_net, poly_reg (degree-2 + Ridge). "
-        "Deep (lstm, vgg19, resnext, se_cnn) need PyTorch. "
+        "Deep (lstm, gat, vgg19, resnext, se_cnn) need PyTorch. "
         "Exploratory Pearson associations are unchanged.",
     )
     parser.add_argument(

@@ -16,6 +16,7 @@ from sklearn.svm import SVC
 
 MODEL_CHOICES: tuple[str, ...] = (
     "lstm",
+    "gat",
     "svm",
     "random_forest",
     "xgboost",
@@ -29,6 +30,7 @@ MODEL_CHOICES: tuple[str, ...] = (
 
 _ALIASES: dict[str, str] = {
     "lstm": "lstm",
+    "gat": "gat",
     "svm": "svm",
     "random_forest": "random_forest",
     "randomforest": "random_forest",
@@ -51,7 +53,7 @@ _ALIASES: dict[str, str] = {
     "polynomialregression": "poly_reg",
 }
 
-_DL_MODELS = frozenset({"lstm", "vgg19", "resnext", "se_cnn"})
+_DL_MODELS = frozenset({"lstm", "gat", "vgg19", "resnext", "se_cnn"})
 _REG_MODELS = frozenset({"ridge_reg", "elastic_net", "poly_reg"})
 
 
@@ -201,7 +203,10 @@ def _predict_torch(
 
     device = torch.device("cpu")
     n_features = int(X_train.shape[1])
-    model = _build_torch_model(name, n_features, nn).to(device)
+    feature_neighbors = _feature_neighbors(X_train) if name == "gat" else None
+    model = _build_torch_model(
+        name, n_features, nn, feature_neighbors=feature_neighbors
+    ).to(device)
 
     mu = X_train.mean(axis=0)
     sigma = X_train.std(axis=0)
@@ -234,7 +239,35 @@ def _predict_torch(
     return np.asarray(probs, dtype=float)
 
 
-def _build_torch_model(name: str, n_features: int, nn):
+def _feature_neighbors(X_train: np.ndarray, max_neighbors: int = 8) -> np.ndarray:
+    """Build a sparse feature graph using training-set correlations only."""
+    n_features = int(X_train.shape[1])
+    if n_features <= 1:
+        return np.zeros((n_features, 1), dtype=np.int64)
+
+    centered = np.asarray(X_train, dtype=float) - np.mean(X_train, axis=0)
+    norms = np.linalg.norm(centered, axis=0)
+    normalized = centered / np.where(norms > 1e-8, norms, 1.0)
+    similarity = np.abs(normalized.T @ normalized)
+    np.fill_diagonal(similarity, -np.inf)
+
+    n_neighbors = min(max_neighbors, n_features - 1)
+    neighbors = np.argpartition(
+        similarity, kth=n_features - n_neighbors, axis=1
+    )[:, -n_neighbors:]
+    self_indices = np.arange(n_features, dtype=np.int64)[:, None]
+    return np.concatenate((self_indices, neighbors), axis=1)
+
+
+def _build_torch_model(
+    name: str,
+    n_features: int,
+    nn,
+    *,
+    feature_neighbors: np.ndarray | None = None,
+):
+    import torch
+
     if name == "lstm":
 
         class LSTMHead(nn.Module):
@@ -248,13 +281,106 @@ def _build_torch_model(name: str, n_features: int, nn):
                     batch_first=True,
                     dropout=0.1,
                 )
+                self.attention = nn.Linear(32, 1)
                 self.fc = nn.Linear(32, 1)
 
             def forward(self, x):
-                out, _ = self.lstm(x.unsqueeze(-1))
-                return self.fc(out[:, -1, :])
+                sequence, _ = self.lstm(x.unsqueeze(-1))
+                weights = torch.softmax(self.attention(sequence).squeeze(-1), dim=1)
+                context = torch.sum(sequence * weights.unsqueeze(-1), dim=1)
+                return self.fc(context)
 
         return LSTMHead()
+
+    if name == "gat":
+        if feature_neighbors is None:
+            raise ValueError("GAT requires a feature-neighbor graph")
+
+        class FeatureGATLayer(nn.Module):
+            def __init__(
+                self,
+                in_features: int,
+                out_features: int,
+                heads: int,
+                neighbors: np.ndarray,
+                *,
+                concatenate: bool,
+            ) -> None:
+                super().__init__()
+                self.out_features = out_features
+                self.heads = heads
+                self.concatenate = concatenate
+                self.projection = nn.Linear(
+                    in_features, heads * out_features, bias=False
+                )
+                self.attention_source = nn.Parameter(
+                    torch.empty(heads, out_features)
+                )
+                self.attention_target = nn.Parameter(
+                    torch.empty(heads, out_features)
+                )
+                nn.init.xavier_uniform_(self.attention_source)
+                nn.init.xavier_uniform_(self.attention_target)
+                self.register_buffer(
+                    "neighbors", torch.as_tensor(neighbors, dtype=torch.long)
+                )
+
+            def forward(self, nodes):
+                batch_size = nodes.shape[0]
+                projected = self.projection(nodes).view(
+                    batch_size, n_features, self.heads, self.out_features
+                )
+                source_scores = (
+                    projected * self.attention_source[None, None, :, :]
+                ).sum(dim=-1)
+                target_scores = (
+                    projected * self.attention_target[None, None, :, :]
+                ).sum(dim=-1)
+                neighbor_scores = target_scores[:, self.neighbors, :]
+                logits = torch.nn.functional.leaky_relu(
+                    source_scores.unsqueeze(2) + neighbor_scores,
+                    negative_slope=0.2,
+                )
+                weights = torch.softmax(logits, dim=2)
+                weights = torch.nn.functional.dropout(
+                    weights, p=0.1, training=self.training
+                )
+                neighbor_nodes = projected[:, self.neighbors, :, :]
+                attended = (weights.unsqueeze(-1) * neighbor_nodes).sum(dim=2)
+                if self.concatenate:
+                    return torch.nn.functional.elu(attended.flatten(start_dim=2))
+                return torch.nn.functional.elu(attended.mean(dim=2))
+
+        class FeatureGAT(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.feature_embedding = nn.Parameter(torch.empty(n_features, 16))
+                nn.init.xavier_uniform_(self.feature_embedding)
+                self.value_projection = nn.Linear(1, 16)
+                self.gat1 = FeatureGATLayer(
+                    16, 16, 4, feature_neighbors, concatenate=True
+                )
+                self.gat2 = FeatureGATLayer(
+                    64, 32, 1, feature_neighbors, concatenate=False
+                )
+                self.classifier = nn.Sequential(
+                    nn.Linear(64, 32),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(32, 1),
+                )
+
+            def forward(self, values):
+                nodes = self.value_projection(values.unsqueeze(-1))
+                nodes = torch.relu(nodes + self.feature_embedding.unsqueeze(0))
+                nodes = self.gat1(nodes)
+                nodes = self.gat2(nodes)
+                pooled = torch.cat(
+                    (nodes.mean(dim=1), nodes.amax(dim=1)), dim=1
+                )
+                return self.classifier(pooled)
+
+        return FeatureGAT()
 
     if name == "vgg19":
 

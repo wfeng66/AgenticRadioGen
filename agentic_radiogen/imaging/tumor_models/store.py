@@ -37,6 +37,13 @@ class ModelStore:
 
     def is_ready(self, spec: TumorModelSpec) -> bool:
         """True when the model can run without a network download."""
+        if spec.runner == "nnunet_task998":
+            from agentic_radiogen.imaging.tumor_models.nnunet_task998 import (
+                _find_trainer,
+                task_root,
+            )
+
+            return _find_trainer(task_root()) is not None
         if spec.runner in {
             "threshold_proxy",
             "totalsegmentator_organ",
@@ -56,6 +63,19 @@ class ModelStore:
 
     def ensure_local(self, spec: TumorModelSpec) -> Path:
         """Return local model directory; download zip package if missing."""
+        if spec.runner == "nnunet_task998":
+            from agentic_radiogen.imaging.tumor_models.nnunet_task998 import (
+                task_root,
+            )
+
+            if not self.is_ready(spec):
+                raise FileNotFoundError(
+                    "Task998 weights are not installed. Download them from "
+                    "https://www.kaggle.com/models/dejankuhn/"
+                    "ct-lung-tumor-segmentation-model and set "
+                    "AGENTIC_RADIOGEN_TASK998_MODEL_DIR to the task directory."
+                )
+            return task_root()
         dest = self.model_dir(spec)
         if self.is_ready(spec):
             log(

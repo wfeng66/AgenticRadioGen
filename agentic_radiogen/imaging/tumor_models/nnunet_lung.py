@@ -29,16 +29,7 @@ def cache_root() -> Path:
     env = (os.environ.get("AGENTIC_RADIOGEN_NNUNET_LUNG_CACHE") or "").strip()
     if env:
         return Path(env).expanduser()
-    # Prefer Linux-native home cache when the project lives on /mnt/* (WSL→NTFS),
-    # because atomic rename of multi-GB files on DrvFs often fails.
-    default = _DEFAULT_CACHE
-    try:
-        resolved = str(default.resolve()).replace("\\", "/")
-        if resolved.startswith("/mnt/"):
-            return Path.home() / ".cache" / "agentic_radiogen" / "nnunet_msd_lung"
-    except Exception:
-        pass
-    return default
+    return _DEFAULT_CACHE
 
 
 def download_url() -> str:
@@ -60,9 +51,6 @@ def nnunet_lung_model_dir() -> Path | None:
         val = (os.environ.get(key) or "").strip()
         if val:
             roots.append(Path(val).expanduser())
-    roots.append(Path.home() / "nnUNet_results")
-    roots.append(Path.home() / ".cache" / "agentic_radiogen" / "nnunet_msd_lung")
-
     seen: set[str] = set()
     for root in roots:
         if not root.is_dir():

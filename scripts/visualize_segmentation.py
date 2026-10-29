@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Overlay a CT/MR volume with its segmentation mask (middle slice by default).
+"""Visualize a CT/MR volume with its segmentation mask.
 
 Examples
 --------
@@ -16,6 +16,10 @@ python scripts/visualize_segmentation.py \\
 # Save figure without opening a window:
 python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
   --patient-id TCGA-50-5936 --out overlay.png
+
+# Show axial, coronal, and sagittal MPR overlays alongside the original CT:
+python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
+  --patient-id TCGA-50-5936 --mpr --out mpr.png
 """
 
 from __future__ import annotations
@@ -74,6 +78,42 @@ def _load_volume(path: Path) -> np.ndarray:
     return _load_array_zyx(path)
 
 
+def _load_volume_and_spacing(
+    path: Path,
+) -> tuple[np.ndarray, tuple[float, float, float]]:
+    """Load a volume as (z,y,x) with physical voxel spacing in the same order."""
+    path = _resolve_path(path)
+    if path.is_dir():
+        from agentic_radiogen.imaging.dicom_io import load_dicom_series_with_spacing
+
+        volume, spacing_zyx = load_dicom_series_with_spacing(path)
+        return np.asarray(volume, dtype=np.float32), spacing_zyx
+    if path.suffix.lower() == ".npy":
+        return np.asarray(np.load(path), dtype=np.float32), (1.0, 1.0, 1.0)
+    try:
+        import SimpleITK as sitk
+
+        image = sitk.ReadImage(str(path))
+        volume = sitk.GetArrayFromImage(image)
+        return np.asarray(volume, dtype=np.float32), tuple(
+            float(value) for value in reversed(image.GetSpacing())
+        )
+    except Exception:
+        pass
+    try:
+        import nibabel as nib
+
+        image = nib.load(str(path))
+        data = np.squeeze(np.asanyarray(image.dataobj))
+        if data.ndim == 3:
+            data = np.transpose(data, (2, 1, 0))
+        spacing_xyz = np.linalg.norm(image.affine[:3, :3], axis=0)
+        spacing_zyx = tuple(float(value) for value in reversed(spacing_xyz))
+        return np.asarray(data, dtype=np.float32), spacing_zyx
+    except Exception as exc:
+        raise SystemExit(f"Cannot load {path}: {exc}") from exc
+
+
 def _load_mask(path: Path, volume_shape: tuple[int, ...]) -> np.ndarray:
     path = _resolve_path(path)
     if not path.is_file():
@@ -94,6 +134,33 @@ def _best_mask_slice(mask: np.ndarray) -> int:
     if float(areas.max()) <= 0:
         return int(mask.shape[0] // 2)
     return int(np.argmax(areas))
+
+
+def _mpr_indices(
+    mask: np.ndarray,
+    volume_shape: tuple[int, int, int],
+    slice_index: int | None = None,
+) -> tuple[int, int, int]:
+    """Choose one z/y/x point through the mask for orthogonal MPR views."""
+    coordinates = np.argwhere(mask > 0)
+    if coordinates.size:
+        z, y, x = np.rint(coordinates.mean(axis=0)).astype(int)
+    else:
+        z, y, x = ((size - 1) // 2 for size in volume_shape)
+    if slice_index is not None:
+        z = int(slice_index)
+    return tuple(
+        max(0, min(int(index), size - 1))
+        for index, size in zip((z, y, x), volume_shape)
+    )
+
+
+def _mpr_aspects(
+    spacing_zyx: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Return display pixel aspect ratios for axial, coronal, sagittal (z,y,x)."""
+    dz, dy, dx = (max(float(value), 1e-6) for value in spacing_zyx)
+    return dy / dx, dz / dx, dz / dy
 
 
 def _window_ct(slice2d: np.ndarray) -> np.ndarray:
@@ -132,31 +199,41 @@ def visualize(
     out: Path | None = None,
     title: str = "",
     img_size: str = "small",
+    mpr: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt
 
     image_path = _resolve_path(image_path)
     mask_path = _resolve_path(mask_path)
-    volume = _load_volume(image_path)
+    volume, spacing_zyx = _load_volume_and_spacing(image_path)
     if volume.ndim != 3:
         raise SystemExit(f"Expected 3D volume, got shape {volume.shape}")
     mask = _load_mask(mask_path, volume.shape)
     n_vox = int(mask.sum())
     nonempty = np.where(mask.reshape(mask.shape[0], -1).sum(axis=1) > 0)[0]
-    if slice_index is not None:
+    if mpr:
+        z, y, x = _mpr_indices(mask, volume.shape, slice_index)
+    elif slice_index is not None:
         z = int(slice_index)
     else:
         z = _best_mask_slice(mask)
-    z = max(0, min(z, volume.shape[0] - 1))
+    if not mpr:
+        z = max(0, min(z, volume.shape[0] - 1))
 
     img = _window_ct(volume[z])
     msk = mask[z]
     slice_vox = int(msk.sum())
-    print(
-        f"mask voxels={n_vox} on {len(nonempty)}/{volume.shape[0]} slices "
-        f"(z={list(nonempty[:8])}{'...' if len(nonempty) > 8 else ''}); "
-        f"showing z={z} (slice voxels={slice_vox})"
-    )
+    if mpr:
+        print(
+            f"mask voxels={n_vox} on {len(nonempty)}/{volume.shape[0]} slices; "
+            f"showing MPR through z/y/x={z}/{y}/{x}"
+        )
+    else:
+        print(
+            f"mask voxels={n_vox} on {len(nonempty)}/{volume.shape[0]} slices "
+            f"(z={list(nonempty[:8])}{'...' if len(nonempty) > 8 else ''}); "
+            f"showing z={z} (slice voxels={slice_vox})"
+        )
     if n_vox == 0:
         print("WARNING: mask file has zero positive voxels (true empty segmentation).")
     elif slice_vox == 0:
@@ -164,21 +241,56 @@ def visualize(
             "WARNING: chosen slice has no mask; pass --slice with a nonempty index."
         )
 
-    figsize = {"small": (8, 2.7), "mid": (12, 4), "big": (18, 6)}[img_size]
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    axes[0].imshow(img, cmap="gray", origin="lower")
-    axes[0].set_title("Image")
-    axes[1].imshow(msk, cmap="Reds", origin="lower", vmin=0, vmax=1)
-    axes[1].set_title("Mask")
-    axes[2].imshow(img, cmap="gray", origin="lower")
-    axes[2].imshow(np.ma.masked_where(msk < 0.5, msk), cmap="autumn", alpha=0.45, origin="lower")
-    axes[2].set_title("Overlay")
-    for ax in axes:
-        ax.axis("off")
-    fig.suptitle(
-        (title or f"{image_path.name}")
-        + f"  |  z={z}/{volume.shape[0]-1}  |  mask_voxels={n_vox}"
-    )
+    if mpr:
+        figsize = {"small": (10, 8), "mid": (14, 10), "big": (18, 13)}[img_size]
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        axial_aspect, coronal_aspect, sagittal_aspect = _mpr_aspects(spacing_zyx)
+        mpr_views = (
+            (volume[z, :, :], mask[z, :, :], f"Axial (z={z})", axial_aspect),
+            (volume[:, y, :], mask[:, y, :], f"Coronal (y={y})", coronal_aspect),
+            (volume[:, :, x], mask[:, :, x], f"Sagittal (x={x})", sagittal_aspect),
+        )
+        axes[0, 0].imshow(img, cmap="gray", origin="lower", aspect=axial_aspect)
+        axes[0, 0].set_title(f"Original CT — axial (z={z})")
+        for ax, (view, view_mask, view_title, aspect) in zip(axes.flat[1:], mpr_views):
+            ax.imshow(_window_ct(view), cmap="gray", origin="lower", aspect=aspect)
+            ax.imshow(
+                np.ma.masked_where(view_mask < 0.5, view_mask),
+                cmap="autumn",
+                alpha=0.45,
+                origin="lower",
+                aspect=aspect,
+            )
+            ax.set_title(view_title)
+    else:
+        figsize = {"small": (8, 2.7), "mid": (12, 4), "big": (18, 6)}[img_size]
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        axes[0].imshow(img, cmap="gray", origin="lower")
+        axes[0].set_title("Image")
+        axes[1].imshow(msk, cmap="Reds", origin="lower", vmin=0, vmax=1)
+        axes[1].set_title("Mask")
+        axes[2].imshow(img, cmap="gray", origin="lower")
+        axes[2].imshow(
+            np.ma.masked_where(msk < 0.5, msk),
+            cmap="autumn",
+            alpha=0.45,
+            origin="lower",
+        )
+        axes[2].set_title("Overlay")
+    if mpr:
+        for ax in axes.flat:
+            ax.axis("off")
+        fig.suptitle(
+            (title or f"{image_path.name}")
+            + f"  |  MPR z/y/x={z}/{y}/{x}  |  mask_voxels={n_vox}"
+        )
+    else:
+        for ax in axes:
+            ax.axis("off")
+        fig.suptitle(
+            (title or f"{image_path.name}")
+            + f"  |  z={z}/{volume.shape[0]-1}  |  mask_voxels={n_vox}"
+        )
     fig.tight_layout()
     if out:
         out = Path(out)
@@ -202,6 +314,11 @@ def main() -> None:
     )
     parser.add_argument("--patient-id", default=None, help="Patient id from the log CSV")
     parser.add_argument("--slice", type=int, default=None, dest="slice_index")
+    parser.add_argument(
+        "--mpr",
+        action="store_true",
+        help="Show a 4-panel figure: original axial CT plus axial, coronal, and sagittal MPR mask overlays.",
+    )
     parser.add_argument("--out", type=Path, default=None, help="Save PNG instead of showing")
     parser.add_argument(
         "--img_size",
@@ -237,6 +354,7 @@ def main() -> None:
         out=args.out,
         title=title,
         img_size=args.img_size,
+        mpr=args.mpr,
     )
 
 
