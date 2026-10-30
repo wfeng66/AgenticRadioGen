@@ -1,4 +1,4 @@
-"""Train/eval backends for radiomics → gene-mutation AUROC.
+"""Train/eval backends for radiomics → gene-mutation AUPRC / F1.
 
 Tabular radiomics features are nonlinearly related to mutation labels; the
 default path uses tree/kernel models. Deep options (LSTM / VGG19 / ResNeXt /
@@ -75,18 +75,36 @@ def predict_proba_mutation(
     y_train: np.ndarray,
     X_test: np.ndarray,
 ) -> np.ndarray:
-    """Fit on train and return scores for class=1 on test (proba or monotone scores)."""
+    """Fit on train and return class=1 scores on test."""
+    _, test_scores = fit_score_mutation(model_name, X_train, y_train, X_test)
+    return test_scores
+
+
+def fit_score_mutation(
+    model_name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit on train; return (train_scores, test_scores) for class=1."""
     name = normalize_model_name(model_name)
     if name in _DL_MODELS:
         return _predict_torch(name, X_train, y_train, X_test)
     est = _sklearn_estimator(name)
     if name in _REG_MODELS:
         est.fit(X_train, y_train.astype(float))
-        scores = np.asarray(est.predict(X_test), dtype=float)
-        # Map regression outputs to (0, 1) for a stable AUROC score scale.
-        return 1.0 / (1.0 + np.exp(-scores))
+        train_scores = np.asarray(est.predict(X_train), dtype=float)
+        test_scores = np.asarray(est.predict(X_test), dtype=float)
+        # Map regression outputs to (0, 1) for a stable ranking/proba score scale.
+        return (
+            1.0 / (1.0 + np.exp(-train_scores)),
+            1.0 / (1.0 + np.exp(-test_scores)),
+        )
     est.fit(X_train, y_train.astype(int))
-    return np.asarray(est.predict_proba(X_test)[:, 1], dtype=float)
+    return (
+        np.asarray(est.predict_proba(X_train)[:, 1], dtype=float),
+        np.asarray(est.predict_proba(X_test)[:, 1], dtype=float),
+    )
 
 
 def _sklearn_estimator(name: str):
@@ -191,7 +209,7 @@ def _predict_torch(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_test: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     try:
         import torch
         import torch.nn as nn
@@ -235,8 +253,12 @@ def _predict_torch(
 
     model.eval()
     with torch.no_grad():
-        probs = torch.sigmoid(model(xv)).cpu().numpy().reshape(-1)
-    return np.asarray(probs, dtype=float)
+        train_probs = torch.sigmoid(model(xt)).cpu().numpy().reshape(-1)
+        test_probs = torch.sigmoid(model(xv)).cpu().numpy().reshape(-1)
+    return (
+        np.asarray(train_probs, dtype=float),
+        np.asarray(test_probs, dtype=float),
+    )
 
 
 def _feature_neighbors(X_train: np.ndarray, max_neighbors: int = 8) -> np.ndarray:

@@ -8,6 +8,7 @@ from agentic_radiogen.data.catalog import CatalogRecord
 from agentic_radiogen.data.disease_match import (
     KeywordTier,
     diagnosis_matches,
+    expected_organ_keywords,
     keyword_match_tiers,
     keywords_from_query,
     rank_names,
@@ -17,10 +18,13 @@ from agentic_radiogen.data.gdc_client import GdcCase, GdcClient
 from agentic_radiogen.data.tcia_client import (
     TciaClient,
     TciaSeries,
-    prefer_volumetric_series,
+    prefer_volumetric_series_ranked,
 )
+from agentic_radiogen.imaging.organ_verify import verify_expected_organ
 from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 from agentic_radiogen.util.progress import log, progress_enabled, progress_iter
+
+_MAX_SERIES_ATTEMPTS = 3
 
 _SEGM_LOG_FIELDS = (
     "patient_id",
@@ -79,7 +83,7 @@ class LiveCatalog:
         self,
         *,
         max_genes: int | None = None,
-        min_altered: int = 1,
+        min_altered: int = 4,
         disease_query: str | None = None,
         keyword_match: bool = False,
         preferred_tcia_collections: list[str] | None = None,
@@ -188,6 +192,7 @@ class LiveCatalog:
                 modality=modality,
                 genes=genes,
                 tcia_patients=bundle["tcia_patients"],
+                tcia_ranked=bundle.get("tcia_ranked") or {},
                 gdc_cases=bundle["gdc_cases"],
                 tcia_collections=bundle["tcia_collections"],
                 gdc_projects=bundle["gdc_projects"],
@@ -236,6 +241,7 @@ class LiveCatalog:
             modality=modality,
             genes=genes,
             tcia_patients=bundle["tcia_patients"],
+            tcia_ranked=bundle.get("tcia_ranked") or {},
             gdc_cases=bundle["gdc_cases"],
             tcia_collections=bundle["tcia_collections"],
             gdc_projects=bundle["gdc_projects"],
@@ -382,12 +388,13 @@ class LiveCatalog:
         chest_only = _wants_chest_ct(
             *tcia_collections, *gdc_projects, *keywords
         )
-        tcia_patients = self._best_series_per_patient(
+        tcia_ranked = self._ranked_series_per_patient(
             tcia_collections,
             modality,
             verbose=verbose,
             chest_only=chest_only,
         )
+        tcia_patients = {pid: ranks[0] for pid, ranks in tcia_ranked.items() if ranks}
         log(
             f"[match] (1) Imaging patients with {modality} in selected TCIA "
             f"[{', '.join(tcia_collections) or 'none'}]: {len(tcia_patients)}",
@@ -482,6 +489,7 @@ class LiveCatalog:
         )
         return {
             "tcia_patients": tcia_patients,
+            "tcia_ranked": tcia_ranked,
             "gdc_cases": gdc_cases,
             "tcia_collections": tcia_collections,
             "gdc_projects": gdc_projects,
@@ -503,12 +511,13 @@ class LiveCatalog:
             enabled=verbose,
         )
         chest_only = _wants_chest_ct(profile_name, tcia_collection, gdc_project)
-        tcia_patients = self._best_series_per_patient(
+        tcia_ranked = self._ranked_series_per_patient(
             [tcia_collection],
             modality,
             verbose=verbose,
             chest_only=chest_only,
         )
+        tcia_patients = {pid: ranks[0] for pid, ranks in tcia_ranked.items() if ranks}
         log(
             f"[match] (1) Imaging patients with {modality} in {tcia_collection}: "
             f"{len(tcia_patients)}",
@@ -528,6 +537,7 @@ class LiveCatalog:
             modality=modality,
             genes=genes,
             tcia_patients=tcia_patients,
+            tcia_ranked=tcia_ranked,
             gdc_cases=gdc_cases,
             tcia_collections=[tcia_collection],
             gdc_projects=[gdc_project],
@@ -557,6 +567,7 @@ class LiveCatalog:
         broadened_from: str | None,
         tier_query: str,
         verbose: bool,
+        tcia_ranked: dict[str, list[TciaSeries]] | None = None,
     ) -> list[CatalogRecord]:
         paired = sorted(set(tcia_patients) & set(gdc_cases))
         image_counts = [int(tcia_patients[pid].image_count or 0) for pid in paired]
@@ -635,6 +646,9 @@ class LiveCatalog:
                 or fallback_project
             )
             series = tcia_patients[pid]
+            ranked = list((tcia_ranked or {}).get(pid) or [series])
+            if not ranked:
+                ranked = [series]
             collection = str(series.collection or "")
             case_clinical["_gdc_paired"] = True
             case_clinical["_gdc_project"] = project
@@ -642,6 +656,9 @@ class LiveCatalog:
             case_clinical["_tcia_series_uid"] = series.series_uid
             case_clinical["_tcia_image_count"] = int(series.image_count or 0)
             case_clinical["_tcia_series_description"] = series.series_description or ""
+            case_clinical["_tcia_series_candidates"] = [
+                s.series_uid for s in ranked if s.series_uid
+            ]
             records.append(
                 CatalogRecord(
                     patient_id=pid,
@@ -674,7 +691,7 @@ class LiveCatalog:
         if discover:
             raw_max = self.last_intermediate.get("max_genes")
             max_genes = None if raw_max in (None, "", "none") else int(raw_max)
-            min_altered = int(self.last_intermediate.get("min_altered") or 1)
+            min_altered = int(self.last_intermediate.get("min_altered") or 4)
             log(
                 "[fetch] Discovering ALL mutated genes in the paired genomics cohort"
                 + (f" (cap={max_genes})" if max_genes is not None else ""),
@@ -736,38 +753,88 @@ class LiveCatalog:
             local_path = rec.local_path
             radiomic_features = dict(rec.radiomic_features)
             volume_summary = dict(rec.volume_summary)
+            chosen_series_uid = rec.series_uid
             if self.download_dicom and rec.series_uid:
                 try:
-                    series_dir = self.tcia.download_series(rec.series_uid)
-                    local_path = str(series_dir)
-                    if self.extract_radiomics:
-                        # Question disease is the matching anchor (site filter);
-                        # cohort/histology are secondary context only.
-                        q_disease = str(
-                            self.last_intermediate.get("disease_query")
-                            or self.last_question_text
-                            or rec.disease
-                            or ""
-                        ).strip()
-                        seg_disease = segmentation_disease_label(
-                            question_disease=q_disease or rec.disease,
-                            gdc_project=str(rec.clinical.get("_gdc_project") or ""),
-                            tcia_collection=str(
-                                rec.clinical.get("_tcia_collection") or ""
-                            ),
-                            primary_diagnosis=str(
-                                rec.clinical.get("primary_diagnosis")
-                                or rec.clinical.get("subtype")
-                                or ""
-                            ),
-                        )
-                        diagnosis = str(
+                    q_disease = str(
+                        self.last_intermediate.get("disease_query")
+                        or self.last_question_text
+                        or rec.disease
+                        or ""
+                    ).strip()
+                    seg_disease = segmentation_disease_label(
+                        question_disease=q_disease or rec.disease,
+                        gdc_project=str(rec.clinical.get("_gdc_project") or ""),
+                        tcia_collection=str(
+                            rec.clinical.get("_tcia_collection") or ""
+                        ),
+                        primary_diagnosis=str(
                             rec.clinical.get("primary_diagnosis")
                             or rec.clinical.get("subtype")
-                            or seg_disease
-                            or rec.disease
                             or ""
+                        ),
+                    )
+                    diagnosis = str(
+                        rec.clinical.get("primary_diagnosis")
+                        or rec.clinical.get("subtype")
+                        or seg_disease
+                        or rec.disease
+                        or ""
+                    )
+                    organs = expected_organ_keywords(
+                        q_disease,
+                        seg_disease,
+                        rec.disease,
+                        str(rec.clinical.get("_gdc_project") or ""),
+                        str(rec.clinical.get("_tcia_collection") or ""),
+                    )
+                    candidate_uids = [
+                        str(u)
+                        for u in (
+                            rec.clinical.get("_tcia_series_candidates")
+                            or [rec.series_uid]
                         )
+                        if str(u).strip()
+                    ]
+                    if rec.series_uid and rec.series_uid not in candidate_uids:
+                        candidate_uids.insert(0, rec.series_uid)
+                    candidate_uids = candidate_uids[:_MAX_SERIES_ATTEMPTS]
+
+                    series_dir: Path | None = None
+                    last_organ_reason = ""
+                    for attempt, uid in enumerate(candidate_uids, start=1):
+                        series_dir = self.tcia.download_series(uid)
+                        local_path = str(series_dir)
+                        chosen_series_uid = uid
+                        if organs and self.extract_radiomics:
+                            gate = verify_expected_organ(
+                                series_dir, organ_keywords=organs
+                            )
+                            if not gate.ok:
+                                last_organ_reason = gate.reason
+                                log(
+                                    f"[fetch] {pid}: organ gate FAIL attempt "
+                                    f"{attempt}/{len(candidate_uids)} "
+                                    f"uid=…{uid[-12:]} ({gate.reason})",
+                                    enabled=verbose,
+                                )
+                                series_dir = None
+                                continue
+                            log(
+                                f"[fetch] {pid}: organ gate PASS "
+                                f"({gate.reason}) uid=…{uid[-12:]}",
+                                enabled=verbose,
+                            )
+                        break
+                    else:
+                        raise RuntimeError(
+                            f"No series passed organ gate for {pid} "
+                            f"(expected={list(organs) or 'any'}; "
+                            f"last={last_organ_reason or 'n/a'})"
+                        )
+
+                    assert series_dir is not None
+                    if self.extract_radiomics:
                         force_model = (
                             self.force_seg_model
                             or str(self.last_intermediate.get("force_seg_model") or "")
@@ -871,8 +938,12 @@ class LiveCatalog:
                     "_gdc_paired": True,
                     "_gdc_project": rec.clinical.get("_gdc_project"),
                     "_tcia_collection": rec.clinical.get("_tcia_collection"),
+                    "_tcia_series_uid": chosen_series_uid,
+                    "_tcia_series_candidates": rec.clinical.get(
+                        "_tcia_series_candidates"
+                    ),
                 },
-                series_uid=rec.series_uid,
+                series_uid=chosen_series_uid,
                 radiomic_features=radiomic_features,
                 volume_summary=volume_summary,
                 local_path=local_path,
@@ -919,41 +990,41 @@ class LiveCatalog:
         self.last_segmentation_log_path = str(path.resolve())
         return self.last_segmentation_log_path
 
-    def _best_series_per_patient(
+    def _ranked_series_per_patient(
         self,
         collections: list[str],
         modality: str,
         *,
         verbose: bool = False,
         chest_only: bool = False,
-    ) -> dict[str, TciaSeries]:
-        """One CT series per patient: thickest non-scout (not first NBIA row).
+    ) -> dict[str, list[TciaSeries]]:
+        """Ranked CT series per patient (best first); not the first NBIA row.
 
         When ``chest_only`` is True (lung cohorts), non-chest series (abd/pelvis,
-        whole-body, renal, …) are dropped first; patients with only those series
-        are omitted from the imaging ID list.
+        whole-body, renal, …) are dropped first; empty site_text is demoted
+        below labeled CHEST series. Patients with no usable candidates are omitted.
         """
         by_patient: dict[str, list[TciaSeries]] = {}
         for coll in collections:
             for item in self._series(coll, modality):
                 by_patient.setdefault(item.patient_id, []).append(item)
-        chosen: dict[str, TciaSeries] = {}
+        chosen: dict[str, list[TciaSeries]] = {}
         thin = 0
         dropped_non_chest = 0
         for pid, cands in by_patient.items():
-            best = prefer_volumetric_series(cands, chest_only=chest_only)
-            if best is None:
+            ranked = prefer_volumetric_series_ranked(cands, chest_only=chest_only)
+            if not ranked:
                 if chest_only and cands:
                     dropped_non_chest += 1
                 continue
-            chosen[pid] = best
-            if 0 < int(best.image_count) < 8:
+            chosen[pid] = ranked
+            if 0 < int(ranked[0].image_count) < 8:
                 thin += 1
         if chest_only and verbose:
             log(
                 f"[match] Chest-only series filter: kept {len(chosen)} patients, "
                 f"dropped {dropped_non_chest} with no usable chest CT "
-                f"(non-chest / scout / ImageCount<8)",
+                f"(non-chest / scout / ImageCount<8); empty-desc demoted vs CHEST text",
                 enabled=True,
             )
         if thin and verbose:

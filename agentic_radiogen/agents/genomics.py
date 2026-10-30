@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from agentic_radiogen.schemas.contracts import GenomicMatrix, OmicsBundle
 
 # Common clinical / literature aliases → HGNC-like symbols used in GDC.
@@ -34,6 +36,20 @@ _GENE_FAMILIES: dict[str, frozenset[str]] = {
     "CDKN2B": frozenset({"CDKN2A", "CDKN2B"}),
 }
 
+# Clinical covariates for --clinic_data (predictors). Survival OS_* stay
+# outcomes-only and are always available for C-index when present.
+_CLINIC_NUMERIC = ("age_at_diagnosis",)
+_CLINIC_CATEGORICAL = (
+    "stage",
+    "subtype",
+    "primary_diagnosis",
+    "vital_status",
+    "sex",
+    "gender",
+    "race",
+    "ethnicity",
+)
+
 
 class GenomicsAgent:
     """Consumes an OmicsBundle only. Never calls the imaging agent.
@@ -41,22 +57,33 @@ class GenomicsAgent:
     Also maps cohort gene symbols ↔ literature gene claims (aliases / families).
     """
 
+    def __init__(self, *, include_clinical: bool = False) -> None:
+        self.include_clinical = bool(include_clinical)
+
     def extract(self, bundle: OmicsBundle) -> GenomicMatrix:
         if not bundle.patient_ids:
             raise ValueError("OmicsBundle has no patients")
         features: dict[str, dict[str, float]] = {}
         names: set[str] = set()
+        clinic_by_pid = {
+            pid: dict(bundle.clinical.get(pid, {}) or {}) for pid in bundle.patient_ids
+        }
+        clinic_cols = (
+            _encode_clinical_matrix(clinic_by_pid) if self.include_clinical else {}
+        )
         for pid in bundle.patient_ids:
             row: dict[str, float] = {}
             for gene, flag in bundle.mutations.get(pid, {}).items():
                 row[f"{gene}_mut"] = float(flag)
             for gene, value in bundle.expression.get(pid, {}).items():
                 row[f"{gene}_expr"] = float(value)
-            clinical = bundle.clinical.get(pid, {})
+            clinical = clinic_by_pid.get(pid, {})
             if "OS_time" in clinical:
                 row["OS_time"] = float(clinical["OS_time"])
             if "OS_event" in clinical:
                 row["OS_event"] = float(clinical["OS_event"])
+            if self.include_clinical:
+                row.update(clinic_cols.get(pid, {}))
             mut_values = [v for k, v in row.items() if k.endswith("_mut")]
             if mut_values:
                 row["TMB_proxy"] = float(sum(mut_values))
@@ -118,3 +145,32 @@ class GenomicsAgent:
                 out.append((self.normalize_gene(lit), reason, score))
         out.sort(key=lambda x: -x[2])
         return out
+
+
+def _encode_clinical_matrix(
+    clinic_by_pid: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """Build per-patient clinic_* predictors (numeric + cohort label codes)."""
+    out: dict[str, dict[str, float]] = {pid: {} for pid in clinic_by_pid}
+    for key in _CLINIC_NUMERIC:
+        for pid, clinical in clinic_by_pid.items():
+            raw = clinical.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                out[pid][f"clinic_{key}"] = float(raw)
+            except (TypeError, ValueError):
+                continue
+    for key in _CLINIC_CATEGORICAL:
+        values = {
+            pid: str(clinical.get(key) or "").strip()
+            for pid, clinical in clinic_by_pid.items()
+        }
+        levels = sorted({v for v in values.values() if v})
+        if not levels:
+            continue
+        code = {level: float(i + 1) for i, level in enumerate(levels)}
+        for pid, raw in values.items():
+            if raw:
+                out[pid][f"clinic_{key}"] = code[raw]
+    return out

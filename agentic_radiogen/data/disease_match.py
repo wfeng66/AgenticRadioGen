@@ -503,6 +503,31 @@ def expand_cohort_label(code: str | None) -> str:
     return raw
 
 
+# Coarse disease/site text → TotalSegmentator organ keywords for pre-seg gates.
+_EXPECTED_ORGAN_BY_SITE: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("lung", "nsclc", "sclc", "luad", "lusc", "pulmonary", "chest", "thorax"), ("lung",)),
+    (("liver", "hcc", "hepatocellular", "hepatic"), ("liver",)),
+    (("kidney", "renal", "rcc"), ("kidney",)),
+    (("pancrea", "pdac"), ("pancreas",)),
+    (("breast", "brca"), ("breast",)),
+    (("brain", "gbm", "glioma", "meningioma"), ("brain",)),
+    (("prostate", "prad"), ("prostate",)),
+    (("colon", "colorectal", "rectal", "crc"), ("colon",)),
+    (("bladder", "urothelial"), ("urinary_bladder",)),
+)
+
+
+def expected_organ_keywords(*texts: str) -> tuple[str, ...]:
+    """Organ tokens expected in the imaging FOV for the question disease/site."""
+    blob = " ".join(t for t in texts if t).lower().replace("_", " ")
+    if not blob.strip():
+        return ()
+    for needles, organs in _EXPECTED_ORGAN_BY_SITE:
+        if any(tok in blob for tok in needles):
+            return organs
+    return ()
+
+
 def segmentation_disease_label(
     *,
     question_disease: str | None = None,

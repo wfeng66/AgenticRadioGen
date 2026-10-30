@@ -50,6 +50,26 @@ class TciaSeries:
     collection: str
     image_count: int = 0
     series_description: str = ""
+    protocol_name: str = ""
+    study_description: str = ""
+    body_part_examined: str = ""
+    source_metadata: dict[str, Any] | None = None
+
+    @property
+    def site_text(self) -> str:
+        """Text used for site/scout filters (descriptions + protocol + study).
+
+        BodyPartExamined is intentionally omitted here: on TCGA-LUAD it often
+        says CHEST/LUNG even for ABD/PEL volumes, so it must not count as
+        positive chest evidence. It is still available on the dataclass for
+        logging / optional blacklist via ``body_part_examined``.
+        """
+        parts = [
+            self.series_description or "",
+            self.protocol_name or "",
+            self.study_description or "",
+        ]
+        return " ".join(p.strip() for p in parts if p and str(p).strip())
 
 
 class TciaClient:
@@ -89,11 +109,16 @@ class TciaClient:
         )
         return self._parse_series_rows(rows, default_collection=collection, modality=modality)
 
-    def list_series_for_patient(self, patient_id: str, modality: str) -> list[TciaSeries]:
+    def list_series_for_patient(
+        self, patient_id: str, modality: str | None = None
+    ) -> list[TciaSeries]:
         """Look up imaging series for one patient ID across TCIA collections."""
+        params = {"PatientID": patient_id}
+        if modality:
+            params["Modality"] = modality
         rows = self._get(
             f"{self.base_url}/getSeries",
-            {"PatientID": patient_id, "Modality": modality},
+            params,
         )
         return self._parse_series_rows(rows, default_collection="", modality=modality)
 
@@ -102,7 +127,7 @@ class TciaClient:
         rows: Any,
         *,
         default_collection: str,
-        modality: str,
+        modality: str | None,
     ) -> list[TciaSeries]:
         if not isinstance(rows, list):
             return []
@@ -114,24 +139,68 @@ class TciaClient:
             uid = str(row.get("SeriesInstanceUID") or "")
             if not patient_id or not uid:
                 continue
-            desc = str(
-                row.get("SeriesDescription")
-                or row.get("ProtocolName")
-                or row.get("seriesDescription")
-                or ""
-            )
+            series_desc = str(
+                row.get("SeriesDescription") or row.get("seriesDescription") or ""
+            ).strip()
+            protocol = str(row.get("ProtocolName") or row.get("protocolName") or "").strip()
+            study_desc = str(
+                row.get("StudyDescription") or row.get("studyDescription") or ""
+            ).strip()
+            body_part = str(
+                row.get("BodyPartExamined") or row.get("bodyPartExamined") or ""
+            ).strip()
+            # Backward-compatible display field: prefer SeriesDescription, else Protocol.
+            display_desc = series_desc or protocol
             count = _image_count(row)
             series.append(
                 TciaSeries(
                     patient_id=_submitter_id(patient_id),
                     series_uid=uid,
-                    modality=str(row.get("Modality") or modality),
+                    modality=str(row.get("Modality") or modality or ""),
                     collection=str(row.get("Collection") or default_collection),
                     image_count=count,
-                    series_description=desc,
+                    series_description=display_desc,
+                    protocol_name=protocol,
+                    study_description=study_desc,
+                    body_part_examined=body_part,
+                    source_metadata=dict(row),
                 )
             )
         return series
+
+    def list_patient_studies(self, patient_id: str) -> list[dict[str, Any]]:
+        """NBIA ``getPatientStudy`` rows for one PatientID (demographics + study UIDs)."""
+        rows = self._get(
+            f"{self.base_url}/getPatientStudy",
+            {"PatientID": patient_id},
+        )
+        if not isinstance(rows, list):
+            return []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def series_metadata(self, series_uid: str) -> dict[str, Any]:
+        """NBIA ``getSeriesMetaData`` for one SeriesInstanceUID (richer series fields)."""
+        rows = self._get(
+            f"{self.base_url}/getSeriesMetaData",
+            {"SeriesInstanceUID": series_uid},
+        )
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return dict(rows[0])
+        if isinstance(rows, dict):
+            return dict(rows)
+        return {}
+
+    def series_size(self, series_uid: str) -> dict[str, Any]:
+        """NBIA ``getSeriesSize`` (TotalSizeInBytes, ObjectCount)."""
+        rows = self._get(
+            f"{self.base_url}/getSeriesSize",
+            {"SeriesInstanceUID": series_uid},
+        )
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return dict(rows[0])
+        if isinstance(rows, dict):
+            return dict(rows)
+        return {}
 
     def download_series(self, series_uid: str) -> Path:
         """Download one series ZIP and extract it. Cached; never pulls a full collection."""
@@ -155,39 +224,49 @@ class TciaClient:
 
 def is_scout_series(series: TciaSeries) -> bool:
     """True for scout / localizer / topogram-style series."""
-    return bool(_SCOUT_RE.search(series.series_description or ""))
+    return bool(_SCOUT_RE.search(series.site_text or series.series_description or ""))
+
+
+def has_positive_chest_evidence(series: TciaSeries) -> bool:
+    """True when description/protocol/study text contains a chest/lung marker."""
+    return bool(_CHEST_RE.search(series.site_text or ""))
 
 
 def is_non_chest_series(series: TciaSeries) -> bool:
-    """True when SeriesDescription clearly indicates a non-chest body site.
+    """True when metadata clearly indicates a non-chest body site.
 
     Combined labels like ``Chest/Abd`` are treated as chest-eligible because a
-    chest keyword is present.
+    chest keyword is present. BodyPartExamined ABD/PELVIS can blacklist when
+    description text is empty (but CHEST/LUNG BodyPart alone does not whitelist).
     """
-    desc = series.series_description or ""
-    if _CHEST_RE.search(desc):
+    text = series.site_text or ""
+    if _CHEST_RE.search(text):
         return False
-    return bool(_NON_CHEST_RE.search(desc))
+    if _NON_CHEST_RE.search(text):
+        return True
+    body = (series.body_part_examined or "").strip()
+    if body and _NON_CHEST_RE.search(body) and not _CHEST_RE.search(body):
+        return True
+    return False
 
 
-def prefer_volumetric_series(
+def prefer_volumetric_series_ranked(
     candidates: list[TciaSeries],
     *,
     chest_only: bool = False,
-) -> TciaSeries | None:
-    """Pick the best CT series for 3D tumor segmentation / radiomics.
+) -> list[TciaSeries]:
+    """Rank CT series for 3D tumor segmentation / radiomics (best first).
 
     When ``chest_only`` is True:
     1. Drop clearly non-chest series (abd/pelvis, whole-body, renal, …), but
        keep combined chest series such as ``Chest/Abd``.
     2. Drop scouts/topograms and series with ImageCount < 8.
-    3. If nothing remains, return ``None`` (omit the patient).
-
-    Among the remainder (or all candidates when ``chest_only`` is False), prefer
-    non-scout series with the largest ImageCount.
+    3. Prefer positive chest/lung text evidence; demote empty site_text so
+       ImageCount alone cannot beat a labeled CHEST series.
+    4. If nothing remains, return ``[]``.
     """
     if not candidates:
-        return None
+        return []
     pool = candidates
     if chest_only:
         pool = [
@@ -198,15 +277,29 @@ def prefer_volumetric_series(
             and int(s.image_count or 0) >= _MIN_CHEST_SLICES
         ]
         if not pool:
-            return None
+            return []
 
     def _score(s: TciaSeries) -> tuple:
         scout = 1 if is_scout_series(s) else 0
-        # Unknown count (0) ranks below known thin series only slightly; prefer known thick.
         count = int(s.image_count or 0)
+        if chest_only:
+            # 0 = has CHEST/LUNG text; 1 = empty/ambiguous site text (demoted).
+            no_chest_text = 0 if has_positive_chest_evidence(s) else 1
+            empty_site = 0 if (s.site_text or "").strip() else 1
+            return (scout, no_chest_text, empty_site, -count, s.series_uid)
         return (scout, -count, s.series_uid)
 
-    return sorted(pool, key=_score)[0]
+    return sorted(pool, key=_score)
+
+
+def prefer_volumetric_series(
+    candidates: list[TciaSeries],
+    *,
+    chest_only: bool = False,
+) -> TciaSeries | None:
+    """Pick the best CT series (first of :func:`prefer_volumetric_series_ranked`)."""
+    ranked = prefer_volumetric_series_ranked(candidates, chest_only=chest_only)
+    return ranked[0] if ranked else None
 
 
 def _image_count(row: dict[str, Any]) -> int:

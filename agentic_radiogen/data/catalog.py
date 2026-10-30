@@ -46,9 +46,10 @@ class CatalogClient(Protocol):
 
 def _lung_records() -> list[CatalogRecord]:
     records: list[CatalogRecord] = []
-    for i in range(16):
-        egfr = int(i < 8)
-        kras = int(8 <= i < 12)
+    # 24 patients: ≥10 EGFR positives so mutation predictors clear the floor.
+    for i in range(24):
+        egfr = int(i < 12)
+        kras = int(12 <= i < 18)
         tp53 = int(i % 3 == 0)
         entropy = 2.2 + 1.4 * egfr + 0.08 * (i % 4)
         sphericity = 0.55 + 0.02 * (i % 5)
@@ -68,6 +69,8 @@ def _lung_records() -> list[CatalogRecord]:
                     "OS_time": os_time,
                     "OS_event": int(egfr or i % 2),
                     "subtype": "LUAD",
+                    "stage": "Stage I" if i % 3 == 0 else ("Stage II" if i % 3 == 1 else "Stage III"),
+                    "age_at_diagnosis": 50 + (i % 20),
                 },
                 series_uid=f"1.2.lung.{i}",
                 radiomic_features={
@@ -83,8 +86,9 @@ def _lung_records() -> list[CatalogRecord]:
 
 def _breast_records() -> list[CatalogRecord]:
     records: list[CatalogRecord] = []
-    for i in range(16):
-        her2 = int(i < 8)
+    # 24 patients: ≥10 ERBB2 positives so mutation predictors clear the floor.
+    for i in range(24):
+        her2 = int(i < 12)
         brca1 = int(i % 4 == 0)
         esr1 = int(i % 2 == 0)
         sphericity = 0.50 + 0.22 * her2 + 0.01 * (i % 3)
@@ -105,6 +109,8 @@ def _breast_records() -> list[CatalogRecord]:
                     "OS_time": os_time,
                     "OS_event": int(her2 or i % 3 == 0),
                     "subtype": "HER2+" if her2 else "HR+",
+                    "stage": "Stage I" if i % 3 == 0 else ("Stage II" if i % 3 == 1 else "Stage III"),
+                    "age_at_diagnosis": 45 + (i % 25),
                 },
                 series_uid=f"1.2.breast.{i}",
                 radiomic_features={

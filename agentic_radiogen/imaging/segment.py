@@ -157,6 +157,30 @@ def _mask_xyz_to_zyx(data: np.ndarray, volume_shape_zyx: tuple[int, ...]) -> np.
     )
 
 
+def _ts_label_ids_for_keywords(task: str, keywords: list[str]) -> set[int]:
+    """Map organ keyword substrings to TotalSegmentator multilabel class ids."""
+    if not keywords:
+        return set()
+    cmap: dict[Any, Any] = {}
+    try:
+        from totalsegmentator.map_to_binary import class_map  # type: ignore
+
+        raw = class_map.get(task) or class_map.get("total") or {}
+        if isinstance(raw, dict):
+            cmap = raw
+    except Exception:
+        cmap = {}
+    ids: set[int] = set()
+    for label_id, name in cmap.items():
+        label = str(name).lower()
+        if any(kw in label for kw in keywords):
+            try:
+                ids.add(int(label_id))
+            except (TypeError, ValueError):
+                continue
+    return ids
+
+
 def _totalsegmentator_mask(
     volume: np.ndarray,
     *,
@@ -164,7 +188,12 @@ def _totalsegmentator_mask(
     task: str = "total",
     spacing_zyx: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
-    """TotalSegmentator ROI (organ ``task=total`` or specialty tasks e.g. lung_nodules)."""
+    """TotalSegmentator ROI (organ ``task=total`` or specialty tasks e.g. lung_nodules).
+
+    When ``organ_keywords`` is set (e.g. ``lung``), only matching class labels are
+    kept. Using ``data > 0`` on the multilabel volume would incorrectly accept any
+    organ (abdomen FOV passes a lung gate).
+    """
     from totalsegmentator.python_api import totalsegmentator  # type: ignore
     import tempfile
     import nibabel as nib
@@ -174,6 +203,7 @@ def _totalsegmentator_mask(
     task_name = (task or "total").strip() or "total"
     spacing = spacing_zyx or (1.0, 1.0, 1.0)
     img_in, vol_shape = _nifti_from_volume_zyx(volume, spacing_zyx=spacing)
+    wanted_ids = _ts_label_ids_for_keywords(task_name, keywords)
 
     # Stabilize nnU-Net workers (lung_nodules uses NibabelIOWithReorient + mp).
     os.environ.setdefault("nnUNet_n_proc_DA", "0")
@@ -205,7 +235,14 @@ def _totalsegmentator_mask(
         if seg_img is not None:
             try:
                 data = np.asanyarray(seg_img.dataobj)
-                mask = _mask_xyz_to_zyx(data > 0, vol_shape).astype(bool)
+                data_zyx = _mask_xyz_to_zyx(data, vol_shape)
+                if keywords and wanted_ids:
+                    mask = np.isin(data_zyx, list(wanted_ids))
+                elif keywords and not wanted_ids:
+                    # Class map missing: do not accept all organs as a site match.
+                    mask = np.zeros(vol_shape, dtype=bool)
+                else:
+                    mask = (data_zyx > 0).astype(bool)
             except Exception:
                 mask = np.zeros(vol_shape, dtype=bool)
 
@@ -219,17 +256,14 @@ def _totalsegmentator_mask(
                 raise RuntimeError(
                     f"TotalSegmentator task={task_name!r} produced no masks"
                 )
-            preferred: list[Path] = []
-            for kw in keywords:
-                preferred.extend(p for p in candidates if kw in p.name.lower())
-            seen: set[str] = set()
-            ordered: list[Path] = []
-            for p in preferred + candidates:
-                key = str(p)
-                if key in seen:
-                    continue
-                seen.add(key)
-                ordered.append(p)
+            if keywords:
+                ordered = [
+                    p
+                    for p in candidates
+                    if any(kw in p.name.lower() for kw in keywords)
+                ]
+            else:
+                ordered = list(candidates)
             for path in ordered:
                 data = np.asarray(nib.load(str(path)).dataobj)
                 try:

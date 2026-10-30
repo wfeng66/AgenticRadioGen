@@ -193,27 +193,65 @@ def print_summary(payload: dict[str, Any]) -> None:
             for item in associations[-8:]:
                 print(f"  {_fmt_assoc(item)}")
         printable_metrics = [
-            m for m in metrics if m.get("auroc") is not None or m.get("c_index") is not None
+            m
+            for m in metrics
+            if m.get("auprc") is not None
+            or m.get("f1") is not None
+            or m.get("c_index") is not None
         ]
+        # Ascending F1 (weakest first); OS C-index rows last.
+        printable_metrics = sorted(
+            printable_metrics,
+            key=lambda m: (
+                1 if m.get("target") == "OS" else 0,
+                m.get("f1") is None,
+                float(m["f1"]) if m.get("f1") is not None else 0.0,
+                str(m.get("target") or ""),
+            ),
+        )
         if printable_metrics:
             print(
-                "Metrics (genes with computable AUROC/C-index only)\n"
-                "  AUROC=mutation prediction from radiomics (--model); "
+                "Metrics (ascending test F1; genes with computable holdout scores)\n"
+                "  test/train AUPRC/F1/precision/recall/accuracy=mutation prediction "
+                "(--model, threshold=0.5); "
                 "C-index=survival concordance if OS present; "
-                "n_train/n_test=split sizes"
+                "n_train/n_test=split sizes. "
+                "Per-patient test split log: --out *.test_split.jsonl"
             )
             for item in printable_metrics:
                 bits = [f"target={item.get('target')}"]
                 if item.get("model"):
                     bits.append(f"model={item['model']}")
-                if item.get("auroc") is not None:
-                    bits.append(f"AUROC={item['auroc']:.3f}")
+                if item.get("auprc") is not None:
+                    bits.append(f"test_AUPRC={item['auprc']:.3f}")
+                if item.get("f1") is not None:
+                    bits.append(f"test_F1={item['f1']:.3f}")
+                if item.get("precision") is not None:
+                    bits.append(f"test_precision={item['precision']:.3f}")
+                if item.get("recall") is not None:
+                    bits.append(f"test_recall={item['recall']:.3f}")
+                if item.get("accuracy") is not None:
+                    bits.append(f"test_accuracy={item['accuracy']:.3f}")
+                if item.get("train_auprc") is not None:
+                    bits.append(f"train_AUPRC={item['train_auprc']:.3f}")
+                if item.get("train_f1") is not None:
+                    bits.append(f"train_F1={item['train_f1']:.3f}")
+                if item.get("train_precision") is not None:
+                    bits.append(f"train_precision={item['train_precision']:.3f}")
+                if item.get("train_recall") is not None:
+                    bits.append(f"train_recall={item['train_recall']:.3f}")
+                if item.get("train_accuracy") is not None:
+                    bits.append(f"train_accuracy={item['train_accuracy']:.3f}")
                 if item.get("c_index") is not None:
                     bits.append(f"C-index={item['c_index']:.3f}")
                 bits.append(f"n_train={item.get('n_train')}")
                 bits.append(f"n_test={item.get('n_test')}")
                 print(f"  {', '.join(bits)}")
-        diagnostics = stats.get("diagnostics")
+        diagnostics = (
+            stats.get("diagnostics")
+            or payload.get("diagnostics")
+            or {}
+        )
         if diagnostics and diagnostics.get("caveats"):
             print("Caveats")
             for caveat in diagnostics["caveats"]:
@@ -379,7 +417,7 @@ def _run_matcher(
     modality: str | None = None,
     genes: str | None = None,
     max_genes: int | None = None,
-    min_altered: int = 1,
+    min_altered: int = 4,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -472,7 +510,7 @@ def run_stage1(
     modality: str | None = None,
     genes: str | None = None,
     max_genes: int | None = None,
-    min_altered: int = 1,
+    min_altered: int = 4,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -517,7 +555,7 @@ def run_stage2(
     modality: str | None = None,
     genes: str | None = None,
     max_genes: int | None = None,
-    min_altered: int = 1,
+    min_altered: int = 4,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -587,7 +625,7 @@ def run_stage3(
     modality: str | None = None,
     genes: str | None = None,
     max_genes: int | None = None,
-    min_altered: int = 1,
+    min_altered: int = 4,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -658,6 +696,7 @@ def run_stage3(
         "metrics": [item.model_dump() for item in result.stats.metrics],
         "diagnostics": result.stats.diagnostics.model_dump(),
         "promoted_findings": result.stats.promoted_findings,
+        "test_split_log": list(result.stats.test_split_log),
     }
     payload["literature"] = result.literature.model_dump()
     return payload
@@ -677,7 +716,7 @@ def run_stage4(
     modality: str | None = None,
     genes: str | None = None,
     max_genes: int | None = None,
-    min_altered: int = 1,
+    min_altered: int = 4,
     max_papers: int | None = None,
     store_segm: bool = False,
     use_llm: bool | None = None,
@@ -772,6 +811,12 @@ def run_stage4(
         "associations_by_gene": associations_by_gene(all_assoc, top_per_gene=0),
         "associations": all_assoc,
         "metrics": [] if state.stats is None else [item.model_dump() for item in state.stats.metrics],
+        "diagnostics": None
+        if state.stats is None
+        else state.stats.diagnostics.model_dump(),
+        "test_split_log": []
+        if state.stats is None
+        else list(state.stats.test_split_log),
         "literature": None if state.literature is None else state.literature.model_dump(),
         "literature_history": [item.model_dump() for item in state.history],
         "imaging_notes": getattr(catalog, "last_imaging_notes", []),
@@ -861,7 +906,7 @@ def main() -> None:
             "elastic_net",
             "poly_reg",
         ),
-        help="Model for radiomics→mutation AUROC metrics (default: random_forest). "
+        help="Model for radiomics→mutation AUPRC/F1 metrics (default: random_forest). "
         "Linear: ridge_reg, elastic_net, poly_reg (degree-2 + Ridge). "
         "Deep (lstm, gat, vgg19, resnext, se_cnn) need PyTorch. "
         "Exploratory Pearson associations are unchanged.",
@@ -1045,6 +1090,20 @@ def main() -> None:
             print(
                 f"Segmentation log ({len(seg_rows)} rows) written to: "
                 f"{seg_csv.resolve()}"
+            )
+        split_rows = list(
+            (payload.get("stats") or {}).get("test_split_log")
+            or payload.get("test_split_log")
+            or []
+        )
+        if split_rows:
+            split_path = out_path.with_name(out_path.stem + ".test_split.jsonl")
+            with split_path.open("w", encoding="utf-8") as fh:
+                for row in split_rows:
+                    fh.write(json.dumps(row, default=str) + "\n")
+            print(
+                f"Test-split log ({len(split_rows)} rows) written to: "
+                f"{split_path.resolve()}"
             )
     if args.json:
         print(json.dumps(payload, indent=2, default=str))

@@ -1,7 +1,9 @@
 from agentic_radiogen.data.tcia_client import (
     TciaSeries,
+    has_positive_chest_evidence,
     is_non_chest_series,
     prefer_volumetric_series,
+    prefer_volumetric_series_ranked,
 )
 
 
@@ -173,3 +175,89 @@ def test_chest_only_drops_patient_when_only_topogram_left() -> None:
         series_description="Topogram",
     )
     assert prefer_volumetric_series([abd, topo], chest_only=True) is None
+
+
+def test_chest_only_prefers_labeled_chest_over_thicker_empty_desc() -> None:
+    """Empty site_text must not beat a thinner labeled CHEST series (Z021-class)."""
+    empty_thick = TciaSeries(
+        "TCGA-17-Z021",
+        "uid-empty",
+        "CT",
+        "TCGA-LUAD",
+        image_count=400,
+        series_description="",
+        body_part_examined="CHEST",  # unreliable alone; must not whitelist
+    )
+    chest = TciaSeries(
+        "TCGA-17-Z021",
+        "uid-chest",
+        "CT",
+        "TCGA-LUAD",
+        image_count=80,
+        series_description="CHEST  5.0  B30f",
+    )
+    assert not has_positive_chest_evidence(empty_thick)
+    assert has_positive_chest_evidence(chest)
+    ranked = prefer_volumetric_series_ranked([empty_thick, chest], chest_only=True)
+    assert [s.series_uid for s in ranked] == ["uid-chest", "uid-empty"]
+    best = prefer_volumetric_series([empty_thick, chest], chest_only=True)
+    assert best is not None and best.series_uid == "uid-chest"
+
+
+def test_body_part_abdomen_blacklists_when_description_empty() -> None:
+    abd_body = TciaSeries(
+        "p",
+        "uid-abd-body",
+        "CT",
+        "TCGA-LUAD",
+        image_count=100,
+        series_description="",
+        body_part_examined="ABDOMEN",
+    )
+    assert is_non_chest_series(abd_body)
+    assert prefer_volumetric_series([abd_body], chest_only=True) is None
+
+
+def test_ranked_returns_multiple_chest_candidates() -> None:
+    thin_chest = TciaSeries(
+        "p", "uid-thin", "CT", "c", image_count=40, series_description="CHEST"
+    )
+    thick_chest = TciaSeries(
+        "p", "uid-thick", "CT", "c", image_count=120, series_description="LUNG"
+    )
+    abd = TciaSeries(
+        "p", "uid-abd", "CT", "c", image_count=200, series_description="ABD/PEL"
+    )
+    ranked = prefer_volumetric_series_ranked(
+        [abd, thin_chest, thick_chest], chest_only=True
+    )
+    assert [s.series_uid for s in ranked] == ["uid-thick", "uid-thin"]
+
+
+def test_patient_series_lookup_preserves_full_metadata_without_modality_filter() -> None:
+    calls: list[dict[str, str]] = []
+
+    def getter(_url: str, params: dict[str, str]) -> list[dict[str, object]]:
+        calls.append(params)
+        return [
+            {
+                "PatientID": "TCGA-17-Z021",
+                "SeriesInstanceUID": "uid-ct",
+                "Modality": "CT",
+                "Collection": "TCGA-LUAD",
+                "StudyInstanceUID": "study-uid",
+                "StudyDate": "20010101",
+                "SeriesNumber": 3,
+                "ImageCount": 49,
+            }
+        ]
+
+    from agentic_radiogen.data.tcia_client import TciaClient
+
+    series = TciaClient(getter=getter).list_series_for_patient("TCGA-17-Z021")
+
+    assert calls == [{"PatientID": "TCGA-17-Z021"}]
+    assert len(series) == 1
+    assert series[0].modality == "CT"
+    assert series[0].source_metadata is not None
+    assert series[0].source_metadata["StudyInstanceUID"] == "study-uid"

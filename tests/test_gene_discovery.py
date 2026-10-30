@@ -14,7 +14,7 @@ def test_default_plans_all_cohort_genes() -> None:
     assert request.filters.get("discover_genes") is True
     assert request.filters.get("gene_source") == "cohort"
     assert request.max_genes is None
-    assert request.min_altered == 1
+    assert request.min_altered == 4
 
 
 def test_genes_auto_uses_literature_panel() -> None:
@@ -107,8 +107,14 @@ def test_discover_genes_returns_all_cohort_genes_by_default() -> None:
             }
         }
 
-    genes = GdcClient(poster=poster).discover_genes(["P1", "P2", "P3"])
+    # Default min_altered=4; tiny mock cohort needs an explicit floor of 1.
+    genes = GdcClient(poster=poster).discover_genes(
+        ["P1", "P2", "P3"], min_altered=1
+    )
     assert genes == ["TP53", "ALK", "RARE"]
+    assert (
+        GdcClient(poster=poster).discover_genes(["P1", "P2", "P3"]) == []
+    )
 
 
 def test_empty_mutation_placeholder_still_keeps_gdc_paired_records() -> None:

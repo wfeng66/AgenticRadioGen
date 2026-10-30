@@ -28,7 +28,7 @@ class DataRequest(BaseModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     max_patients: int = 24
     max_genes: int | None = None
-    min_altered: int = 1
+    min_altered: int = 4
     estimated_patient_count: int | None = None
     # Optional CLI overrides: restrict cohort and/or force a segmentation backend.
     patient_ids: list[str] = Field(default_factory=list)
@@ -81,8 +81,19 @@ class Association(BaseModel):
 
 
 class ModelMetrics(BaseModel):
-    auroc: float | None = None
+    # Holdout (test) metrics
+    auprc: float | None = None
     c_index: float | None = None
+    f1: float | None = None
+    precision: float | None = None
+    recall: float | None = None
+    accuracy: float | None = None
+    # Training-set metrics (same definitions as test)
+    train_auprc: float | None = None
+    train_f1: float | None = None
+    train_precision: float | None = None
+    train_recall: float | None = None
+    train_accuracy: float | None = None
     n_train: int = 0
     n_test: int = 0
     target: str | None = None
@@ -101,6 +112,8 @@ class ModelResult(BaseModel):
     metrics: list[ModelMetrics] = Field(default_factory=list)
     diagnostics: ModelDiagnostics = Field(default_factory=ModelDiagnostics)
     promoted_findings: list[str] = Field(default_factory=list)
+    # Per test-patient rows: id, features, y_true, y_pred, proba (per gene target).
+    test_split_log: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LiteratureSupport(BaseModel):

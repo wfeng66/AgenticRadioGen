@@ -4,6 +4,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import numpy as np
+import pytest
 
 from agentic_radiogen.agents.data_matcher import DataMatcherAgent
 from agentic_radiogen.agents.orchestrator import OrchestratorAgent
@@ -50,7 +51,36 @@ def _write_minimal_dicom(path: Path, value: float = 40.0) -> None:
     ds.save_as(str(path), write_like_original=False)
 
 
-def test_live_fetch_downloads_dicom_and_builds_radiomics(tmp_path: Path) -> None:
+def test_live_fetch_downloads_dicom_and_builds_radiomics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentic_radiogen.imaging.organ_verify import OrganVerifyResult
+
+    monkeypatch.setattr(
+        "agentic_radiogen.data.live_catalog.verify_expected_organ",
+        lambda *a, **k: OrganVerifyResult(
+            ok=True,
+            organ_keywords=("lung",),
+            n_organ_voxels=5000,
+            volume_voxels=10000,
+            reason="mocked",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentic_radiogen.data.live_catalog.extract_series_features",
+        lambda series_dir, **k: {
+            "features": {"original_firstorder_Mean": 42.0},
+            "volume_summary": {"mean": 42.0, "std": 1.0, "size": 16.0},
+            "from_cache": False,
+            "segmentation_backend": "mock",
+            "segmentation_model_id": "mock",
+            "segm_status": "success",
+            "n_mask_voxels": 8,
+            "mask_path": "",
+            "models_attempted": "mock",
+        },
+    )
+
     def tcia_get(_url: str, params=None):
         if "getCollectionValues" in _url:
             return [

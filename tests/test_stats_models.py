@@ -1,4 +1,4 @@
-"""Nonlinear --model backends for radiomics → mutation AUROC."""
+"""Nonlinear --model backends for radiomics → mutation AUPRC."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def test_sklearn_models_predict_proba() -> None:
 
 
 def test_stats_agent_records_model_name() -> None:
-    patients = [f"P{i}" for i in range(12)]
+    patients = [f"P{i}" for i in range(24)]
     radio = RadiomicMatrix(
         patient_ids=patients,
         feature_names=["f1", "f2"],
@@ -68,7 +68,25 @@ def test_stats_agent_records_model_name() -> None:
     result = StatisticalCriticalAgent(model="svm").analyze(radio, geno)
     egfr = next(m for m in result.metrics if m.target == "EGFR_mut")
     assert egfr.model == "svm"
-    assert egfr.auroc is not None
+    assert egfr.auprc is not None
+    assert egfr.f1 is not None
+    assert egfr.precision is not None
+    assert egfr.recall is not None
+    assert egfr.accuracy is not None
+    assert egfr.train_auprc is not None
+    assert egfr.train_f1 is not None
+    assert egfr.train_precision is not None
+    assert egfr.train_recall is not None
+    assert egfr.train_accuracy is not None
+    assert result.test_split_log
+    row = result.test_split_log[0]
+    assert row["split"] == "test"
+    assert row["target"] == "EGFR_mut"
+    assert "patient_id" in row
+    assert row["y_true"] in (0, 1)
+    assert row["y_pred"] in (0, 1)
+    assert "proba" in row
+    assert "features" in row and "f1" in row["features"]
     assert any("svm" in c for c in result.diagnostics.caveats)
 
 

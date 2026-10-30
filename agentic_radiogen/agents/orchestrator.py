@@ -240,7 +240,7 @@ class OrchestratorAgent:
             filters=filters,
             max_patients=24,
             max_genes=None,
-            min_altered=1,
+            min_altered=4,
         )
 
     def parse_and_plan(self, text: str, disease: str | None = None) -> DataRequest:

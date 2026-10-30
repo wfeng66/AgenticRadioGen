@@ -62,6 +62,7 @@ Equivalent via `pyproject.toml`:
 pip install -e .
 pip install -e ".[dev]"
 pip install -e ".[imaging-gpu]"
+pip install -e ".[visualization]"
 ```
 
 Segmentation-model checkpoints are stored under the project's
@@ -70,6 +71,27 @@ Segmentation-model checkpoints are stored under the project's
 directory mounted under `/mnt/<drive>/...`, rather than the separate
 `/home/<user>/.cache/agentic_radiogen/` tree. Existing model-specific cache
 environment variables can still override the default location.
+
+## Explore one TCIA patient
+
+The patient exploration script inventories TCIA series, downloads CT DICOM
+series into `data_cache/tcia/`, retrieves the public GDC case and clinical-file
+metadata, downloads available GDC clinical files, and writes per-series PNG
+previews plus an overview contact sheet. It defaults to CT; use
+`--all-modalities` to include every modality returned by TCIA.
+
+```bash
+pip install -e ".[visualization]"
+python scripts/explore_tcia_patient.py --patient-id TCGA-17-Z021
+```
+
+By default, metadata and previews are written to
+`outputs/tcia_patient/TCGA-17-Z021/`. The JSON/CSV inventory and `manifest.json`
+record series UIDs, source metadata, download locations, expected versus
+observed DICOM instance counts, preview paths, and any failures. Use
+`--metadata-only` to skip image and clinical-file downloads, `--no-previews` to
+skip PNG generation, `--modality MR --modality CT` to select modalities, or
+`--cache-dir PATH` to override the DICOM cache location.
 
 ---
 
@@ -228,7 +250,7 @@ Full run payload, including:
 - `patient_table` — per-patient radiomics × mutation matrix  
 - `associations` — imaging feature ~ gene associations (`r`, `p`, `q`, `n`)  
 - `associations_by_gene`, `top_associations`  
-- `metrics` — optional model metrics (e.g. AUROC)  
+- `metrics` — optional model metrics (e.g. AUPRC, F1; sorted by ascending F1)  
 - `literature` — supported / unverified / contradicted labels  
 - `intermediate` — match keywords, collections/projects, i&g counts  
 - `directive` / `stopped` — loop outcome  

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from agentic_radiogen.data.http_json import post_json
+from agentic_radiogen.data.http_json import get_bytes, post_json
 
 GDC_BASE = "https://api.gdc.cancer.gov"
 _CASE_FIELDS = ",".join(
@@ -19,6 +19,39 @@ _CASE_FIELDS = ",".join(
         "demographic.vital_status",
         "demographic.days_to_death",
         "diagnoses.age_at_diagnosis",
+    ]
+)
+_CASE_DETAIL_FIELDS = ",".join(
+    [
+        "case_id",
+        "submitter_id",
+        "primary_site",
+        "project.project_id",
+        "project.disease_type",
+        "demographic.gender",
+        "demographic.race",
+        "demographic.ethnicity",
+        "demographic.vital_status",
+        "demographic.days_to_death",
+        "diagnoses.vital_status",
+        "diagnoses.days_to_death",
+        "diagnoses.days_to_last_follow_up",
+        "diagnoses.ajcc_pathologic_stage",
+        "diagnoses.tumor_stage",
+        "diagnoses.primary_diagnosis",
+        "diagnoses.age_at_diagnosis",
+    ]
+)
+_CLINICAL_FILE_FIELDS = ",".join(
+    [
+        "file_id",
+        "file_name",
+        "data_category",
+        "data_type",
+        "experimental_strategy",
+        "file_size",
+        "md5sum",
+        "cases.submitter_id",
     ]
 )
 
@@ -77,9 +110,78 @@ class GdcClient:
         self,
         base_url: str = GDC_BASE,
         poster: Callable[..., Any] | None = None,
+        downloader: Callable[..., bytes] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._post = poster or post_json
+        self._download = downloader or get_bytes
+
+    def get_case_details(self, submitter_id: str) -> dict[str, Any] | None:
+        """Return the public GDC case fields useful for a patient-level review."""
+        payload = {
+            "filters": {
+                "op": "in",
+                "content": {
+                    "field": "submitter_id",
+                    "value": [submitter_id],
+                },
+            },
+            "fields": _CASE_DETAIL_FIELDS,
+            "size": 2,
+            "from": 0,
+        }
+        data = self._post(f"{self.base_url}/cases", payload)
+        hits = data.get("data", {}).get("hits", []) if isinstance(data, dict) else []
+        for hit in hits:
+            if isinstance(hit, dict) and hit.get("submitter_id") == submitter_id:
+                return hit
+        return None
+
+    def list_clinical_files(self, submitter_id: str) -> list[dict[str, Any]]:
+        """List downloadable public GDC files categorized as clinical."""
+        results: list[dict[str, Any]] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            payload = {
+                "filters": {
+                    "op": "and",
+                    "content": [
+                        {
+                            "op": "in",
+                            "content": {
+                                "field": "cases.submitter_id",
+                                "value": [submitter_id],
+                            },
+                        },
+                        {
+                            "op": "in",
+                            "content": {
+                                "field": "data_category",
+                                "value": ["Clinical"],
+                            },
+                        },
+                    ],
+                },
+                "fields": _CLINICAL_FILE_FIELDS,
+                "size": page_size,
+                "from": offset,
+            }
+            data = self._post(f"{self.base_url}/files", payload)
+            response_data = data.get("data", {}) if isinstance(data, dict) else {}
+            hits = response_data.get("hits", [])
+            results.extend(hit for hit in hits if isinstance(hit, dict))
+            pagination = response_data.get("pagination") or {}
+            total = pagination.get("total")
+            offset += len(hits)
+            if not hits or len(hits) < page_size or (
+                total is not None and offset >= int(total)
+            ):
+                return results
+
+    def download_file(self, file_id: str) -> bytes:
+        """Download a public GDC file by UUID."""
+        return self._download(f"{self.base_url}/data/{file_id}", timeout=600)
 
     def list_projects(self, *, size: int = 200) -> list[dict[str, Any]]:
         """List GDC projects (id, name, primary_site, disease_type)."""
@@ -233,7 +335,7 @@ class GdcClient:
         self,
         submitter_ids: list[str],
         *,
-        min_altered: int = 1,
+        min_altered: int = 4,
         max_genes: int | None = None,
     ) -> list[str]:
         """Return every gene mutated in this cohort (optionally frequency-filtered/capped)."""
@@ -243,7 +345,7 @@ class GdcClient:
         return genes
 
     def _gene_counts(
-        self, submitter_ids: list[str], *, min_altered: int = 1
+        self, submitter_ids: list[str], *, min_altered: int = 4
     ) -> tuple[list[str], dict[str, int]]:
         if not submitter_ids:
             return [], {}

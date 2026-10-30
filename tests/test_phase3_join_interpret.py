@@ -57,7 +57,7 @@ def test_stats_joins_lung_imaging_and_genomics(
     )
     assert entropy.effect_size > 0.7
     assert entropy.q_value < 0.05
-    assert any(m.auroc is not None and m.auroc >= 0.7 for m in result.metrics if m.target == "EGFR_mut")
+    assert any(m.auprc is not None and m.auprc >= 0.7 for m in result.metrics if m.target == "EGFR_mut")
     assert result.diagnostics.multiple_testing_method == "fdr_bh"
     assert result.promoted_findings == []
 
@@ -195,5 +195,33 @@ def test_predict_mutation_skips_rare_class_instead_of_crashing() -> None:
         },
     )
     result = StatisticalCriticalAgent().analyze(radio, geno)
-    alk = next(m for m in result.metrics if m.target == "ALK_mut")
-    assert alk.auroc is None
+    assert not any(m.target == "ALK_mut" for m in result.metrics)
+    assert any("<10 positive" in c for c in result.diagnostics.caveats)
+
+
+def test_predict_mutation_skips_genes_below_ten_positives() -> None:
+    from agentic_radiogen.schemas.contracts import GenomicMatrix, RadiomicMatrix
+
+    patients = [f"P{i}" for i in range(40)]
+    radio = RadiomicMatrix(
+        patient_ids=patients,
+        feature_names=["f1"],
+        features={pid: {"f1": float(i)} for i, pid in enumerate(patients)},
+    )
+    # EGFR: 12 positives (kept); RARE: 3 positives (dropped from metrics).
+    geno = GenomicMatrix(
+        patient_ids=patients,
+        feature_names=["EGFR_mut", "RARE_mut"],
+        features={
+            pid: {
+                "EGFR_mut": float(i < 12),
+                "RARE_mut": float(i < 3),
+            }
+            for i, pid in enumerate(patients)
+        },
+    )
+    result = StatisticalCriticalAgent().analyze(radio, geno)
+    targets = {m.target for m in result.metrics}
+    assert "EGFR_mut" in targets
+    assert "RARE_mut" not in targets
+    assert any("Skipped 1 mutation" in c for c in result.diagnostics.caveats)
