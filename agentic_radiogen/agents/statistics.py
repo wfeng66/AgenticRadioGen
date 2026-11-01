@@ -25,8 +25,8 @@ from agentic_radiogen.schemas.contracts import (
 from agentic_radiogen.stats.predictors import fit_score_mutation, normalize_model_name
 
 _PRED_THRESHOLD = 0.5
-# Skip mutation predictors with too few positives (wide-negative genes inflate AUPRC/F1).
-_MIN_POSITIVE_MUTATIONS = 10
+# Default for --min_test_pos_mut: drop genes with too few positives in the holdout.
+_MIN_TEST_POS_MUT = 2
 
 
 def _fdr_bh(p_values: list[float]) -> list[float]:
@@ -85,9 +85,11 @@ class StatisticalCriticalAgent:
         model: str = "random_forest",
         *,
         use_clinic_data: bool = False,
+        min_test_pos_mut: int = _MIN_TEST_POS_MUT,
     ) -> None:
         self.model_name = normalize_model_name(model)
         self.use_clinic_data = bool(use_clinic_data)
+        self.min_test_pos_mut = max(1, int(min_test_pos_mut))
 
     def analyze(
         self,
@@ -111,17 +113,6 @@ class StatisticalCriticalAgent:
             genomic_targets = [c for c in genomic_targets if c.startswith(target_prefix)]
         if not genomic_targets:
             genomic_targets = [c for c in geno_df.columns if c.endswith("_expr")][:1]
-
-        predict_targets = [
-            c
-            for c in genomic_targets
-            if c.endswith("_mut")
-            and int(np.nansum(geno_df[c].to_numpy(dtype=float) >= 0.5))
-            >= _MIN_POSITIVE_MUTATIONS
-        ]
-        if not predict_targets and genomic_targets and not genomic_targets[0].endswith("_mut"):
-            # Expression fallback when no mutation columns meet the positive floor.
-            predict_targets = list(genomic_targets[:1])
 
         associations: list[Association] = []
         raw_p: list[float] = []
@@ -156,16 +147,10 @@ class StatisticalCriticalAgent:
         diagnostics.caveats.append(
             f"Mutation AUPRC uses model '{self.model_name}'"
         )
-        n_skipped_rare = sum(
-            1
-            for c in genomic_targets
-            if c.endswith("_mut") and c not in predict_targets
+        diagnostics.caveats.append(
+            f"Mutation metrics require ≥{self.min_test_pos_mut} positive cases "
+            f"in the test split (--min_test_pos_mut)"
         )
-        if n_skipped_rare:
-            diagnostics.caveats.append(
-                f"Skipped {n_skipped_rare} mutation target(s) with "
-                f"<{_MIN_POSITIVE_MUTATIONS} positive cases"
-            )
         if self.use_clinic_data:
             n_clinic = sum(1 for c in feature_df.columns if str(c).startswith("clinic_"))
             diagnostics.caveats.append(
@@ -178,10 +163,25 @@ class StatisticalCriticalAgent:
             )
         metrics: list[ModelMetrics] = []
         test_split_log: list[dict[str, Any]] = []
-        for target in predict_targets:
-            row, log_rows = self._predict_mutation(feature_df, geno_df, target)
-            metrics.append(row)
+        n_skipped_test_pos = 0
+        for target in genomic_targets:
+            row, log_rows, skip_reason = self._predict_mutation(
+                feature_df, geno_df, target
+            )
+            # Always keep per-patient holdout rows in *.test_split.jsonl.
             test_split_log.extend(log_rows)
+            if skip_reason == "test_pos":
+                n_skipped_test_pos += 1
+                continue
+            if row is None:
+                continue
+            metrics.append(row)
+        if n_skipped_test_pos:
+            diagnostics.caveats.append(
+                f"Omitted {n_skipped_test_pos} mutation target(s) from metrics "
+                f"display with <{self.min_test_pos_mut} positive case(s) in the "
+                f"test split (rows still in test_split_log)"
+            )
         if {"OS_time", "OS_event"}.issubset(geno_df.columns) and len(feature_df.columns):
             risk = feature_df.iloc[:, 0].to_numpy(dtype=float)
             c_index = _concordance_index(
@@ -260,21 +260,23 @@ class StatisticalCriticalAgent:
 
     def _predict_mutation(
         self, feature_df: pd.DataFrame, geno_df: pd.DataFrame, target: str
-    ) -> tuple[ModelMetrics, list[dict[str, Any]]]:
+    ) -> tuple[ModelMetrics | None, list[dict[str, Any]], str | None]:
+        """Fit holdout metrics.
+
+        Returns ``(metrics, log_rows, skip_reason)``. ``skip_reason`` is
+        ``\"test_pos\"`` when the gene is omitted for too few test positives.
+        """
         y_all = geno_df[target].to_numpy(dtype=float)
         mask = np.isfinite(y_all)
         y = y_all[mask]
         patient_ids = feature_df.index.to_numpy()[mask]
         feat_names = [str(c) for c in feature_df.columns]
-        empty = ModelMetrics(
-            auprc=None, n_train=0, n_test=0, target=target, model=self.model_name
-        )
         if len(y) < 4:
-            return empty, []
+            return None, [], None
         classes, counts = np.unique(y.astype(int), return_counts=True)
         if len(classes) < 2 or int(counts.min()) < 2:
             # Rare / single-mutant cohorts cannot support a stratified holdout AUPRC.
-            return empty, []
+            return None, [], None
         X = feature_df.to_numpy(dtype=float)[mask]
         # Impute non-finite clinic/radiomic cells with column medians (train-safe enough for holdout).
         if not np.isfinite(X).all():
@@ -294,20 +296,13 @@ class StatisticalCriticalAgent:
                 stratify=y.astype(int) if can_stratify else None,
             )
         except ValueError:
-            return empty, []
+            return None, [], None
         X_train, X_test = X[idx_train], X[idx_test]
         y_train, y_test = y[idx_train], y[idx_test]
+        n_test_pos = int(np.sum(np.asarray(y_test, dtype=float) >= 0.5))
+        omit_metrics = n_test_pos < self.min_test_pos_mut
         if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-            return (
-                ModelMetrics(
-                    auprc=None,
-                    n_train=len(y_train),
-                    n_test=len(y_test),
-                    target=target,
-                    model=self.model_name,
-                ),
-                [],
-            )
+            return None, [], None
         try:
             train_proba, test_proba = fit_score_mutation(
                 self.model_name, X_train, y_train, X_test
@@ -315,16 +310,7 @@ class StatisticalCriticalAgent:
             train_m = _binary_metrics(y_train, train_proba)
             test_m = _binary_metrics(y_test, test_proba)
         except Exception:
-            return (
-                ModelMetrics(
-                    auprc=None,
-                    n_train=len(y_train),
-                    n_test=len(y_test),
-                    target=target,
-                    model=self.model_name,
-                ),
-                [],
-            )
+            return None, [], None
 
         y_hat_test = (np.asarray(test_proba, dtype=float) >= _PRED_THRESHOLD).astype(int)
         log_rows: list[dict[str, Any]] = []
@@ -340,6 +326,8 @@ class StatisticalCriticalAgent:
                     "y_pred": int(y_hat_test[local_i]),
                     "proba": float(test_proba[local_i]),
                     "threshold": _PRED_THRESHOLD,
+                    "n_test_pos": n_test_pos,
+                    "metrics_displayed": not omit_metrics,
                     "feature_names": feat_names,
                     "features": {
                         name: float(feat_row[j]) if np.isfinite(feat_row[j]) else None
@@ -347,6 +335,10 @@ class StatisticalCriticalAgent:
                     },
                 }
             )
+
+        if omit_metrics:
+            # Keep test_split_log rows; omit from screen / metrics list only.
+            return None, log_rows, "test_pos"
 
         return (
             ModelMetrics(
@@ -366,4 +358,5 @@ class StatisticalCriticalAgent:
                 model=self.model_name,
             ),
             log_rows,
+            None,
         )

@@ -15,6 +15,13 @@ from agentic_radiogen.data.disease_match import (
     segmentation_disease_label,
 )
 from agentic_radiogen.data.gdc_client import GdcCase, GdcClient
+from agentic_radiogen.data.organ_gate_blacklist import (
+    default_blacklist_path,
+    filter_uids,
+    load_failed_uids,
+    record_failed_uid,
+    remove_cached_series,
+)
 from agentic_radiogen.data.tcia_client import (
     TciaClient,
     TciaSeries,
@@ -798,7 +805,27 @@ class LiveCatalog:
                     ]
                     if rec.series_uid and rec.series_uid not in candidate_uids:
                         candidate_uids.insert(0, rec.series_uid)
+                    blacklist_path = self._organ_gate_blacklist_path()
+                    failed_uids = load_failed_uids(blacklist_path)
+                    if failed_uids:
+                        before = list(candidate_uids)
+                        candidate_uids = filter_uids(
+                            candidate_uids, failed=failed_uids
+                        )
+                        skipped = [u for u in before if u not in candidate_uids]
+                        if skipped:
+                            log(
+                                f"[fetch] {pid}: skipping {len(skipped)} blacklisted "
+                                f"organ-gate UID(s) "
+                                f"({', '.join('…' + u[-12:] for u in skipped)})",
+                                enabled=verbose,
+                            )
                     candidate_uids = candidate_uids[:_MAX_SERIES_ATTEMPTS]
+                    if not candidate_uids:
+                        raise RuntimeError(
+                            f"No series candidates left for {pid} after organ-gate "
+                            f"blacklist filter (see {blacklist_path})"
+                        )
 
                     series_dir: Path | None = None
                     last_organ_reason = ""
@@ -812,10 +839,29 @@ class LiveCatalog:
                             )
                             if not gate.ok:
                                 last_organ_reason = gate.reason
+                                record_failed_uid(
+                                    uid,
+                                    reason=gate.reason,
+                                    patient_id=pid,
+                                    organ_keywords=organs,
+                                    path=blacklist_path,
+                                )
+                                removed = remove_cached_series(
+                                    uid,
+                                    cache_dir=self.tcia.cache_dir,
+                                    series_dir=series_dir,
+                                )
+                                removed_note = (
+                                    f"; removed cache {removed.name}"
+                                    if removed is not None
+                                    else "; cache already absent"
+                                )
                                 log(
                                     f"[fetch] {pid}: organ gate FAIL attempt "
                                     f"{attempt}/{len(candidate_uids)} "
-                                    f"uid=…{uid[-12:]} ({gate.reason})",
+                                    f"uid=…{uid[-12:]} ({gate.reason}); "
+                                    f"blacklisted → {blacklist_path.name}"
+                                    f"{removed_note}",
                                     enabled=verbose,
                                 )
                                 series_dir = None
@@ -1011,7 +1057,13 @@ class LiveCatalog:
         chosen: dict[str, list[TciaSeries]] = {}
         thin = 0
         dropped_non_chest = 0
+        failed_uids = load_failed_uids(self._organ_gate_blacklist_path())
+        blacklisted_drop = 0
         for pid, cands in by_patient.items():
+            if failed_uids:
+                kept = [s for s in cands if s.series_uid not in failed_uids]
+                blacklisted_drop += len(cands) - len(kept)
+                cands = kept
             ranked = prefer_volumetric_series_ranked(cands, chest_only=chest_only)
             if not ranked:
                 if chest_only and cands:
@@ -1020,6 +1072,12 @@ class LiveCatalog:
             chosen[pid] = ranked
             if 0 < int(ranked[0].image_count) < 8:
                 thin += 1
+        if blacklisted_drop and verbose:
+            log(
+                f"[match] Organ-gate blacklist: excluded {blacklisted_drop} series "
+                f"UID(s) from ranking ({self._organ_gate_blacklist_path().name})",
+                enabled=True,
+            )
         if chest_only and verbose:
             log(
                 f"[match] Chest-only series filter: kept {len(chosen)} patients, "
@@ -1040,3 +1098,7 @@ class LiveCatalog:
         if key not in self._series_cache:
             self._series_cache[key] = self.tcia.list_series(collection, modality)
         return self._series_cache[key]
+
+    def _organ_gate_blacklist_path(self) -> Path:
+        """JSONL of organ-gate failures, stored next to the TCIA DICOM cache."""
+        return default_blacklist_path(self.tcia.cache_dir)

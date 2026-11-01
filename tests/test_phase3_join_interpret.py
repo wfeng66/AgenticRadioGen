@@ -196,10 +196,9 @@ def test_predict_mutation_skips_rare_class_instead_of_crashing() -> None:
     )
     result = StatisticalCriticalAgent().analyze(radio, geno)
     assert not any(m.target == "ALK_mut" for m in result.metrics)
-    assert any("<10 positive" in c for c in result.diagnostics.caveats)
 
 
-def test_predict_mutation_skips_genes_below_ten_positives() -> None:
+def test_predict_mutation_skips_genes_below_min_test_pos() -> None:
     from agentic_radiogen.schemas.contracts import GenomicMatrix, RadiomicMatrix
 
     patients = [f"P{i}" for i in range(40)]
@@ -208,20 +207,53 @@ def test_predict_mutation_skips_genes_below_ten_positives() -> None:
         feature_names=["f1"],
         features={pid: {"f1": float(i)} for i, pid in enumerate(patients)},
     )
-    # EGFR: 12 positives (kept); RARE: 3 positives (dropped from metrics).
+    # EGFR: 12 cohort positives (enough in test); RARE: 1 cohort positive (no metrics).
     geno = GenomicMatrix(
         patient_ids=patients,
         feature_names=["EGFR_mut", "RARE_mut"],
         features={
             pid: {
                 "EGFR_mut": float(i < 12),
-                "RARE_mut": float(i < 3),
+                "RARE_mut": float(i < 1),
             }
             for i, pid in enumerate(patients)
         },
     )
-    result = StatisticalCriticalAgent().analyze(radio, geno)
+    result = StatisticalCriticalAgent(min_test_pos_mut=2).analyze(radio, geno)
     targets = {m.target for m in result.metrics}
     assert "EGFR_mut" in targets
     assert "RARE_mut" not in targets
-    assert any("Skipped 1 mutation" in c for c in result.diagnostics.caveats)
+    assert any("--min_test_pos_mut" in c for c in result.diagnostics.caveats)
+
+
+def test_min_test_pos_mut_filters_by_holdout_positives() -> None:
+    from agentic_radiogen.schemas.contracts import GenomicMatrix, RadiomicMatrix
+
+    patients = [f"P{i}" for i in range(40)]
+    radio = RadiomicMatrix(
+        patient_ids=patients,
+        feature_names=["f1"],
+        features={pid: {"f1": float(i)} for i, pid in enumerate(patients)},
+    )
+    # MID: 5 cohort positives → typically ~2 in 35% test; floor=10 drops metrics.
+    geno = GenomicMatrix(
+        patient_ids=patients,
+        feature_names=["EGFR_mut", "MID_mut"],
+        features={
+            pid: {
+                "EGFR_mut": float(i < 12),
+                "MID_mut": float(i < 5),
+            }
+            for i, pid in enumerate(patients)
+        },
+    )
+    low = StatisticalCriticalAgent(min_test_pos_mut=1).analyze(radio, geno)
+    high = StatisticalCriticalAgent(min_test_pos_mut=10).analyze(radio, geno)
+    assert "MID_mut" in {m.target for m in low.metrics}
+    assert "MID_mut" not in {m.target for m in high.metrics}
+    assert any("test split" in c for c in high.diagnostics.caveats)
+    # test_split_log still includes MID_mut patient rows when metrics are omitted.
+    mid_log = [r for r in high.test_split_log if r.get("target") == "MID_mut"]
+    assert mid_log
+    assert all(r.get("metrics_displayed") is False for r in mid_log)
+    assert any(r.get("target") == "EGFR_mut" for r in high.test_split_log)

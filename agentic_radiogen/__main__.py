@@ -517,7 +517,10 @@ def run_stage1(
     llm_model: str | None = None,
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
+    stats_model: str = "random_forest",
+    min_test_pos_mut: int = 2,
 ) -> dict[str, Any]:
+    del stats_model, min_test_pos_mut  # unused until Stage 3+
     payload, _, _ = _run_matcher(
         question_text,
         disease=disease,
@@ -562,7 +565,10 @@ def run_stage2(
     llm_model: str | None = None,
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
+    stats_model: str = "random_forest",
+    min_test_pos_mut: int = 2,
 ) -> dict[str, Any]:
+    del stats_model, min_test_pos_mut  # unused until Stage 3+
     payload, images, omics = _run_matcher(
         question_text,
         disease=disease,
@@ -633,6 +639,7 @@ def run_stage3(
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
     stats_model: str = "random_forest",
+    min_test_pos_mut: int = 2,
 ) -> dict[str, Any]:
     payload, images, omics = _run_matcher(
         question_text,
@@ -684,7 +691,9 @@ def run_stage3(
             outputs,
             disease=payload["question"]["disease"],
             question=question_text,
-            stats=StatisticalCriticalAgent(model=stats_model),
+            stats=StatisticalCriticalAgent(
+                model=stats_model, min_test_pos_mut=min_test_pos_mut
+            ),
             literature=literature,
         )
     except Stage3Error as exc:
@@ -725,6 +734,7 @@ def run_stage4(
     patient_ids: list[str] | None = None,
     force_seg_model: str | None = None,
     stats_model: str = "random_forest",
+    min_test_pos_mut: int = 2,
 ) -> dict[str, Any]:
     if catalog_name == "live" and not approve_download:
         raise ValueError("Live Stage 4 requires --approve-download (question-scoped DICOM + metadata).")
@@ -755,7 +765,9 @@ def run_stage4(
         ),
         imaging=ImagingRadiomicsAgent(force_model_id=force_seg_model),
         genomics=GenomicsAgent(),
-        stats=StatisticalCriticalAgent(model=stats_model),
+        stats=StatisticalCriticalAgent(
+            model=stats_model, min_test_pos_mut=min_test_pos_mut
+        ),
         literature=LiteratureAgent(
             use_llm=use_llm,
             llm_provider=llm_provider,
@@ -912,6 +924,16 @@ def main() -> None:
         "Exploratory Pearson associations are unchanged.",
     )
     parser.add_argument(
+        "--min_test_pos_mut",
+        type=int,
+        default=2,
+        help=(
+            "Minimum positive (mutated) cases required in the test split "
+            "before a gene is reported with holdout AUPRC/F1 (default: 2). "
+            "Genes below this floor are omitted from metrics output."
+        ),
+    )
+    parser.add_argument(
         "--llm",
         action="store_true",
         default=None,
@@ -1015,6 +1037,7 @@ def main() -> None:
         patient_ids=patient_ids,
         force_seg_model=force_seg_model,
         stats_model=str(args.model or "random_forest"),
+        min_test_pos_mut=int(args.min_test_pos_mut),
     )
 
     try:

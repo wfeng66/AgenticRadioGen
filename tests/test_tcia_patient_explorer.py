@@ -128,6 +128,7 @@ def test_explore_patient_downloads_selected_series_and_clinical_files(
         out_dir=out_dir,
         modalities={"CT"},
         previews=False,
+        disease="lung cancer",
         tcia_client=tcia,  # type: ignore[arg-type]
         gdc_client=gdc,  # type: ignore[arg-type]
     )
@@ -142,6 +143,13 @@ def test_explore_patient_downloads_selected_series_and_clinical_files(
     assert (out_dir / "metadata" / "tcia_series.csv").is_file()
     assert (out_dir / "metadata" / "tcia_patient.csv").is_file()
     assert (out_dir / "metadata" / "tcia_studies.json").is_file()
+    assert (out_dir / "series.log").is_file()
+    series_log = (out_dir / "series.log").read_text(encoding="utf-8")
+    assert "patient_id: TCGA-17-Z021" in series_log
+    assert "downloaded_series_count: 1" in series_log
+    assert "disease_question: lung cancer" in series_log
+    assert "metadata_indicates_disease_match: True" in series_log
+    assert "SeriesDescription=" in series_log or "BodyPartExamined=" in series_log
     patient_csv = (out_dir / "metadata" / "tcia_patient.csv").read_text(encoding="utf-8")
     assert "getPatientStudy.PatientSex" in patient_csv
     assert "series_records_json" in patient_csv
@@ -159,13 +167,15 @@ def test_metadata_only_does_not_download_images_or_clinical_files(
 ) -> None:
     tcia = _FakeTciaClient(tmp_path / "cache")
     gdc = _FakeGdcClient()
+    out_dir = tmp_path / "output"
 
     result = explore_patient(
         patient_id="TCGA-17-Z021",
-        out_dir=tmp_path / "output",
+        out_dir=out_dir,
         modalities={"CT"},
         download=False,
         previews=False,
+        disease="lung cancer",
         tcia_client=tcia,  # type: ignore[arg-type]
         gdc_client=gdc,  # type: ignore[arg-type]
     )
@@ -174,6 +184,77 @@ def test_metadata_only_does_not_download_images_or_clinical_files(
     assert gdc.downloaded == []
     assert result["series"][0]["status"] == "metadata_only"
     assert result["clinical_file_downloads"] == []
+    series_log = (out_dir / "series.log").read_text(encoding="utf-8")
+    assert "downloaded_series_count: 0" in series_log
+    assert "metadata-only mode" in series_log
+
+
+def test_series_log_reports_organ_gate_when_metadata_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentic_radiogen.imaging.organ_verify import OrganVerifyResult
+
+    class _BlankMetaTcia(_FakeTciaClient):
+        def list_series_for_patient(
+            self, patient_id: str, modality: str | None = None
+        ) -> list[TciaSeries]:
+            series = [
+                TciaSeries(
+                    patient_id,
+                    "uid-ct",
+                    "CT",
+                    "OTHER",
+                    image_count=2,
+                    series_description="",
+                    body_part_examined="",
+                    source_metadata={
+                        "PatientID": patient_id,
+                        "SeriesInstanceUID": "uid-ct",
+                        "StudyInstanceUID": "study-1",
+                        "Modality": "CT",
+                        "Collection": "OTHER",
+                        "ImageCount": 2,
+                        "SeriesNumber": 7,
+                    },
+                )
+            ]
+            if modality is None:
+                return series
+            return [item for item in series if item.modality == modality]
+
+    tcia = _BlankMetaTcia(tmp_path / "cache")
+
+    def fake_verify(series_dir, *, organ_keywords, min_voxels=1000):
+        return OrganVerifyResult(
+            ok=True,
+            organ_keywords=tuple(organ_keywords),
+            n_organ_voxels=5000,
+            volume_voxels=10000,
+            reason="organ ['lung'] voxels=5000",
+        )
+
+    monkeypatch.setattr(
+        "agentic_radiogen.imaging.organ_verify.verify_expected_organ",
+        fake_verify,
+    )
+
+    out_dir = tmp_path / "output"
+    result = explore_patient(
+        patient_id="TCGA-17-Z021",
+        out_dir=out_dir,
+        modalities={"CT"},
+        previews=False,
+        disease="lung cancer",
+        verify_organ=True,
+        tcia_client=tcia,  # type: ignore[arg-type]
+        gdc_client=_FakeGdcClient(),  # type: ignore[arg-type]
+    )
+    assert result["series"][0]["disease_evidence"]["metadata_indicates_match"] is False
+    series_log = (out_dir / "series.log").read_text(encoding="utf-8")
+    assert "metadata_indicates_disease_match: False" in series_log
+    assert "organ_gate PASS" in series_log
+    assert "no original metadata matched disease keywords" in series_log
+    assert "downloaded_series_numbers: 7" in series_log
 
 
 def test_gdc_patient_case_and_clinical_file_methods() -> None:

@@ -9,10 +9,14 @@ Writes under ``--out-dir/metadata``:
   getSeriesMetaData / getSeriesSize field
 - ``tcia_studies.csv`` — one row per study
 - ``tcia_all_metadata.csv`` — one row per DICOM instance (headers + TCIA fields)
+- ``series.log`` — patient id, downloaded series count, per-series disease-keyword
+  metadata evidence (original field values), and organ-gate verification when
+  metadata does not indicate a disease match
 
 Examples
 --------
 python scripts/explore_tcia_patient.py --patient-id TCGA-17-Z021
+python scripts/explore_tcia_patient.py --patient-id TCGA-17-Z021 --disease "lung cancer"
 python scripts/explore_tcia_patient.py --patient-id TCGA-17-Z021 --all-modalities
 python scripts/explore_tcia_patient.py --patient-id TCGA-17-Z021 --metadata-only
 """
@@ -30,8 +34,22 @@ from typing import Any
 
 import numpy as np
 
+from agentic_radiogen.data.disease_match import (
+    expected_organ_keywords,
+    keywords_from_query,
+)
 from agentic_radiogen.data.gdc_client import GdcClient
 from agentic_radiogen.data.tcia_client import TciaClient, TciaSeries
+
+# Metadata fields checked for disease/site keyword evidence (original NBIA text).
+_SERIES_MATCH_FIELDS: tuple[tuple[str, str], ...] = (
+    ("SeriesDescription", "series_description"),
+    ("ProtocolName", "protocol_name"),
+    ("StudyDescription", "study_description"),
+    ("BodyPartExamined", "body_part_examined"),
+    ("Collection", "collection"),
+    ("Modality", "modality"),
+)
 
 
 def _json_write(path: Path, value: Any) -> None:
@@ -517,6 +535,244 @@ def _render_preview(
     return _window(slices[0][0])
 
 
+# Extra site tokens (beyond disease query) that commonly appear in BodyPartExamined.
+_SITE_ALIAS_BY_ORGAN: dict[str, tuple[str, ...]] = {
+    "lung": ("lung", "chest", "thorax", "thoracic", "pulmonary", "luad", "lusc"),
+    "liver": ("liver", "hepatic", "hcc"),
+    "kidney": ("kidney", "renal", "rcc"),
+    "pancreas": ("pancreas", "pancreatic", "pdac"),
+    "breast": ("breast", "brca"),
+    "brain": ("brain", "gbm", "glioma"),
+    "prostate": ("prostate", "prad"),
+    "colon": ("colon", "colorectal", "rectal"),
+    "urinary_bladder": ("bladder", "urothelial"),
+}
+
+
+def _site_evidence_keywords(disease: str) -> list[str]:
+    """Keywords used to judge whether series metadata matches the disease/site."""
+    organs = expected_organ_keywords(disease)
+    merged: list[str] = list(organs) + list(keywords_from_query(disease))
+    for organ in organs:
+        merged.extend(_SITE_ALIAS_BY_ORGAN.get(organ, ()))
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in sorted(
+        {str(k).strip().lower() for k in merged if str(k).strip()},
+        key=len,
+        reverse=True,
+    ):
+        if len(kw) < 3 or kw in seen:
+            continue
+        seen.add(kw)
+        out.append(kw)
+    return out
+
+
+def _field_keyword_hits(
+    field: str, value: str, keywords: list[str]
+) -> list[str]:
+    hay = (value or "").lower()
+    if not hay.strip():
+        return []
+    hits: list[str] = []
+    for kw in keywords:
+        if re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", hay) or kw in hay:
+            hits.append(kw)
+    return hits
+
+
+def _series_disease_evidence(
+    series: TciaSeries,
+    *,
+    keywords: list[str],
+) -> dict[str, Any]:
+    """Which original TCIA metadata fields indicate a disease/site match."""
+    source = dict(series.source_metadata or {})
+    matches: list[dict[str, Any]] = []
+    inspected: list[dict[str, Any]] = []
+    for api_key, attr in _SERIES_MATCH_FIELDS:
+        value = str(getattr(series, attr, "") or source.get(api_key) or "").strip()
+        inspected.append({"field": api_key, "value": value or "(empty)"})
+        hits = _field_keyword_hits(api_key, value, keywords)
+        if hits:
+            matches.append(
+                {
+                    "field": api_key,
+                    "value": value,
+                    "matched_keywords": hits,
+                }
+            )
+    # Also scan any other non-empty string fields on getSeries that were not listed.
+    covered = {api for api, _ in _SERIES_MATCH_FIELDS}
+    for key, raw in source.items():
+        if key in covered or not isinstance(raw, (str, int, float)):
+            continue
+        value = str(raw).strip()
+        if not value:
+            continue
+        hits = _field_keyword_hits(str(key), value, keywords)
+        if hits:
+            matches.append(
+                {
+                    "field": str(key),
+                    "value": value,
+                    "matched_keywords": hits,
+                }
+            )
+    return {
+        "metadata_indicates_match": bool(matches),
+        "matching_fields": matches,
+        "inspected_fields": inspected,
+        "site_text": series.site_text or "",
+    }
+
+
+def _verify_series_organ(
+    series_dir: Path,
+    *,
+    disease: str,
+    collection: str,
+) -> dict[str, Any]:
+    organs = expected_organ_keywords(disease, collection)
+    if not organs:
+        return {
+            "ran": False,
+            "ok": None,
+            "organ_keywords": [],
+            "reason": (
+                f"no expected organ mapped for disease={disease!r} "
+                f"collection={collection!r}; organ gate skipped"
+            ),
+        }
+    from agentic_radiogen.imaging.organ_verify import verify_expected_organ
+
+    result = verify_expected_organ(series_dir, organ_keywords=organs)
+    return {
+        "ran": True,
+        "ok": bool(result.ok),
+        "organ_keywords": list(result.organ_keywords),
+        "n_organ_voxels": result.n_organ_voxels,
+        "volume_voxels": result.volume_voxels,
+        "reason": result.reason,
+    }
+
+
+def _format_series_log(
+    *,
+    patient_id: str,
+    disease: str,
+    keywords: list[str],
+    expected_organs: tuple[str, ...],
+    entries: list[dict[str, Any]],
+) -> str:
+    downloaded = [e for e in entries if e.get("status") == "downloaded"]
+    lines: list[str] = [
+        f"patient_id: {patient_id}",
+        f"disease_question: {disease}",
+        f"disease_keywords: {', '.join(keywords) if keywords else '(none)'}",
+        f"expected_organs: {', '.join(expected_organs) if expected_organs else '(none)'}",
+        f"series_listed: {len(entries)}",
+        f"downloaded_series_count: {len(downloaded)}",
+        f"downloaded_series_numbers: "
+        + (
+            ", ".join(
+                str(e.get("series_number") or e.get("series_uid") or "?")
+                for e in downloaded
+            )
+            if downloaded
+            else "(none)"
+        ),
+        "",
+    ]
+    for index, entry in enumerate(entries, start=1):
+        lines.append(f"--- series {index}/{len(entries)} ---")
+        lines.append(f"patient_id: {patient_id}")
+        lines.append(f"series_uid: {entry.get('series_uid', '')}")
+        lines.append(f"series_number: {entry.get('series_number', '')}")
+        lines.append(f"modality: {entry.get('modality', '')}")
+        lines.append(f"collection: {entry.get('collection', '')}")
+        lines.append(f"image_count: {entry.get('image_count', '')}")
+        lines.append(f"status: {entry.get('status', '')}")
+        if entry.get("download_dir"):
+            lines.append(f"download_dir: {entry['download_dir']}")
+        if entry.get("error"):
+            lines.append(f"error: {entry['error']}")
+        evidence = entry.get("disease_evidence") or {}
+        lines.append(
+            "metadata_indicates_disease_match: "
+            f"{bool(evidence.get('metadata_indicates_match'))}"
+        )
+        lines.append("matching_original_fields:")
+        matches = list(evidence.get("matching_fields") or [])
+        if matches:
+            for hit in matches:
+                kws = ", ".join(hit.get("matched_keywords") or [])
+                lines.append(
+                    f"  - {hit.get('field')}={hit.get('value')!r} "
+                    f"matched_keywords=[{kws}]"
+                )
+        else:
+            lines.append(
+                "  - (none) no SeriesDescription/ProtocolName/StudyDescription/"
+                "BodyPartExamined/Collection text matched the disease keywords"
+            )
+            lines.append("inspected_original_fields:")
+            for field in evidence.get("inspected_fields") or []:
+                lines.append(f"  - {field.get('field')}={field.get('value')!r}")
+        verification = entry.get("verification") or {}
+        lines.append("verification:")
+        if entry.get("status") == "metadata_only":
+            lines.append(
+                "  - metadata-only mode; DICOM not downloaded so organ gate "
+                "was not run"
+            )
+            if evidence.get("metadata_indicates_match"):
+                lines.append(
+                    "  - disease-site indication relies on original metadata "
+                    "fields listed above"
+                )
+            else:
+                lines.append(
+                    "  - no original metadata matched; re-run without "
+                    "--metadata-only to confirm via organ gate"
+                )
+        elif evidence.get("metadata_indicates_match"):
+            lines.append(
+                "  - metadata evidence present; organ verification not required "
+                "for disease-site indication (may still be used by the main pipeline)"
+            )
+            if verification.get("ran"):
+                lines.append(
+                    f"  - organ_gate optional_run: "
+                    f"{'PASS' if verification.get('ok') else 'FAIL'} "
+                    f"({verification.get('reason', '')})"
+                )
+        elif verification.get("ran"):
+            verdict = "PASS" if verification.get("ok") else "FAIL"
+            lines.append(
+                f"  - no original metadata matched disease keywords; "
+                f"organ_gate {verdict} for expected organs "
+                f"{verification.get('organ_keywords')}: {verification.get('reason')}"
+            )
+            if verification.get("n_organ_voxels") is not None:
+                lines.append(
+                    f"  - organ_voxels={verification.get('n_organ_voxels')} / "
+                    f"volume_voxels={verification.get('volume_voxels')}"
+                )
+        else:
+            lines.append(
+                f"  - {verification.get('reason') or 'verification not run'}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_series_log(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 def _write_overview(
     previews: list[tuple[str, np.ndarray]], output: Path, columns: int = 3
 ) -> None:
@@ -547,6 +803,8 @@ def explore_patient(
     modalities: set[str] | None = None,
     download: bool = True,
     previews: bool = True,
+    disease: str | None = None,
+    verify_organ: bool = True,
     cache_dir: Path | None = None,
     tcia_client: TciaClient | None = None,
     gdc_client: GdcClient | None = None,
@@ -556,6 +814,9 @@ def explore_patient(
     out_dir.mkdir(parents=True, exist_ok=True)
     tcia = tcia_client or TciaClient(cache_dir=cache_dir)
     gdc = gdc_client or GdcClient()
+    disease_query = (disease or "lung cancer").strip() or "lung cancer"
+    disease_keywords = _site_evidence_keywords(disease_query)
+    expected_organs = expected_organ_keywords(disease_query)
 
     if modalities is None:
         all_series = tcia.list_series_for_patient(patient_id)
@@ -621,12 +882,16 @@ def explore_patient(
 
     summary: dict[str, Any] = {
         "patient_id": patient_id,
+        "disease_question": disease_query,
+        "disease_keywords": disease_keywords,
+        "expected_organs": list(expected_organs),
         "selected_modalities": sorted(modalities) if modalities is not None else "all",
         "downloaded": download,
         "gdc_case_found": case is not None,
         "gdc_clinical_file_count": len(clinical_files),
         "tcia_patient": patient_row,
         "series": [],
+        "series_log_entries": [],
         "clinical_file_downloads": [],
         "errors": [],
     }
@@ -641,9 +906,18 @@ def explore_patient(
 
     previews_for_overview: list[tuple[str, np.ndarray]] = []
     all_metadata_rows: list[dict[str, Any]] = []
+    series_log_entries: list[dict[str, Any]] = []
     for index, item in enumerate(series, start=1):
         record: dict[str, Any] = _series_metadata(item)
+        evidence = _series_disease_evidence(item, keywords=disease_keywords)
+        record["disease_evidence"] = evidence
         record["status"] = "metadata_only" if not download else "pending"
+        series_dir: Path | None = None
+        verification: dict[str, Any] = {
+            "ran": False,
+            "ok": None,
+            "reason": "verification not run yet",
+        }
         if download:
             try:
                 series_dir = tcia.download_series(item.series_uid)
@@ -680,6 +954,38 @@ def explore_patient(
                     f"[{index}/{len(series)}] {item.modality} {item.series_uid}: "
                     f"{actual_count}/{item.image_count or '?'} DICOM instances"
                 )
+                # If original metadata does not indicate disease/site, run organ gate.
+                if verify_organ and not evidence["metadata_indicates_match"]:
+                    try:
+                        verification = _verify_series_organ(
+                            series_dir,
+                            disease=disease_query,
+                            collection=item.collection,
+                        )
+                    except Exception as exc:
+                        verification = {
+                            "ran": True,
+                            "ok": False,
+                            "reason": (
+                                f"organ verification error: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+                elif evidence["metadata_indicates_match"]:
+                    verification = {
+                        "ran": False,
+                        "ok": None,
+                        "reason": (
+                            "original metadata matched disease keywords; "
+                            "organ gate not required for site indication"
+                        ),
+                    }
+                else:
+                    verification = {
+                        "ran": False,
+                        "ok": None,
+                        "reason": "organ verification disabled (--no-verify-organ)",
+                    }
                 if previews:
                     preview_path = (
                         out_dir / "previews" / f"{_safe_name(item.series_uid)}.png"
@@ -698,12 +1004,15 @@ def explore_patient(
             except Exception as exc:
                 record["status"] = "error"
                 record["error"] = f"{type(exc).__name__}: {exc}"
+                verification = {
+                    "ran": False,
+                    "ok": None,
+                    "reason": f"download/processing failed: {record['error']}",
+                }
                 all_metadata_rows.append(
                     _all_metadata_row(
                         item,
-                        download_dir=(
-                            series_dir if "series_dir" in locals() else None
-                        ),
+                        download_dir=series_dir,
                         status="error",
                         error=record["error"],
                     )
@@ -716,13 +1025,46 @@ def explore_patient(
                     file=sys.stderr,
                 )
         else:
+            verification = {
+                "ran": False,
+                "ok": None,
+                "reason": (
+                    "metadata-only mode; DICOM not downloaded so organ gate "
+                    "was not run"
+                ),
+            }
             all_metadata_rows.append(
                 _all_metadata_row(item, status="metadata_only")
             )
+        record["verification"] = verification
+        log_entry = {
+            "series_uid": item.series_uid,
+            "series_number": record.get("series_number")
+            or (item.source_metadata or {}).get("SeriesNumber", ""),
+            "modality": item.modality,
+            "collection": item.collection,
+            "image_count": item.image_count,
+            "status": record["status"],
+            "download_dir": record.get("download_dir", ""),
+            "error": record.get("error", ""),
+            "disease_evidence": evidence,
+            "verification": verification,
+        }
+        series_log_entries.append(log_entry)
         summary["series"].append(record)
+        summary["series_log_entries"] = series_log_entries
         _json_write(out_dir / "manifest.json", summary)
 
     _write_all_metadata_csv(all_metadata_rows, out_dir)
+    series_log_text = _format_series_log(
+        patient_id=patient_id,
+        disease=disease_query,
+        keywords=disease_keywords,
+        expected_organs=expected_organs,
+        entries=series_log_entries,
+    )
+    _write_series_log(out_dir / "series.log", series_log_text)
+    summary["series_log_path"] = str((out_dir / "series.log").resolve())
 
     if download:
         clinical_dir = out_dir / "gdc_clinical_files"
@@ -793,6 +1135,18 @@ def main() -> None:
         action="store_true",
         help="Skip PNG image previews and the series overview.",
     )
+    parser.add_argument(
+        "--disease",
+        default="lung cancer",
+        help="Disease/question text used to judge series-site match "
+        "(default: lung cancer). Keywords are derived for series.log.",
+    )
+    parser.add_argument(
+        "--no-verify-organ",
+        action="store_true",
+        help="Do not run TotalSegmentator organ gate when metadata lacks "
+        "disease-site keywords.",
+    )
     args = parser.parse_args()
     if args.all_modalities and args.modality:
         parser.error("--all-modalities cannot be combined with --modality")
@@ -820,6 +1174,8 @@ def main() -> None:
         modalities=modalities,
         download=not args.metadata_only,
         previews=not args.no_previews,
+        disease=str(args.disease or "lung cancer"),
+        verify_organ=not args.no_verify_organ,
         cache_dir=args.cache_dir,
     )
     failures = len(result["errors"])
@@ -828,6 +1184,7 @@ def main() -> None:
         f"{len(result['clinical_file_downloads'])} clinical files downloaded, "
         f"{failures} error(s). Output: {out_dir.resolve()}"
     )
+    print(f"Series log: {(out_dir / 'series.log').resolve()}")
     if failures:
         raise SystemExit(1)
 

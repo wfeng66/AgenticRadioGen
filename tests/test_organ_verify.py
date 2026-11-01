@@ -206,3 +206,49 @@ def test_fetch_tries_next_series_after_organ_gate_fail(
     assert downloads == ["uid-bad", "uid-good"]
     assert out[0].series_uid == "uid-good"
     assert out[0].radiomic_features.get("original_firstorder_Mean") == 1.0
+    blacklist = catalog._organ_gate_blacklist_path()
+    assert blacklist.is_file()
+    text = blacklist.read_text(encoding="utf-8")
+    assert "uid-bad" in text
+    assert "uid-good" not in text
+    # Failed series cache folder is deleted.
+    assert not (tmp_path / "uid-bad").exists()
+    assert (tmp_path / "uid-good").is_dir()
+
+    # Next fetch must skip blacklisted UID (no download / organ gate for uid-bad).
+    downloads.clear()
+    calls["n"] = 0
+    out2 = catalog.fetch_records(["TCGA-17-Z021"])
+    assert downloads == ["uid-good"]
+    assert calls["n"] == 1
+    assert out2[0].series_uid == "uid-good"
+
+
+def test_organ_gate_blacklist_helpers(tmp_path: Path) -> None:
+    from agentic_radiogen.data.organ_gate_blacklist import (
+        filter_uids,
+        load_failed_uids,
+        record_failed_uid,
+        remove_cached_series,
+    )
+
+    path = tmp_path / "organ_gate_failed.jsonl"
+    record_failed_uid(
+        "uid-a",
+        reason="no lung",
+        patient_id="P1",
+        organ_keywords=("lung",),
+        path=path,
+    )
+    record_failed_uid("uid-a", reason="duplicate", path=path)  # idempotent
+    assert load_failed_uids(path) == {"uid-a"}
+    assert filter_uids(["uid-a", "uid-b", "uid-a"], path=path) == ["uid-b"]
+    assert path.read_text(encoding="utf-8").count("uid-a") == 1
+
+    cache = tmp_path / "cache"
+    series = cache / "uid-rm"
+    series.mkdir(parents=True)
+    (series / ".complete").write_text("ok", encoding="utf-8")
+    removed = remove_cached_series("uid-rm", cache_dir=cache)
+    assert removed == series
+    assert not series.exists()

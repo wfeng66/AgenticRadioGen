@@ -191,6 +191,25 @@ def _row_from_log(log_path: Path, patient_id: str | None) -> dict[str, str]:
     return rows[0]
 
 
+def _series_uid_from_row(row: dict[str, str], image_path: Path | None = None) -> str:
+    """Best-effort SeriesInstanceUID from log columns or the DICOM cache path."""
+    for key in ("series_uid", "SeriesInstanceUID", "tcia_series_uid"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    raw = str(row.get("image_path") or "")
+    if raw.startswith("series_uid="):
+        return raw.split("=", 1)[1].strip()
+    path = _resolve_path(image_path or Path(raw)) if (image_path or raw) else None
+    if path is None:
+        return ""
+    # TCIA downloads land in data_cache/tcia/<SeriesInstanceUID>/
+    name = path.name if path.is_dir() else path.parent.name
+    if name.startswith("1.") or len(name) > 20:
+        return name
+    return name
+
+
 def visualize(
     *,
     image_path: Path,
@@ -200,6 +219,7 @@ def visualize(
     title: str = "",
     img_size: str = "small",
     mpr: bool = False,
+    series_uid: str = "",
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -211,6 +231,7 @@ def visualize(
     mask = _load_mask(mask_path, volume.shape)
     n_vox = int(mask.sum())
     nonempty = np.where(mask.reshape(mask.shape[0], -1).sum(axis=1) > 0)[0]
+    uid = (series_uid or "").strip() or _series_uid_from_row({}, image_path)
     if mpr:
         z, y, x = _mpr_indices(mask, volume.shape, slice_index)
     elif slice_index is not None:
@@ -223,6 +244,8 @@ def visualize(
     img = _window_ct(volume[z])
     msk = mask[z]
     slice_vox = int(msk.sum())
+    if uid:
+        print(f"series_uid={uid}")
     if mpr:
         print(
             f"mask voxels={n_vox} on {len(nonempty)}/{volume.shape[0]} slices; "
@@ -277,11 +300,13 @@ def visualize(
             origin="lower",
         )
         axes[2].set_title("Overlay")
+    uid_bit = f"  |  series_uid={uid}" if uid else ""
     if mpr:
         for ax in axes.flat:
             ax.axis("off")
         fig.suptitle(
             (title or f"{image_path.name}")
+            + uid_bit
             + f"  |  MPR z/y/x={z}/{y}/{x}  |  mask_voxels={n_vox}"
         )
     else:
@@ -289,6 +314,7 @@ def visualize(
             ax.axis("off")
         fig.suptitle(
             (title or f"{image_path.name}")
+            + uid_bit
             + f"  |  z={z}/{volume.shape[0]-1}  |  mask_voxels={n_vox}"
         )
     fig.tight_layout()
@@ -331,10 +357,12 @@ def main() -> None:
     image_path = args.image
     mask_path = args.mask
     title = ""
+    series_uid = ""
     if args.log:
         row = _row_from_log(args.log, args.patient_id)
         image_path = Path(row["image_path"])
         mask_path = Path(row["mask_path"]) if row.get("mask_path") else None
+        series_uid = _series_uid_from_row(row, image_path)
         title = (
             f"{row.get('patient_id')} | {row.get('diagnosis')} | "
             f"model={row.get('segmentation_model')} | {row.get('status')}"
@@ -346,6 +374,8 @@ def main() -> None:
             )
     if image_path is None or mask_path is None:
         raise SystemExit("Provide --image and --mask, or --log [--patient-id]")
+    if not series_uid:
+        series_uid = _series_uid_from_row({}, image_path)
 
     visualize(
         image_path=image_path,
@@ -355,6 +385,7 @@ def main() -> None:
         title=title,
         img_size=args.img_size,
         mpr=args.mpr,
+        series_uid=series_uid,
     )
 
 
