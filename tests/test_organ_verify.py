@@ -218,10 +218,15 @@ def test_fetch_tries_next_series_after_organ_gate_fail(
     # Next fetch must skip blacklisted UID (no download / organ gate for uid-bad).
     downloads.clear()
     calls["n"] = 0
+    # Recreate leftover bad cache (as if delete-on-fail was missed earlier).
+    leftover = tmp_path / "cache" / "uid-bad"
+    leftover.mkdir(parents=True, exist_ok=True)
+    (leftover / ".complete").write_text("ok", encoding="utf-8")
     out2 = catalog.fetch_records(["TCGA-17-Z021"])
     assert downloads == ["uid-good"]
     assert calls["n"] == 1
     assert out2[0].series_uid == "uid-good"
+    assert not leftover.exists()
 
 
 def test_organ_gate_blacklist_helpers(tmp_path: Path) -> None:

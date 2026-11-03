@@ -814,10 +814,25 @@ class LiveCatalog:
                         )
                         skipped = [u for u in before if u not in candidate_uids]
                         if skipped:
+                            # Purge leftover DICOM folders (e.g. failed before
+                            # delete-on-fail existed, or a prior delete missed).
+                            removed_names: list[str] = []
+                            for bad_uid in skipped:
+                                removed = remove_cached_series(
+                                    bad_uid, cache_dir=self.tcia.cache_dir
+                                )
+                                if removed is not None:
+                                    removed_names.append(removed.name[-12:])
+                            purge_note = (
+                                f"; purged cache …{', …'.join(removed_names)}"
+                                if removed_names
+                                else ""
+                            )
                             log(
                                 f"[fetch] {pid}: skipping {len(skipped)} blacklisted "
                                 f"organ-gate UID(s) "
-                                f"({', '.join('…' + u[-12:] for u in skipped)})",
+                                f"({', '.join('…' + u[-12:] for u in skipped)})"
+                                f"{purge_note}",
                                 enabled=verbose,
                             )
                     candidate_uids = candidate_uids[:_MAX_SERIES_ATTEMPTS]

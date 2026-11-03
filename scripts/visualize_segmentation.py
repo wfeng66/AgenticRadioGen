@@ -17,7 +17,7 @@ python scripts/visualize_segmentation.py \\
 python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
   --patient-id TCGA-50-5936 --out overlay.png
 
-# Show axial, coronal, and sagittal MPR overlays alongside the original CT:
+# Show four axial, two coronal, and two sagittal mask overlays:
 python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
   --patient-id TCGA-50-5936 --mpr --out mpr.png
 """
@@ -155,6 +155,44 @@ def _mpr_indices(
     )
 
 
+def _mask_slice_indices(
+    mask: np.ndarray,
+    axis: int,
+    count: int,
+    preferred_index: int | None = None,
+) -> list[int]:
+    """Choose slices across a mask's extent, preferring dense planes."""
+    foreground = np.asarray(mask) > 0
+    axis = int(axis)
+    if axis < 0:
+        axis += foreground.ndim
+    if foreground.ndim != 3 or axis not in (0, 1, 2):
+        raise ValueError(f"Expected a 3D mask and axis 0, 1, or 2; got {axis}")
+    if count < 1:
+        raise ValueError(f"count must be positive; got {count}")
+
+    areas = foreground.sum(axis=tuple(i for i in range(3) if i != axis))
+    available = np.flatnonzero(areas > 0)
+    if available.size == 0:
+        return [int(round(value)) for value in np.linspace(0, foreground.shape[axis] - 1, count)]
+
+    groups = np.array_split(available, min(count, available.size))
+    indices = [
+        int(group[np.argmax(areas[group])])
+        for group in groups
+        if group.size
+    ]
+    if preferred_index is not None:
+        preferred = max(0, min(int(preferred_index), foreground.shape[axis] - 1))
+        if preferred not in indices:
+            replace_at = int(np.argmin([abs(index - preferred) for index in indices]))
+            indices[replace_at] = preferred
+    indices = sorted(set(indices))
+    while len(indices) < count:
+        indices.append(indices[int(np.argmax(areas[indices]))])
+    return sorted(indices)
+
+
 def _mpr_aspects(
     spacing_zyx: tuple[float, float, float],
 ) -> tuple[float, float, float]:
@@ -173,8 +211,21 @@ def _window_ct(slice2d: np.ndarray) -> np.ndarray:
     return np.clip(out, 0, 1).astype(np.float32)
 
 
+def _open_csv_text(path: Path):
+    """Open a CSV trying UTF-8 first, then common Windows / legacy encodings."""
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "gbk", "cp1252", "latin-1"):
+        try:
+            raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return path.open(encoding=encoding, newline="")
+    return path.open(encoding="utf-8", errors="replace", newline="")
+
+
 def _row_from_log(log_path: Path, patient_id: str | None) -> dict[str, str]:
-    rows = list(csv.DictReader(log_path.open(encoding="utf-8")))
+    with _open_csv_text(log_path) as handle:
+        rows = list(csv.DictReader(handle))
     if not rows:
         raise SystemExit(f"Empty log: {log_path}")
     if patient_id:
@@ -233,7 +284,12 @@ def visualize(
     nonempty = np.where(mask.reshape(mask.shape[0], -1).sum(axis=1) > 0)[0]
     uid = (series_uid or "").strip() or _series_uid_from_row({}, image_path)
     if mpr:
-        z, y, x = _mpr_indices(mask, volume.shape, slice_index)
+        axial_indices = _mask_slice_indices(
+            mask, axis=0, count=4, preferred_index=slice_index
+        )
+        coronal_indices = _mask_slice_indices(mask, axis=1, count=2)
+        sagittal_indices = _mask_slice_indices(mask, axis=2, count=2)
+        z = axial_indices[0]
     elif slice_index is not None:
         z = int(slice_index)
     else:
@@ -249,7 +305,8 @@ def visualize(
     if mpr:
         print(
             f"mask voxels={n_vox} on {len(nonempty)}/{volume.shape[0]} slices; "
-            f"showing MPR through z/y/x={z}/{y}/{x}"
+            f"showing axial z={axial_indices}, coronal y={coronal_indices}, "
+            f"sagittal x={sagittal_indices}"
         )
     else:
         print(
@@ -259,23 +316,47 @@ def visualize(
         )
     if n_vox == 0:
         print("WARNING: mask file has zero positive voxels (true empty segmentation).")
-    elif slice_vox == 0:
+    elif not mpr and slice_vox == 0:
         print(
             "WARNING: chosen slice has no mask; pass --slice with a nonempty index."
         )
 
     if mpr:
-        figsize = {"small": (10, 8), "mid": (14, 10), "big": (18, 13)}[img_size]
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        figsize = {"small": (12, 14), "mid": (16, 18), "big": (20, 22)}[img_size]
+        fig, axes = plt.subplots(4, 2, figsize=figsize)
         axial_aspect, coronal_aspect, sagittal_aspect = _mpr_aspects(spacing_zyx)
-        mpr_views = (
-            (volume[z, :, :], mask[z, :, :], f"Axial (z={z})", axial_aspect),
-            (volume[:, y, :], mask[:, y, :], f"Coronal (y={y})", coronal_aspect),
-            (volume[:, :, x], mask[:, :, x], f"Sagittal (x={x})", sagittal_aspect),
+
+        mpr_views = [
+            (
+                axes.flat[position],
+                volume[index, :, :],
+                mask[index, :, :],
+                f"Axial (z={index})",
+                axial_aspect,
+            )
+            for position, index in enumerate(axial_indices)
+        ]
+        mpr_views.extend(
+            (
+                axes[2, position],
+                volume[:, index, :],
+                mask[:, index, :],
+                f"Coronal (y={index})",
+                coronal_aspect,
+            )
+            for position, index in enumerate(coronal_indices)
         )
-        axes[0, 0].imshow(img, cmap="gray", origin="lower", aspect=axial_aspect)
-        axes[0, 0].set_title(f"Original CT — axial (z={z})")
-        for ax, (view, view_mask, view_title, aspect) in zip(axes.flat[1:], mpr_views):
+        mpr_views.extend(
+            (
+                axes[3, position],
+                volume[:, :, index],
+                mask[:, :, index],
+                f"Sagittal (x={index})",
+                sagittal_aspect,
+            )
+            for position, index in enumerate(sagittal_indices)
+        )
+        for ax, view, view_mask, view_title, aspect in mpr_views:
             ax.imshow(_window_ct(view), cmap="gray", origin="lower", aspect=aspect)
             ax.imshow(
                 np.ma.masked_where(view_mask < 0.5, view_mask),
@@ -284,7 +365,7 @@ def visualize(
                 origin="lower",
                 aspect=aspect,
             )
-            ax.set_title(view_title)
+            ax.set_title(f"{view_title} | mask voxels={int(view_mask.sum())}")
     else:
         figsize = {"small": (8, 2.7), "mid": (12, 4), "big": (18, 6)}[img_size]
         fig, axes = plt.subplots(1, 3, figsize=figsize)
@@ -307,7 +388,8 @@ def visualize(
         fig.suptitle(
             (title or f"{image_path.name}")
             + uid_bit
-            + f"  |  MPR z/y/x={z}/{y}/{x}  |  mask_voxels={n_vox}"
+            + f"  |  MPR axial={axial_indices}, coronal={coronal_indices}, "
+            + f"sagittal={sagittal_indices}  |  mask_voxels={n_vox}"
         )
     else:
         for ax in axes:
@@ -343,7 +425,7 @@ def main() -> None:
     parser.add_argument(
         "--mpr",
         action="store_true",
-        help="Show a 4-panel figure: original axial CT plus axial, coronal, and sagittal MPR mask overlays.",
+        help="Show 8 mask overlays: four axial, two coronal, and two sagittal slices.",
     )
     parser.add_argument("--out", type=Path, default=None, help="Save PNG instead of showing")
     parser.add_argument(
