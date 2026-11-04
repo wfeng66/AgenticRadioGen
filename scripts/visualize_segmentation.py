@@ -17,9 +17,18 @@ python scripts/visualize_segmentation.py \\
 python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
   --patient-id TCGA-50-5936 --out overlay.png
 
-# Show four axial, two coronal, and two sagittal mask overlays:
+# Show 8 mask overlays in two rows of four:
 python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
   --patient-id TCGA-50-5936 --mpr --out mpr.png
+
+# Fuse a registered PET series onto the CT/MPR mask views:
+python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
+  --patient-id TCGA-50-5936 --pet-image data_cache/tcia/<PET-SeriesInstanceUID> \\
+  --mpr
+
+# Automatically look up and download a paired PET series from the CT study:
+python scripts/visualize_segmentation.py --log segm_rslt/segmentation_log.csv \\
+  --patient-id TCGA-50-5936 --mpr
 """
 
 from __future__ import annotations
@@ -27,8 +36,12 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
+import sys
 
 import numpy as np
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _resolve_path(path: Path | str) -> Path:
@@ -112,6 +125,123 @@ def _load_volume_and_spacing(
         return np.asarray(data, dtype=np.float32), spacing_zyx
     except Exception as exc:
         raise SystemExit(f"Cannot load {path}: {exc}") from exc
+
+
+def _read_sitk_image(path: Path):
+    """Read a volume and its physical geometry; identify DICOM frame of reference."""
+    import SimpleITK as sitk
+
+    frame_uid = ""
+    is_dicom_series = path.is_dir()
+    if is_dicom_series:
+        series_ids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(path)) or ()
+        if len(series_ids) != 1:
+            raise ValueError(
+                f"Expected one DICOM series in {path}, found {len(series_ids)}"
+            )
+        files = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(
+            str(path), series_ids[0]
+        )
+        if not files:
+            raise ValueError(f"No DICOM images found in {path}")
+        reader = sitk.ImageSeriesReader()
+        reader.SetFileNames(files)
+        reader.MetaDataDictionaryArrayUpdateOn()
+        image = reader.Execute()
+        try:
+            import pydicom
+
+            for file_path in files:
+                dataset = pydicom.dcmread(
+                    file_path,
+                    stop_before_pixels=True,
+                    specific_tags=["FrameOfReferenceUID"],
+                )
+                frame_uid = str(getattr(dataset, "FrameOfReferenceUID", "") or "")
+                if frame_uid:
+                    break
+        except ImportError as exc:
+            raise ImportError(
+                "pydicom is required to verify PET/CT DICOM frame alignment"
+            ) from exc
+    else:
+        image = sitk.ReadImage(str(path))
+    return image, frame_uid, is_dicom_series
+
+
+def _load_pet_in_ct_space(
+    ct_path: Path, pet_path: Path, ct_volume: np.ndarray
+) -> np.ndarray:
+    """Resample PET onto the CT physical grid, rejecting unverified DICOM frames."""
+    import SimpleITK as sitk
+
+    ct_image, ct_frame_uid, ct_is_dicom = _read_sitk_image(ct_path)
+    pet_image, pet_frame_uid, pet_is_dicom = _read_sitk_image(pet_path)
+    if ct_is_dicom and pet_is_dicom:
+        if not ct_frame_uid or not pet_frame_uid:
+            raise ValueError(
+                "Cannot align PET and CT DICOM series: FrameOfReferenceUID is "
+                "missing from one or both series"
+            )
+        if ct_frame_uid != pet_frame_uid:
+            raise ValueError(
+                "Cannot align PET and CT DICOM series with different "
+                "FrameOfReferenceUID values"
+            )
+
+    ct_sitk_volume = np.asarray(sitk.GetArrayFromImage(ct_image), dtype=np.float32)
+    if ct_sitk_volume.shape == ct_volume.shape and np.allclose(
+        ct_sitk_volume, ct_volume, rtol=0, atol=1e-4, equal_nan=True
+    ):
+        reverse_z = False
+    elif ct_sitk_volume.shape == ct_volume[::-1].shape and np.allclose(
+        ct_sitk_volume, ct_volume[::-1], rtol=0, atol=1e-4, equal_nan=True
+    ):
+        reverse_z = True
+    else:
+        raise ValueError(
+            "Cannot align PET to this CT ordering: the DICOM loader's CT array "
+            "does not match the SimpleITK physical reference grid"
+        )
+
+    aligned_pet = sitk.Resample(
+        pet_image,
+        ct_image,
+        sitk.Transform(),
+        sitk.sitkLinear,
+        0.0,
+        sitk.sitkFloat32,
+    )
+    pet_volume = np.asarray(sitk.GetArrayFromImage(aligned_pet), dtype=np.float32)
+    if reverse_z:
+        pet_volume = pet_volume[::-1]
+    if pet_volume.shape != ct_volume.shape:
+        raise ValueError(
+            f"Resampled PET shape {pet_volume.shape} does not match CT "
+            f"shape {ct_volume.shape}"
+        )
+    return pet_volume
+
+
+def _overlay_pet(ax, pet_slice: np.ndarray) -> None:
+    """Overlay non-background PET uptake in color on a CT slice."""
+    finite = pet_slice[np.isfinite(pet_slice)]
+    if finite.size == 0:
+        return
+    low, high = np.percentile(finite, [5, 99])
+    if high <= low:
+        return
+    uptake = np.ma.masked_where(
+        ~np.isfinite(pet_slice) | (pet_slice <= low), pet_slice
+    )
+    ax.imshow(
+        uptake,
+        cmap="magma",
+        alpha=0.4,
+        vmin=low,
+        vmax=high,
+        origin="lower",
+    )
 
 
 def _load_mask(path: Path, volume_shape: tuple[int, ...]) -> np.ndarray:
@@ -261,6 +391,88 @@ def _series_uid_from_row(row: dict[str, str], image_path: Path | None = None) ->
     return name
 
 
+def _dicom_series_identity(path: Path) -> tuple[str, str]:
+    """Return PatientID and StudyInstanceUID from one DICOM in a series."""
+    import pydicom
+    from pydicom.errors import InvalidDicomError
+
+    candidates = [path] if path.is_file() else path.rglob("*")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            dataset = pydicom.dcmread(
+                str(candidate),
+                stop_before_pixels=True,
+                specific_tags=["PatientID", "StudyInstanceUID"],
+            )
+        except (InvalidDicomError, OSError, EOFError, ValueError):
+            continue
+        patient_id = str(getattr(dataset, "PatientID", "") or "").strip()
+        study_uid = str(getattr(dataset, "StudyInstanceUID", "") or "").strip()
+        if patient_id or study_uid:
+            return patient_id, study_uid
+    return "", ""
+
+
+def _discover_pet_series(
+    *,
+    image_path: Path,
+    patient_id: str = "",
+    series_uid: str = "",
+) -> tuple[Path | None, str]:
+    """Find and download a PT series from the CT's study, if one is available."""
+    image_path = _resolve_path(image_path)
+    dicom_patient_id, study_uid = _dicom_series_identity(image_path)
+    patient_id = (patient_id or dicom_patient_id).strip()
+    if not patient_id:
+        return None, "PET auto-discovery needs a patient ID or a DICOM CT series"
+
+    from agentic_radiogen.data.tcia_client import TciaClient
+
+    cache_dir = next(
+        (
+            parent
+            for parent in (image_path, *image_path.parents)
+            if parent.name.lower() == "tcia"
+        ),
+        Path.cwd() / "data_cache" / "tcia",
+    )
+    tcia = TciaClient(cache_dir=cache_dir)
+    series = tcia.list_series_for_patient(patient_id)
+    if not study_uid and series_uid:
+        study_uid = next(
+            (
+                str((item.source_metadata or {}).get("StudyInstanceUID") or "").strip()
+                for item in series
+                if item.series_uid == series_uid and item.modality.upper() == "CT"
+            ),
+            "",
+        )
+    if not study_uid:
+        return None, (
+            f"could not determine StudyInstanceUID for CT series {series_uid or image_path}"
+        )
+
+    pet_series = [
+        item
+        for item in series
+        if item.modality.upper() in {"PT", "PET"}
+        and str((item.source_metadata or {}).get("StudyInstanceUID") or "").strip()
+        == study_uid
+    ]
+    if not pet_series:
+        return None, (
+            f"TCIA has no PET/PT series in CT study {study_uid} for {patient_id}"
+        )
+    pet_series.sort(key=lambda item: (-item.image_count, item.series_uid))
+    selected = pet_series[0]
+    pet_path = tcia.download_series(selected.series_uid)
+    return pet_path, (
+        f"using PET series {selected.series_uid} from CT study {study_uid}"
+    )
+
+
 def visualize(
     *,
     image_path: Path,
@@ -271,6 +483,7 @@ def visualize(
     img_size: str = "small",
     mpr: bool = False,
     series_uid: str = "",
+    pet_image_path: Path | None = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -279,6 +492,13 @@ def visualize(
     volume, spacing_zyx = _load_volume_and_spacing(image_path)
     if volume.ndim != 3:
         raise SystemExit(f"Expected 3D volume, got shape {volume.shape}")
+    pet_volume = None
+    if pet_image_path is not None:
+        pet_image_path = _resolve_path(pet_image_path)
+        try:
+            pet_volume = _load_pet_in_ct_space(image_path, pet_image_path, volume)
+        except (ImportError, ValueError, RuntimeError) as exc:
+            raise SystemExit(f"Cannot display PET with CT: {exc}") from exc
     mask = _load_mask(mask_path, volume.shape)
     n_vox = int(mask.sum())
     nonempty = np.where(mask.reshape(mask.shape[0], -1).sum(axis=1) > 0)[0]
@@ -322,42 +542,47 @@ def visualize(
         )
 
     if mpr:
-        figsize = {"small": (12, 14), "mid": (16, 18), "big": (20, 22)}[img_size]
-        fig, axes = plt.subplots(4, 2, figsize=figsize)
+        figsize = {"small": (16, 8), "mid": (20, 10), "big": (24, 12)}[img_size]
+        fig, axes = plt.subplots(2, 4, figsize=figsize, squeeze=False)
         axial_aspect, coronal_aspect, sagittal_aspect = _mpr_aspects(spacing_zyx)
 
         mpr_views = [
             (
-                axes.flat[position],
+                axes[0, position],
                 volume[index, :, :],
                 mask[index, :, :],
                 f"Axial (z={index})",
                 axial_aspect,
+                pet_volume[index, :, :] if pet_volume is not None else None,
             )
             for position, index in enumerate(axial_indices)
         ]
         mpr_views.extend(
             (
-                axes[2, position],
+                axes[1, position],
                 volume[:, index, :],
                 mask[:, index, :],
                 f"Coronal (y={index})",
                 coronal_aspect,
+                pet_volume[:, index, :] if pet_volume is not None else None,
             )
             for position, index in enumerate(coronal_indices)
         )
         mpr_views.extend(
             (
-                axes[3, position],
+                axes[1, position + len(coronal_indices)],
                 volume[:, :, index],
                 mask[:, :, index],
                 f"Sagittal (x={index})",
                 sagittal_aspect,
+                pet_volume[:, :, index] if pet_volume is not None else None,
             )
             for position, index in enumerate(sagittal_indices)
         )
-        for ax, view, view_mask, view_title, aspect in mpr_views:
+        for ax, view, view_mask, view_title, aspect, pet_view in mpr_views:
             ax.imshow(_window_ct(view), cmap="gray", origin="lower", aspect=aspect)
+            if pet_view is not None:
+                _overlay_pet(ax, pet_view)
             ax.imshow(
                 np.ma.masked_where(view_mask < 0.5, view_mask),
                 cmap="autumn",
@@ -365,7 +590,10 @@ def visualize(
                 origin="lower",
                 aspect=aspect,
             )
-            ax.set_title(f"{view_title} | mask voxels={int(view_mask.sum())}")
+            pet_label = " | PET overlay" if pet_volume is not None else ""
+            ax.set_title(
+                f"{view_title} | mask voxels={int(view_mask.sum())}{pet_label}"
+            )
     else:
         figsize = {"small": (8, 2.7), "mid": (12, 4), "big": (18, 6)}[img_size]
         fig, axes = plt.subplots(1, 3, figsize=figsize)
@@ -374,6 +602,8 @@ def visualize(
         axes[1].imshow(msk, cmap="Reds", origin="lower", vmin=0, vmax=1)
         axes[1].set_title("Mask")
         axes[2].imshow(img, cmap="gray", origin="lower")
+        if pet_volume is not None:
+            _overlay_pet(axes[2], pet_volume[z])
         axes[2].imshow(
             np.ma.masked_where(msk < 0.5, msk),
             cmap="autumn",
@@ -413,6 +643,20 @@ def visualize(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize image + segmentation mask")
     parser.add_argument("--image", type=Path, default=None, help="DICOM series dir or .nii/.npy")
+    parser.add_argument(
+        "--pet-image",
+        type=Path,
+        default=None,
+        help=(
+            "Paired PET DICOM series directory or volume; if omitted, the viewer "
+            "looks up and downloads PET/PT from the CT study."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-pet",
+        action="store_true",
+        help="Do not look up or download a paired PET series when --pet-image is omitted.",
+    )
     parser.add_argument("--mask", type=Path, default=None, help="Mask .nii.gz or .npy")
     parser.add_argument(
         "--log",
@@ -440,11 +684,13 @@ def main() -> None:
     mask_path = args.mask
     title = ""
     series_uid = ""
+    patient_id = ""
     if args.log:
         row = _row_from_log(args.log, args.patient_id)
         image_path = Path(row["image_path"])
         mask_path = Path(row["mask_path"]) if row.get("mask_path") else None
         series_uid = _series_uid_from_row(row, image_path)
+        patient_id = str(row.get("patient_id") or args.patient_id or "").strip()
         title = (
             f"{row.get('patient_id')} | {row.get('diagnosis')} | "
             f"model={row.get('segmentation_model')} | {row.get('status')}"
@@ -458,6 +704,22 @@ def main() -> None:
         raise SystemExit("Provide --image and --mask, or --log [--patient-id]")
     if not series_uid:
         series_uid = _series_uid_from_row({}, image_path)
+    pet_image_path = args.pet_image
+    if pet_image_path is None and not args.no_auto_pet:
+        try:
+            pet_image_path, pet_message = _discover_pet_series(
+                image_path=image_path,
+                patient_id=patient_id,
+                series_uid=series_uid,
+            )
+        except Exception as exc:
+            pet_message = f"PET auto-discovery failed: {type(exc).__name__}: {exc}"
+            print(f"WARNING: {pet_message}", file=sys.stderr)
+        else:
+            if pet_image_path is None:
+                print(f"WARNING: {pet_message}", file=sys.stderr)
+            else:
+                print(f"PET: {pet_message}")
 
     visualize(
         image_path=image_path,
@@ -468,6 +730,7 @@ def main() -> None:
         img_size=args.img_size,
         mpr=args.mpr,
         series_uid=series_uid,
+        pet_image_path=pet_image_path,
     )
 
 

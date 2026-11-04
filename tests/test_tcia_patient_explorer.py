@@ -9,7 +9,11 @@ import pytest
 
 from agentic_radiogen.data.gdc_client import GdcClient
 from agentic_radiogen.data.tcia_client import TciaSeries
-from scripts.explore_tcia_patient import _render_preview, explore_patient
+from scripts.explore_tcia_patient import (
+    _render_preview,
+    _selected_modalities,
+    explore_patient,
+)
 
 
 class _FakeTciaClient:
@@ -62,6 +66,20 @@ class _FakeTciaClient:
                     "Collection": "TCGA-LUAD",
                     "ImageCount": 1,
                     "FileSize": 500,
+                },
+            ),
+            TciaSeries(
+                patient_id,
+                "uid-pt",
+                "PT",
+                "TCGA-LUAD",
+                image_count=3,
+                series_description="PET/CT",
+                source_metadata={
+                    "PatientID": patient_id,
+                    "SeriesInstanceUID": "uid-pt",
+                    "StudyInstanceUID": "study-1",
+                    "Modality": "PT",
                 },
             ),
         ]
@@ -162,6 +180,73 @@ def test_explore_patient_downloads_selected_series_and_clinical_files(
     assert manifest["tcia_patient"]["n_series"] == 1
 
 
+def test_explore_patient_prefers_site_metadata_and_skips_whole_body(
+    tmp_path: Path,
+) -> None:
+    class _SiteMetadataTcia(_FakeTciaClient):
+        def list_series_for_patient(
+            self, patient_id: str, modality: str | None = None
+        ) -> list[TciaSeries]:
+            series = [
+                TciaSeries(
+                    patient_id,
+                    "uid-whole-body",
+                    "CT",
+                    "TCGA-LUAD",
+                    image_count=40,
+                    series_description="Whole Body CT",
+                    body_part_examined="WHOLEBODY",
+                    source_metadata={
+                        "SeriesInstanceUID": "uid-whole-body",
+                        "StudyInstanceUID": "study-whole-body",
+                        "Modality": "CT",
+                        "Collection": "TCGA-LUAD",
+                        "SeriesNumber": 1,
+                    },
+                ),
+                TciaSeries(
+                    patient_id,
+                    "uid-chest",
+                    "CT",
+                    "TCGA-LUAD",
+                    image_count=20,
+                    series_description="Axial CT",
+                    body_part_examined="CHEST",
+                    source_metadata={
+                        "SeriesInstanceUID": "uid-chest",
+                        "StudyInstanceUID": "study-chest",
+                        "Modality": "CT",
+                        "Collection": "TCGA-LUAD",
+                        "SeriesNumber": 2,
+                    },
+                ),
+            ]
+            if modality is None:
+                return series
+            return [item for item in series if item.modality == modality]
+
+    tcia = _SiteMetadataTcia(tmp_path / "cache")
+    result = explore_patient(
+        patient_id="TCGA-17-Z021",
+        out_dir=tmp_path / "output",
+        modalities={"CT"},
+        previews=False,
+        disease="lung cancer",
+        tcia_client=tcia,  # type: ignore[arg-type]
+        gdc_client=_FakeGdcClient(),  # type: ignore[arg-type]
+    )
+
+    assert tcia.downloaded == ["uid-chest"]
+    assert result["series_selection"]["selection_method"] == "metadata_keywords"
+    assert result["series_selection"]["selected_series_uids"] == ["uid-chest"]
+    whole_body = next(
+        row for row in result["series"] if row["series_uid"] == "uid-whole-body"
+    )
+    assert whole_body["selected"] is False
+    assert whole_body["disease_evidence"]["whole_body_indication"] is True
+    assert whole_body["disease_evidence"]["metadata_indicates_match"] is False
+
+
 def test_metadata_only_does_not_download_images_or_clinical_files(
     tmp_path: Path,
 ) -> None:
@@ -189,11 +274,30 @@ def test_metadata_only_does_not_download_images_or_clinical_files(
     assert "metadata-only mode" in series_log
 
 
-def test_series_log_reports_organ_gate_when_metadata_empty(
+def test_pet_modality_is_included_by_default_and_pet_alias_maps_to_pt() -> None:
+    assert _selected_modalities(None, all_modalities=False) == {"CT", "PT"}
+    assert _selected_modalities(["CT", "PET"], all_modalities=False) == {"CT", "PT"}
+    assert _selected_modalities(None, all_modalities=True) is None
+
+
+def test_explore_patient_can_download_pet_and_ct_series(tmp_path: Path) -> None:
+    tcia = _FakeTciaClient(tmp_path / "cache")
+    result = explore_patient(
+        patient_id="TCGA-17-Z021",
+        out_dir=tmp_path / "output",
+        modalities={"CT", "PT"},
+        previews=False,
+        tcia_client=tcia,  # type: ignore[arg-type]
+        gdc_client=_FakeGdcClient(),  # type: ignore[arg-type]
+    )
+
+    assert tcia.downloaded == ["uid-ct", "uid-pt"]
+    assert {row["modality"] for row in result["series"]} == {"CT", "PT"}
+
+
+def test_series_log_ranks_and_reuses_organ_proportions_when_metadata_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from agentic_radiogen.imaging.organ_verify import OrganVerifyResult
-
     class _BlankMetaTcia(_FakeTciaClient):
         def list_series_for_patient(
             self, patient_id: str, modality: str | None = None
@@ -216,26 +320,58 @@ def test_series_log_reports_organ_gate_when_metadata_empty(
                         "ImageCount": 2,
                         "SeriesNumber": 7,
                     },
-                )
+                ),
+                TciaSeries(
+                    patient_id,
+                    "uid-ct-largest-lung",
+                    "CT",
+                    "OTHER",
+                    image_count=3,
+                    source_metadata={
+                        "PatientID": patient_id,
+                        "SeriesInstanceUID": "uid-ct-largest-lung",
+                        "StudyInstanceUID": "study-2",
+                        "Modality": "CT",
+                        "Collection": "OTHER",
+                        "ImageCount": 3,
+                        "SeriesNumber": 8,
+                    },
+                ),
             ]
             if modality is None:
                 return series
             return [item for item in series if item.modality == modality]
 
     tcia = _BlankMetaTcia(tmp_path / "cache")
+    verify_calls: list[str] = []
 
-    def fake_verify(series_dir, *, organ_keywords, min_voxels=1000):
-        return OrganVerifyResult(
-            ok=True,
-            organ_keywords=tuple(organ_keywords),
-            n_organ_voxels=5000,
-            volume_voxels=10000,
-            reason="organ ['lung'] voxels=5000",
-        )
+    def fake_verify(series_dir, *, disease, collection):
+        uid = Path(series_dir).name
+        verify_calls.append(uid)
+        voxels = 8000 if uid == "uid-ct-largest-lung" else 2000
+        return {
+            "ran": True,
+            "ok": True,
+            "organ_keywords": ["lung"],
+            "n_organ_voxels": voxels,
+            "volume_voxels": 10000,
+            "reason": f"organ ['lung'] voxels={voxels}",
+        }
 
     monkeypatch.setattr(
-        "agentic_radiogen.imaging.organ_verify.verify_expected_organ",
+        "scripts.explore_tcia_patient._verify_series_organ",
         fake_verify,
+    )
+    monkeypatch.setattr(
+        "scripts.explore_tcia_patient._dicom_instances",
+        lambda series_dir: [Path(series_dir) / "1.dcm", Path(series_dir) / "2.dcm"],
+    )
+    monkeypatch.setattr(
+        "scripts.explore_tcia_patient._all_metadata_row",
+        lambda series, **kwargs: {
+            "tcia.series_uid": series.series_uid,
+            "exploration.status": kwargs.get("status", ""),
+        },
     )
 
     out_dir = tmp_path / "output"
@@ -249,12 +385,42 @@ def test_series_log_reports_organ_gate_when_metadata_empty(
         tcia_client=tcia,  # type: ignore[arg-type]
         gdc_client=_FakeGdcClient(),  # type: ignore[arg-type]
     )
-    assert result["series"][0]["disease_evidence"]["metadata_indicates_match"] is False
+    assert tcia.downloaded == ["uid-ct", "uid-ct-largest-lung"]
+    assert verify_calls == ["uid-ct", "uid-ct-largest-lung"]
+    assert result["series_selection"]["selection_method"] == "organ_proportion"
+    assert result["series_selection"]["selected_series_uids"] == [
+        "uid-ct-largest-lung"
+    ]
+    assert (tcia.cache_dir / "uid-ct").exists() is False
+    assert (tcia.cache_dir / "uid-ct-largest-lung").exists()
     series_log = (out_dir / "series.log").read_text(encoding="utf-8")
     assert "metadata_indicates_disease_match: False" in series_log
     assert "organ_gate PASS" in series_log
-    assert "no original metadata matched disease keywords" in series_log
-    assert "downloaded_series_numbers: 7" in series_log
+    assert "organ_proportion: 0.80000000" in series_log
+    assert "downloaded_series_numbers: 8" in series_log
+    selection_log = json.loads(
+        Path(result["series_selection"]["series_selection_log"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert selection_log["selected_series_uid"] == "uid-ct-largest-lung"
+    assert [
+        row["organ_proportion"] for row in selection_log["series"]
+    ] == [0.2, 0.8]
+
+    reused = explore_patient(
+        patient_id="TCGA-17-Z021",
+        out_dir=tmp_path / "output-reused",
+        modalities={"CT"},
+        previews=False,
+        disease="lung cancer",
+        verify_organ=True,
+        tcia_client=tcia,  # type: ignore[arg-type]
+        gdc_client=_FakeGdcClient(),  # type: ignore[arg-type]
+    )
+    assert reused["series_selection"]["selection_method"] == "organ_proportion_cached"
+    assert verify_calls == ["uid-ct", "uid-ct-largest-lung"]
+    assert tcia.downloaded == ["uid-ct", "uid-ct-largest-lung"]
 
 
 def test_gdc_patient_case_and_clinical_file_methods() -> None:

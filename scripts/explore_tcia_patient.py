@@ -9,9 +9,8 @@ Writes under ``--out-dir/metadata``:
   getSeriesMetaData / getSeriesSize field
 - ``tcia_studies.csv`` — one row per study
 - ``tcia_all_metadata.csv`` — one row per DICOM instance (headers + TCIA fields)
-- ``series.log`` — patient id, downloaded series count, per-series disease-keyword
-  metadata evidence (original field values), and organ-gate verification when
-  metadata does not indicate a disease match
+- ``series.log`` — per-series site-keyword evidence, selection decisions, and
+  organ proportions when metadata cannot identify a multi-slice CT
 
 Examples
 --------
@@ -27,12 +26,16 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agentic_radiogen.data.disease_match import (
     expected_organ_keywords,
@@ -47,8 +50,10 @@ _SERIES_MATCH_FIELDS: tuple[tuple[str, str], ...] = (
     ("ProtocolName", "protocol_name"),
     ("StudyDescription", "study_description"),
     ("BodyPartExamined", "body_part_examined"),
-    ("Collection", "collection"),
-    ("Modality", "modality"),
+)
+_WHOLE_BODY_RE = re.compile(
+    r"\bwhole[\s-]*body\b|\bwholebody\b|\bvertex\s+to\s+(?:thighs|feet)\b",
+    re.IGNORECASE,
 )
 
 
@@ -61,6 +66,22 @@ def _json_write(path: Path, value: Any) -> None:
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "unnamed"
+
+
+def _selected_modalities(
+    values: list[str] | None, *, all_modalities: bool
+) -> set[str] | None:
+    if all_modalities:
+        return None
+    requested = values or ["CT", "PT"]
+    modalities = {
+        "PT" if value.strip().upper() == "PET" else value.strip().upper()
+        for value in requested
+        if value.strip()
+    }
+    if not modalities:
+        raise ValueError("At least one non-empty modality must be selected")
+    return modalities
 
 
 def _cell(value: Any) -> Any:
@@ -552,7 +573,9 @@ _SITE_ALIAS_BY_ORGAN: dict[str, tuple[str, ...]] = {
 def _site_evidence_keywords(disease: str) -> list[str]:
     """Keywords used to judge whether series metadata matches the disease/site."""
     organs = expected_organ_keywords(disease)
-    merged: list[str] = list(organs) + list(keywords_from_query(disease))
+    merged: list[str] = list(organs)
+    if not organs:
+        merged.extend(keywords_from_query(disease))
     for organ in organs:
         merged.extend(_SITE_ALIAS_BY_ORGAN.get(organ, ()))
     seen: set[str] = set()
@@ -591,9 +614,12 @@ def _series_disease_evidence(
     source = dict(series.source_metadata or {})
     matches: list[dict[str, Any]] = []
     inspected: list[dict[str, Any]] = []
+    whole_body_fields: list[str] = []
     for api_key, attr in _SERIES_MATCH_FIELDS:
         value = str(getattr(series, attr, "") or source.get(api_key) or "").strip()
         inspected.append({"field": api_key, "value": value or "(empty)"})
+        if _WHOLE_BODY_RE.search(value):
+            whole_body_fields.append(api_key)
         hits = _field_keyword_hits(api_key, value, keywords)
         if hits:
             matches.append(
@@ -603,14 +629,18 @@ def _series_disease_evidence(
                     "matched_keywords": hits,
                 }
             )
-    # Also scan any other non-empty string fields on getSeries that were not listed.
-    covered = {api for api, _ in _SERIES_MATCH_FIELDS}
+    # Scan additional anatomical-region fields without treating cohort/modality
+    # labels as evidence that the image volume covers the disease site.
     for key, raw in source.items():
-        if key in covered or not isinstance(raw, (str, int, float)):
+        if not re.search(
+            r"(?:anatom|body.?part|region.?examined)", str(key), re.IGNORECASE
+        ) or not isinstance(raw, (str, int, float)):
             continue
         value = str(raw).strip()
         if not value:
             continue
+        if _WHOLE_BODY_RE.search(value):
+            whole_body_fields.append(str(key))
         hits = _field_keyword_hits(str(key), value, keywords)
         if hits:
             matches.append(
@@ -621,10 +651,258 @@ def _series_disease_evidence(
                 }
             )
     return {
-        "metadata_indicates_match": bool(matches),
+        "metadata_indicates_match": bool(matches) and not whole_body_fields,
         "matching_fields": matches,
         "inspected_fields": inspected,
+        "whole_body_indication": bool(whole_body_fields),
+        "whole_body_fields": whole_body_fields,
         "site_text": series.site_text or "",
+    }
+
+
+def _has_multiple_slices(series: TciaSeries) -> bool:
+    try:
+        return int(series.image_count or 0) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _series_study_uid(series: TciaSeries) -> str:
+    return str((series.source_metadata or {}).get("StudyInstanceUID") or "").strip()
+
+
+def _selection_log_path(
+    cache_dir: Path, patient_id: str, expected_organs: tuple[str, ...], disease: str
+) -> Path:
+    site_key = "_".join(expected_organs) or "_".join(_site_evidence_keywords(disease))
+    return (
+        cache_dir
+        / "selection_logs"
+        / f"{_safe_name(patient_id)}_{_safe_name(site_key or 'unknown_site')}.json"
+    )
+
+
+def _read_selection_log(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"WARNING: could not read series-selection log {path}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _remove_cached_series(series_dir: Path, cache_dir: Path) -> bool:
+    cache_root = cache_dir.resolve()
+    target = series_dir.resolve()
+    if target.parent != cache_root or target == cache_root or series_dir.is_symlink():
+        raise ValueError(f"Refusing to remove a series outside the TCIA cache: {series_dir}")
+    if target.exists():
+        shutil.rmtree(target)
+        return True
+    return False
+
+
+def _select_series(
+    *,
+    patient_id: str,
+    series: list[TciaSeries],
+    evidence_by_uid: dict[str, dict[str, Any]],
+    disease: str,
+    expected_organs: tuple[str, ...],
+    cache_dir: Path,
+    tcia: TciaClient,
+    download: bool,
+    verify_organ: bool,
+) -> dict[str, Any]:
+    """Choose site-matched series, falling back to the highest organ fraction."""
+    metadata_matches = {
+        item.series_uid
+        for item in series
+        if evidence_by_uid[item.series_uid]["metadata_indicates_match"]
+        and _has_multiple_slices(item)
+    }
+    ct_series = [item for item in series if item.modality.upper() == "CT"]
+    ct_metadata_matches = metadata_matches.intersection(
+        item.series_uid for item in ct_series
+    )
+    selected = set(metadata_matches)
+    selected_ct = set(ct_metadata_matches)
+    fallback_candidates: list[dict[str, Any]] = []
+    selection_method = "metadata_keywords" if metadata_matches else "no_site_match"
+    fallback_info: dict[str, Any] = {}
+    log_path = _selection_log_path(cache_dir, patient_id, expected_organs, disease)
+
+    if (
+        not ct_metadata_matches
+        and ct_series
+        and download
+        and verify_organ
+        and expected_organs
+    ):
+        candidate_uids = sorted(item.series_uid for item in ct_series)
+        previous = _read_selection_log(log_path)
+        previous_rows = previous.get("series") if previous else None
+        reusable = (
+            previous is not None
+            and previous.get("schema_version") == 1
+            and previous.get("selection_method") == "organ_proportion"
+            and previous.get("patient_id") == patient_id
+            and previous.get("expected_organs") == list(expected_organs)
+            and previous.get("candidate_series_uids") == candidate_uids
+            and previous.get("selected_series_uid") in candidate_uids
+            and isinstance(previous_rows, list)
+            and all(isinstance(row, dict) for row in previous_rows)
+        )
+        if reusable and previous is not None and isinstance(previous_rows, list):
+            fallback_candidates = list(previous_rows)
+            selected_ct = {str(previous["selected_series_uid"])}
+            selection_method = "organ_proportion_cached"
+            fallback_info = {
+                "reused_log": True,
+                "selected_series_uid": next(iter(selected_ct)),
+                "series": fallback_candidates,
+            }
+        else:
+            for item in ct_series:
+                details: dict[str, Any] = {
+                    "series_uid": item.series_uid,
+                    "image_count": item.image_count,
+                    "status": "not_scored",
+                    "organ_voxels": None,
+                    "volume_voxels": None,
+                    "organ_proportion": None,
+                }
+                try:
+                    series_dir = tcia.download_series(item.series_uid)
+                    instance_count = len(_dicom_instances(series_dir))
+                    details.update(
+                        {
+                            "actual_image_count": instance_count,
+                            "download_dir": str(series_dir.resolve()),
+                        }
+                    )
+                    if instance_count < 2:
+                        details["status"] = "not_multislice"
+                    else:
+                        result = _verify_series_organ(
+                            series_dir,
+                            disease=disease,
+                            collection=item.collection,
+                        )
+                        verification_error = result.get("error")
+                        organ_voxels = result.get("n_organ_voxels")
+                        volume_voxels = result.get("volume_voxels")
+                        if verification_error:
+                            details["status"] = "error"
+                        elif volume_voxels:
+                            details["status"] = "scored"
+                        else:
+                            details["status"] = "verification_failed"
+                        details.update(
+                            {
+                                "organ_voxels": organ_voxels,
+                                "volume_voxels": volume_voxels,
+                                "organ_proportion": (
+                                    organ_voxels / volume_voxels
+                                    if (
+                                        not verification_error
+                                        and volume_voxels
+                                        and organ_voxels is not None
+                                    )
+                                    else None
+                                ),
+                                "verification_ok": result.get("ok"),
+                                "verification_reason": result.get("reason"),
+                                "error": verification_error or "",
+                            }
+                        )
+                except Exception as exc:
+                    details.update(
+                        {
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                fallback_candidates.append(details)
+
+            scored = [
+                row
+                for row in fallback_candidates
+                if row.get("organ_proportion") is not None
+                and float(row["organ_proportion"]) > 0
+            ]
+            selected_uid = (
+                max(
+                    scored,
+                    key=lambda row: (
+                        float(row["organ_proportion"]),
+                        int(row.get("organ_voxels") or 0),
+                        int(row.get("actual_image_count") or 0),
+                    ),
+                )["series_uid"]
+                if scored
+                else None
+            )
+            if selected_uid:
+                selected_ct = {str(selected_uid)}
+                selection_method = "organ_proportion"
+                for row in fallback_candidates:
+                    row["selected"] = row.get("series_uid") == selected_uid
+            else:
+                selection_method = "organ_proportion_no_positive_score"
+
+            fallback_info = {
+                "reused_log": False,
+                "selected_series_uid": selected_uid,
+                "series": fallback_candidates,
+            }
+            log_selection_method = (
+                "organ_proportion"
+                if selected_uid
+                else "organ_proportion_no_positive_score"
+            )
+            _json_write(
+                log_path,
+                {
+                    "schema_version": 1,
+                    "patient_id": patient_id,
+                    "disease_question": disease,
+                    "expected_organs": list(expected_organs),
+                    "selection_method": log_selection_method,
+                    "candidate_series_uids": candidate_uids,
+                    "selected_series_uid": selected_uid,
+                    "series": fallback_candidates,
+                },
+            )
+
+    selected.update(selected_ct)
+    selected_studies = {
+        _series_study_uid(item)
+        for item in series
+        if item.series_uid in selected_ct and _series_study_uid(item)
+    }
+    # Keep non-CT series only when site metadata matches or they share a study
+    # with a selected CT, so PET can remain paired without accepting whole-body CT.
+    for item in series:
+        if item.modality.upper() == "CT":
+            continue
+        if item.series_uid in metadata_matches or (
+            _series_study_uid(item) and _series_study_uid(item) in selected_studies
+        ):
+            selected.add(item.series_uid)
+
+    return {
+        "selected_series_uids": sorted(selected),
+        "selection_method": selection_method,
+        "series_selection_log": str(log_path.resolve()) if fallback_info else "",
+        "fallback": fallback_info,
+        "fallback_candidates": fallback_candidates,
+        "fallback_cache_cleanup": bool(fallback_info and fallback_info.get("selected_series_uid")),
     }
 
 
@@ -655,6 +933,11 @@ def _verify_series_organ(
         "n_organ_voxels": result.n_organ_voxels,
         "volume_voxels": result.volume_voxels,
         "reason": result.reason,
+        "error": (
+            result.reason
+            if result.reason.startswith("organ segmentation failed:")
+            else ""
+        ),
     }
 
 
@@ -665,6 +948,7 @@ def _format_series_log(
     keywords: list[str],
     expected_organs: tuple[str, ...],
     entries: list[dict[str, Any]],
+    selection: dict[str, Any],
 ) -> str:
     downloaded = [e for e in entries if e.get("status") == "downloaded"]
     lines: list[str] = [
@@ -672,6 +956,10 @@ def _format_series_log(
         f"disease_question: {disease}",
         f"disease_keywords: {', '.join(keywords) if keywords else '(none)'}",
         f"expected_organs: {', '.join(expected_organs) if expected_organs else '(none)'}",
+        f"selection_method: {selection.get('selection_method', '')}",
+        f"selected_series_uids: "
+        f"{', '.join(selection.get('selected_series_uids') or []) or '(none)'}",
+        f"selection_log: {selection.get('series_selection_log', '')}",
         f"series_listed: {len(entries)}",
         f"downloaded_series_count: {len(downloaded)}",
         f"downloaded_series_numbers: "
@@ -685,6 +973,15 @@ def _format_series_log(
         ),
         "",
     ]
+    fallback = selection.get("fallback") or {}
+    fallback_rows = fallback.get("series") or []
+    removed = [row for row in fallback_rows if row.get("removed_from_cache")]
+    if fallback_rows:
+        lines.append(
+            "fallback_cache_cleanup_removed_series: "
+            f"{', '.join(str(row.get('series_uid')) for row in removed) or '(none)'}"
+        )
+        lines.append("")
     for index, entry in enumerate(entries, start=1):
         lines.append(f"--- series {index}/{len(entries)} ---")
         lines.append(f"patient_id: {patient_id}")
@@ -694,6 +991,9 @@ def _format_series_log(
         lines.append(f"collection: {entry.get('collection', '')}")
         lines.append(f"image_count: {entry.get('image_count', '')}")
         lines.append(f"status: {entry.get('status', '')}")
+        lines.append(f"selected: {bool(entry.get('selected'))}")
+        if entry.get("selection_reason"):
+            lines.append(f"selection_reason: {entry['selection_reason']}")
         if entry.get("download_dir"):
             lines.append(f"download_dir: {entry['download_dir']}")
         if entry.get("error"):
@@ -703,6 +1003,11 @@ def _format_series_log(
             "metadata_indicates_disease_match: "
             f"{bool(evidence.get('metadata_indicates_match'))}"
         )
+        if evidence.get("whole_body_indication"):
+            lines.append(
+                "whole_body_indication: excluded from site-matched selection "
+                f"using fields={evidence.get('whole_body_fields')}"
+            )
         lines.append("matching_original_fields:")
         matches = list(evidence.get("matching_fields") or [])
         if matches:
@@ -714,13 +1019,18 @@ def _format_series_log(
                 )
         else:
             lines.append(
-                "  - (none) no SeriesDescription/ProtocolName/StudyDescription/"
-                "BodyPartExamined/Collection text matched the disease keywords"
+                "  - no eligible body-site metadata matched; cohort and modality "
+                "labels are not used as body-site evidence"
             )
             lines.append("inspected_original_fields:")
             for field in evidence.get("inspected_fields") or []:
                 lines.append(f"  - {field.get('field')}={field.get('value')!r}")
         verification = entry.get("verification") or {}
+        if verification.get("organ_proportion") is not None:
+            lines.append(
+                "organ_proportion: "
+                f"{float(verification['organ_proportion']):.8f}"
+            )
         lines.append("verification:")
         if entry.get("status") == "metadata_only":
             lines.append(
@@ -875,6 +1185,30 @@ def explore_patient(
         series_rows, studies_api, out_dir, patient_id=patient_id
     )
 
+    evidence_by_uid = {
+        item.series_uid: _series_disease_evidence(item, keywords=disease_keywords)
+        for item in series
+    }
+    tcia_cache_dir = Path(
+        getattr(tcia, "cache_dir", out_dir / "tcia_cache")
+    )
+    selection = _select_series(
+        patient_id=patient_id,
+        series=series,
+        evidence_by_uid=evidence_by_uid,
+        disease=disease_query,
+        expected_organs=expected_organs,
+        cache_dir=tcia_cache_dir,
+        tcia=tcia,
+        download=download,
+        verify_organ=verify_organ,
+    )
+    selected_series_uids = set(selection["selected_series_uids"])
+    fallback_by_uid = {
+        str(row.get("series_uid")): row
+        for row in selection.get("fallback_candidates", [])
+    }
+
     case = gdc.get_case_details(patient_id)
     _json_write(out_dir / "metadata" / "gdc_case.json", case)
     clinical_files = gdc.list_clinical_files(patient_id)
@@ -885,6 +1219,7 @@ def explore_patient(
         "disease_question": disease_query,
         "disease_keywords": disease_keywords,
         "expected_organs": list(expected_organs),
+        "series_selection": selection,
         "selected_modalities": sorted(modalities) if modalities is not None else "all",
         "downloaded": download,
         "gdc_case_found": case is not None,
@@ -909,8 +1244,24 @@ def explore_patient(
     series_log_entries: list[dict[str, Any]] = []
     for index, item in enumerate(series, start=1):
         record: dict[str, Any] = _series_metadata(item)
-        evidence = _series_disease_evidence(item, keywords=disease_keywords)
+        evidence = evidence_by_uid[item.series_uid]
         record["disease_evidence"] = evidence
+        record["selected"] = item.series_uid in selected_series_uids
+        record["selection_method"] = selection["selection_method"]
+        if record["selected"]:
+            fallback_row = fallback_by_uid.get(item.series_uid)
+            if fallback_row and fallback_row.get("selected"):
+                record["selection_reason"] = (
+                    "highest disease-organ voxel proportion among CT candidates"
+                )
+            elif evidence["metadata_indicates_match"]:
+                record["selection_reason"] = (
+                    "anatomical metadata matched disease-site keywords"
+                )
+            else:
+                record["selection_reason"] = (
+                    "same study as the selected CT series"
+                )
         record["status"] = "metadata_only" if not download else "pending"
         series_dir: Path | None = None
         verification: dict[str, Any] = {
@@ -918,9 +1269,57 @@ def explore_patient(
             "ok": None,
             "reason": "verification not run yet",
         }
-        if download:
+        if download and item.series_uid not in selected_series_uids:
+            fallback_row = fallback_by_uid.get(item.series_uid)
+            record["status"] = "not_selected"
+            record["selection_reason"] = (
+                "organ-proportion fallback selected a different series"
+                if fallback_row
+                else "no disease-site metadata match or selected CT study companion"
+            )
+            if fallback_row:
+                record["actual_image_count"] = fallback_row.get("actual_image_count")
+                record["download_dir"] = fallback_row.get("download_dir", "")
+                verification = {
+                    "ran": fallback_row.get("status") in {
+                        "scored",
+                        "verification_failed",
+                    },
+                    "ok": fallback_row.get("verification_ok"),
+                    "reason": fallback_row.get("verification_reason")
+                    or fallback_row.get("error")
+                    or fallback_row.get("status"),
+                    "n_organ_voxels": fallback_row.get("organ_voxels"),
+                    "volume_voxels": fallback_row.get("volume_voxels"),
+                    "organ_proportion": fallback_row.get("organ_proportion"),
+                }
+                if fallback_row.get("error"):
+                    summary["errors"].append(
+                        f"Series {item.series_uid}: {fallback_row['error']}"
+                    )
+                if fallback_row.get("download_dir"):
+                    series_dir = Path(fallback_row["download_dir"])
+                    if series_dir.is_dir():
+                        all_metadata_rows.extend(
+                            _all_metadata_row(
+                                item,
+                                dicom_path=instance,
+                                download_dir=series_dir,
+                                status="scored_not_selected",
+                            )
+                            for instance in _dicom_instances(series_dir)
+                        )
+        elif download:
             try:
-                series_dir = tcia.download_series(item.series_uid)
+                fallback_row = fallback_by_uid.get(item.series_uid)
+                cached_path = Path(fallback_row["download_dir"]) if (
+                    fallback_row and fallback_row.get("download_dir")
+                ) else None
+                series_dir = (
+                    cached_path
+                    if cached_path is not None and cached_path.is_dir()
+                    else tcia.download_series(item.series_uid)
+                )
                 instances = _dicom_instances(series_dir)
                 actual_count = len(instances)
                 record.update(
@@ -954,23 +1353,20 @@ def explore_patient(
                     f"[{index}/{len(series)}] {item.modality} {item.series_uid}: "
                     f"{actual_count}/{item.image_count or '?'} DICOM instances"
                 )
-                # If original metadata does not indicate disease/site, run organ gate.
-                if verify_organ and not evidence["metadata_indicates_match"]:
-                    try:
-                        verification = _verify_series_organ(
-                            series_dir,
-                            disease=disease_query,
-                            collection=item.collection,
-                        )
-                    except Exception as exc:
-                        verification = {
-                            "ran": True,
-                            "ok": False,
-                            "reason": (
-                                f"organ verification error: "
-                                f"{type(exc).__name__}: {exc}"
-                            ),
-                        }
+                fallback_row = fallback_by_uid.get(item.series_uid)
+                if fallback_row:
+                    verification = {
+                        "ran": fallback_row.get("status") in {
+                            "scored",
+                            "verification_failed",
+                        },
+                        "ok": fallback_row.get("verification_ok"),
+                        "reason": fallback_row.get("verification_reason")
+                        or fallback_row.get("status"),
+                        "n_organ_voxels": fallback_row.get("organ_voxels"),
+                        "volume_voxels": fallback_row.get("volume_voxels"),
+                        "organ_proportion": fallback_row.get("organ_proportion"),
+                    }
                 elif evidence["metadata_indicates_match"]:
                     verification = {
                         "ran": False,
@@ -980,11 +1376,29 @@ def explore_patient(
                             "organ gate not required for site indication"
                         ),
                     }
+                elif item.modality.upper() != "CT":
+                    verification = {
+                        "ran": False,
+                        "ok": None,
+                        "reason": (
+                            f"organ verification is CT-only; skipped for "
+                            f"modality={item.modality}"
+                        ),
+                    }
+                elif item.modality.upper() != "CT":
+                    verification = {
+                        "ran": False,
+                        "ok": None,
+                        "reason": (
+                            "organ verification is CT-only; skipped for "
+                            f"modality={item.modality}"
+                        ),
+                    }
                 else:
                     verification = {
                         "ran": False,
                         "ok": None,
-                        "reason": "organ verification disabled (--no-verify-organ)",
+                        "reason": selection["selection_method"],
                     }
                 if previews:
                     preview_path = (
@@ -1047,6 +1461,8 @@ def explore_patient(
             "status": record["status"],
             "download_dir": record.get("download_dir", ""),
             "error": record.get("error", ""),
+            "selected": record["selected"],
+            "selection_reason": record.get("selection_reason", ""),
             "disease_evidence": evidence,
             "verification": verification,
         }
@@ -1055,6 +1471,44 @@ def explore_patient(
         summary["series_log_entries"] = series_log_entries
         _json_write(out_dir / "manifest.json", summary)
 
+    if selection.get("fallback_cache_cleanup"):
+        selected_uid = selection["fallback"].get("selected_series_uid")
+        for row in selection.get("fallback_candidates", []):
+            if row.get("series_uid") == selected_uid:
+                continue
+            series_path = Path(
+                row.get("download_dir") or tcia_cache_dir / str(row["series_uid"])
+            )
+            try:
+                row["removed_from_cache"] = _remove_cached_series(
+                    series_path, tcia_cache_dir
+                )
+            except (OSError, ValueError) as exc:
+                row["removed_from_cache"] = False
+                row["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+                summary["errors"].append(
+                    f"Could not remove unselected series {row['series_uid']} "
+                    f"from TCIA cache: {exc}"
+                )
+        selection["fallback"]["series"] = selection["fallback_candidates"]
+        _json_write(
+            Path(selection["series_selection_log"]),
+            {
+                "schema_version": 1,
+                "patient_id": patient_id,
+                "disease_question": disease_query,
+                "expected_organs": list(expected_organs),
+                "selection_method": "organ_proportion",
+                "candidate_series_uids": sorted(
+                    item.series_uid
+                    for item in series
+                    if item.modality.upper() == "CT"
+                ),
+                "selected_series_uid": selected_uid,
+                "series": selection["fallback_candidates"],
+            },
+        )
+
     _write_all_metadata_csv(all_metadata_rows, out_dir)
     series_log_text = _format_series_log(
         patient_id=patient_id,
@@ -1062,6 +1516,7 @@ def explore_patient(
         keywords=disease_keywords,
         expected_organs=expected_organs,
         entries=series_log_entries,
+        selection=selection,
     )
     _write_series_log(out_dir / "series.log", series_log_text)
     summary["series_log_path"] = str((out_dir / "series.log").resolve())
@@ -1118,7 +1573,10 @@ def main() -> None:
         "--modality",
         action="append",
         default=None,
-        help="Modality to include; repeat to select multiple (default: CT)",
+        help=(
+            "Modality to include; repeat to select multiple. PET is requested as "
+            "DICOM modality PT (default: CT and PT)."
+        ),
     )
     parser.add_argument(
         "--all-modalities",
@@ -1138,8 +1596,8 @@ def main() -> None:
     parser.add_argument(
         "--disease",
         default="lung cancer",
-        help="Disease/question text used to judge series-site match "
-        "(default: lung cancer). Keywords are derived for series.log.",
+        help="Disease/question used for anatomical series selection "
+        "(default: lung cancer).",
     )
     parser.add_argument(
         "--no-verify-organ",
@@ -1151,11 +1609,12 @@ def main() -> None:
     if args.all_modalities and args.modality:
         parser.error("--all-modalities cannot be combined with --modality")
 
-    modalities = (
-        None
-        if args.all_modalities
-        else {value.upper() for value in (args.modality or ["CT"])}
-    )
+    try:
+        modalities = _selected_modalities(
+            args.modality, all_modalities=args.all_modalities
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     out_dir = args.out_dir or (
         Path("outputs") / "tcia_patient" / _safe_name(args.patient_id)
     )
@@ -1180,11 +1639,14 @@ def main() -> None:
     )
     failures = len(result["errors"])
     print(
-        f"Finished: {len(result['series'])} series, "
+        f"Finished: {len(result['series'])} listed series, "
+        f"{len(result['series_selection']['selected_series_uids'])} selected, "
         f"{len(result['clinical_file_downloads'])} clinical files downloaded, "
         f"{failures} error(s). Output: {out_dir.resolve()}"
     )
     print(f"Series log: {(out_dir / 'series.log').resolve()}")
+    if result["series_selection"].get("series_selection_log"):
+        print(f"Reusable selection log: {result['series_selection']['series_selection_log']}")
     if failures:
         raise SystemExit(1)
 

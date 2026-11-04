@@ -74,11 +74,19 @@ environment variables can still override the default location.
 
 ## Explore one TCIA patient
 
-The patient exploration script inventories TCIA series, downloads CT DICOM
-series into `data_cache/tcia/`, retrieves the public GDC case and clinical-file
-metadata, downloads available GDC clinical files, and writes per-series PNG
-previews plus an overview contact sheet. It defaults to CT; use
-`--all-modalities` to include every modality returned by TCIA.
+The patient exploration script inventories TCIA series, downloads CT and PET
+DICOM series into `data_cache/tcia/` by default (PET is usually DICOM modality
+`PT`), retrieves the public GDC case and clinical-file metadata, downloads
+available GDC clinical files, and writes per-series PNG previews plus an
+overview contact sheet. Use `--all-modalities` to include every modality
+returned by TCIA, or repeated `--modality` options to choose modalities.
+Series are filtered using anatomical metadata (for example `CHEST`, `LUNG`, or
+`THORAX` for lung cancer); cohort names and modality labels alone do not count,
+and explicit whole-body series are excluded. If no multi-slice CT matches the
+site metadata, the explorer downloads CT candidates, ranks them by the fraction
+of voxels occupied by the expected organ, and keeps the highest-scoring CT.
+Other requested modalities are kept only when their metadata matches or they
+belong to the selected CT's study.
 
 ```bash
 pip install -e ".[visualization]"
@@ -90,8 +98,34 @@ By default, metadata and previews are written to
 record series UIDs, source metadata, download locations, expected versus
 observed DICOM instance counts, preview paths, and any failures. Use
 `--metadata-only` to skip image and clinical-file downloads, `--no-previews` to
-skip PNG generation, `--modality MR --modality CT` to select modalities, or
+skip PNG generation, `--modality CT --modality PT` to select modalities, or
 `--cache-dir PATH` to override the DICOM cache location.
+The fallback scores are saved in
+`data_cache/tcia/selection_logs/<patient>_<site>.json` and reused when the
+patient, disease site, and candidate CT series are unchanged. During an organ
+proportion fallback, unselected CT candidate folders are removed from the
+TCIA cache; the selected series and the complete comparison scores remain.
+
+When launched from a segmentation log, the visualizer automatically looks up
+the PET/PT series from the same TCIA study as the CT, downloads it into
+`data_cache/tcia/` if needed, and overlays PET uptake on the CT and mask views.
+MPR displays eight panels in two rows of four (four axial views, followed by
+two coronal and two sagittal views).
+To choose a different PET volume explicitly:
+
+```bash
+python scripts/visualize_segmentation.py \
+  --log segm_rslt/segmentation_log.csv \
+  --patient-id TCGA-17-Z021 \
+  --pet-image data_cache/tcia/<PET-SeriesInstanceUID> \
+  --mpr
+```
+
+For two DICOM series, the viewer verifies their `FrameOfReferenceUID` and
+resamples PET onto the CT physical grid before overlaying. It refuses to fuse
+DICOM series with missing or different frame identifiers. Use `--no-auto-pet`
+to skip lookup/download and view CT only. If TCIA has no PT series for the CT
+study, the viewer reports that and continues with CT.
 
 ---
 
