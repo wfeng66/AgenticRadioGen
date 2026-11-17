@@ -58,6 +58,7 @@ class DataMatcherAgent:
         self.gate = gate or AlwaysAllowGate()
         self._cache: dict[tuple[str, str, tuple[str, ...]], tuple[ImageBundle, OmicsBundle]] = {}
         self._matcher_backend = "rules"
+        self._eligible_patient_ids: list[str] = []
         if llm_client is not None:
             self._llm = llm_client
             self._use_llm = True
@@ -100,6 +101,7 @@ class DataMatcherAgent:
         ]
         # Full intersection first; then optional --patient-id filter, then --max-patients.
         available = len(hits)
+        self._eligible_patient_ids = [r.patient_id for r in hits]
         if request.patient_ids:
             wanted = [str(p).strip() for p in request.patient_ids if str(p).strip()]
             by_id = {r.patient_id: r for r in hits}
@@ -110,6 +112,7 @@ class DataMatcherAgent:
                     + ", ".join(missing)
                 )
             selected = [by_id[p] for p in wanted]
+            self._eligible_patient_ids = [r.patient_id for r in selected]
             log(
                 f"[match] --patient-id override: keeping {len(selected)} of "
                 f"{available} paired patients ({', '.join(wanted)})"
@@ -161,23 +164,67 @@ class DataMatcherAgent:
         if not self.gate.approve(preview):
             raise DownloadDeniedError("Download gate denied the question-scoped fetch")
         log(f"[fetch] Starting question-scoped fetch for {preview.n_paired} patients")
+        organ_fraction = float(getattr(request, "organ_fraction", 0.3) or 0.3)
         apply = getattr(self.catalog, "apply_request_options", None)
         if callable(apply):
-            apply(
-                max_genes=request.max_genes,
-                min_altered=request.min_altered,
-                disease_query=str(request.filters.get("disease_query") or request.disease),
-                keyword_match=bool(request.filters.get("keyword_match")),
-                matcher_backend=self._matcher_backend,
-            )
+            try:
+                apply(
+                    max_genes=request.max_genes,
+                    min_altered=request.min_altered,
+                    disease_query=str(
+                        request.filters.get("disease_query") or request.disease
+                    ),
+                    keyword_match=bool(request.filters.get("keyword_match")),
+                    matcher_backend=self._matcher_backend,
+                    organ_fraction=organ_fraction,
+                )
+            except TypeError:
+                apply(
+                    max_genes=request.max_genes,
+                    min_altered=request.min_altered,
+                    disease_query=str(
+                        request.filters.get("disease_query") or request.disease
+                    ),
+                    keyword_match=bool(request.filters.get("keyword_match")),
+                    matcher_backend=self._matcher_backend,
+                )
         # Persist gene_source so fetch logs distinguish literature vs explicit --genes.
         intermediate = getattr(self.catalog, "last_intermediate", None)
         if isinstance(intermediate, dict) and request.filters.get("gene_source"):
             intermediate["gene_source"] = request.filters.get("gene_source")
-        # Preview already selected TCIA ∩ GDC IDs; do not drop them again after fetch.
-        records = list(self.catalog.fetch_records(preview.patient_ids))
+        # Preview IDs first; remaining eligible pool used to refill after organ-fraction drops.
+        pool_ids = list(self._eligible_patient_ids) or list(preview.patient_ids)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for pid in list(preview.patient_ids) + pool_ids:
+            if pid not in seen:
+                ordered.append(pid)
+                seen.add(pid)
+        target = (
+            int(request.max_patients)
+            if request.max_patients > 0
+            else len(preview.patient_ids)
+        )
+        if request.patient_ids:
+            target = len(preview.patient_ids)
+        fetch_fn = getattr(self.catalog, "fetch_records")
+        try:
+            records = list(
+                fetch_fn(
+                    ordered,
+                    target_count=target,
+                    organ_fraction=organ_fraction,
+                )
+            )
+        except TypeError:
+            records = list(fetch_fn(preview.patient_ids))
         fetched_ids = {record.patient_id for record in records}
-        if fetched_ids != set(preview.patient_ids):
+        if not fetched_ids and preview.patient_ids:
+            raise ValueError(
+                "Fetch returned no patients from the paired preview; "
+                "both TCIA and GDC are required."
+            )
+        if request.patient_ids and fetched_ids != set(preview.patient_ids):
             missing = sorted(set(preview.patient_ids) - fetched_ids)
             raise ValueError(
                 "Fetch returned missing patients from the paired preview; "

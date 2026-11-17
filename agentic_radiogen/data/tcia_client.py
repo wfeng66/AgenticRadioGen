@@ -37,6 +37,12 @@ _CHEST_RE = re.compile(
     r"\b(?:chest|lung|thorax|thoracic|pe\s*study)\b",
     re.I,
 )
+# Prefer true chest FOV wording over generic "LUNG WINDOWS" / lung-recon labels
+# (TCGA-34-5240: LOW DOSE C- CHEST should beat thicker LUNG WINDOWS torso).
+_CHEST_FOV_RE = re.compile(
+    r"\b(?:chest|thorax|thoracic|pe\s*study)\b",
+    re.I,
+)
 
 # Minimum ImageCount for a usable 3D CT when chest_only filtering is on.
 _MIN_CHEST_SLICES = 8
@@ -232,6 +238,59 @@ def has_positive_chest_evidence(series: TciaSeries) -> bool:
     return bool(_CHEST_RE.search(series.site_text or ""))
 
 
+# Tokens surfaced in fetch logs so users can see why a series was ranked/kept.
+_METADATA_LOG_TOKENS: tuple[str, ...] = (
+    "chest",
+    "thorax",
+    "thoracic",
+    "lung",
+    "pulmonary",
+    "pe study",
+    "abdomen",
+    "abd",
+    "pelvis",
+    "pel",
+    "whole body",
+    "wb",
+    "renal",
+    "kidney",
+    "scout",
+    "localizer",
+    "topogram",
+)
+
+
+def metadata_keyword_hits(series: TciaSeries) -> list[str]:
+    """Keyword hits from SeriesDescription / Protocol / Study / BodyPartExamined."""
+    blob = " ".join(
+        [
+            series.series_description or "",
+            series.protocol_name or "",
+            series.study_description or "",
+            series.body_part_examined or "",
+        ]
+    ).lower()
+    hits: list[str] = []
+    for tok in _METADATA_LOG_TOKENS:
+        if tok in blob and tok not in hits:
+            hits.append(tok)
+    return hits
+
+
+def format_series_metadata(series: TciaSeries) -> str:
+    """Compact metadata string for fetch logs."""
+    desc = (series.series_description or "").strip() or "?"
+    body = (series.body_part_examined or "").strip() or "?"
+    proto = (series.protocol_name or "").strip()
+    n = int(series.image_count or 0)
+    hits = metadata_keyword_hits(series)
+    kw = ",".join(hits) if hits else "none"
+    parts = [f"desc={desc!r}", f"body={body!r}", f"n={n}", f"keywords=[{kw}]"]
+    if proto:
+        parts.insert(1, f"protocol={proto!r}")
+    return " ".join(parts)
+
+
 def is_non_chest_series(series: TciaSeries) -> bool:
     """True when metadata clearly indicates a non-chest body site.
 
@@ -261,8 +320,10 @@ def prefer_volumetric_series_ranked(
     1. Drop clearly non-chest series (abd/pelvis, whole-body, renal, …), but
        keep combined chest series such as ``Chest/Abd``.
     2. Drop scouts/topograms and series with ImageCount < 8.
-    3. Prefer positive chest/lung text evidence; demote empty site_text so
-       ImageCount alone cannot beat a labeled CHEST series.
+    3. Prefer chest/thorax/thoracic (or PE) FOV wording over generic lung-window
+       labels, then prefer any chest/lung text over empty site_text, then
+       thicker volumes. Does **not** drop lower-ranked lung series — fetch
+       walks the ranked list one-by-one for ``--organ-fraction``.
     4. If nothing remains, return ``[]``.
     """
     if not candidates:
@@ -279,14 +340,20 @@ def prefer_volumetric_series_ranked(
         if not pool:
             return []
 
+    def _chest_fov_rank(s: TciaSeries) -> int:
+        """0 = chest/thorax/PE FOV wording; 1 = other lung-ish; 2 = empty."""
+        text = s.site_text or ""
+        if _CHEST_FOV_RE.search(text):
+            return 0
+        if has_positive_chest_evidence(s):
+            return 1
+        return 2
+
     def _score(s: TciaSeries) -> tuple:
         scout = 1 if is_scout_series(s) else 0
         count = int(s.image_count or 0)
         if chest_only:
-            # 0 = has CHEST/LUNG text; 1 = empty/ambiguous site text (demoted).
-            no_chest_text = 0 if has_positive_chest_evidence(s) else 1
-            empty_site = 0 if (s.site_text or "").strip() else 1
-            return (scout, no_chest_text, empty_site, -count, s.series_uid)
+            return (scout, _chest_fov_rank(s), -count, s.series_uid)
         return (scout, -count, s.series_uid)
 
     return sorted(pool, key=_score)

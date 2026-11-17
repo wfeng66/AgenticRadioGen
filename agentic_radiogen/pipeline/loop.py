@@ -58,6 +58,7 @@ class DiscoveryLoop:
         literature: LiteratureAgent,
         max_iterations: int = 3,
         max_patients: int | None = None,
+        organ_fraction: float | None = None,
         max_genes: int | None = None,
         min_altered: int | None = None,
         max_papers: int | None = None,
@@ -72,6 +73,7 @@ class DiscoveryLoop:
         self.literature = literature
         self.max_iterations = max_iterations
         self.max_patients = max_patients
+        self.organ_fraction = organ_fraction
         self.max_genes = max_genes
         self.min_altered = min_altered
         self.patient_ids = list(patient_ids or [])
@@ -85,6 +87,8 @@ class DiscoveryLoop:
         updates: dict = {}
         if self.max_patients is not None:
             updates["max_patients"] = self.max_patients
+        if self.organ_fraction is not None:
+            updates["organ_fraction"] = float(self.organ_fraction)
         if self.max_genes is not None:
             updates["max_genes"] = self.max_genes
         if self.min_altered is not None:

@@ -418,6 +418,7 @@ def _run_matcher(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 4,
+    organ_fraction: float = 0.3,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -448,6 +449,7 @@ def _run_matcher(
             "max_patients": max_patients,
             "max_genes": max_genes,
             "min_altered": min_altered,
+            "organ_fraction": float(organ_fraction),
             "patient_ids": list(patient_ids or []),
             "force_seg_model": force_seg_model,
         }
@@ -511,6 +513,7 @@ def run_stage1(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 4,
+    organ_fraction: float = 0.3,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -535,6 +538,7 @@ def run_stage1(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        organ_fraction=organ_fraction,
         store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
@@ -559,6 +563,7 @@ def run_stage2(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 4,
+    organ_fraction: float = 0.3,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -583,6 +588,7 @@ def run_stage2(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        organ_fraction=organ_fraction,
         store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
@@ -632,6 +638,7 @@ def run_stage3(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 4,
+    organ_fraction: float = 0.3,
     store_segm: bool = False,
     use_llm: bool | None = None,
     llm_provider: str | None = None,
@@ -655,6 +662,7 @@ def run_stage3(
         genes=genes,
         max_genes=max_genes,
         min_altered=min_altered,
+        organ_fraction=organ_fraction,
         store_segm=store_segm,
         use_llm=use_llm,
         llm_provider=llm_provider,
@@ -726,6 +734,7 @@ def run_stage4(
     genes: str | None = None,
     max_genes: int | None = None,
     min_altered: int = 4,
+    organ_fraction: float = 0.3,
     max_papers: int | None = None,
     store_segm: bool = False,
     use_llm: bool | None = None,
@@ -776,6 +785,7 @@ def run_stage4(
         ),
         max_iterations=max_iterations,
         max_patients=max_patients,
+        organ_fraction=organ_fraction,
         max_genes=max_genes,
         min_altered=min_altered,
         max_papers=max_papers,
@@ -973,6 +983,14 @@ def main() -> None:
         help="Live catalog: metadata/mutations only (skip DICOM download and radiomics).",
     )
     parser.add_argument("--max-patients", type=int, default=24)
+    parser.add_argument(
+        "--organ-fraction",
+        type=float,
+        default=0.3,
+        help="Min high-air slice fraction for chest CT (lung). If a series is below "
+        "this, try other series for the patient; if none qualify, replace the patient. "
+        "Default: 0.3.",
+    )
     parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument(
         "--max-papers",
@@ -1025,6 +1043,7 @@ def main() -> None:
         catalog_name=args.catalog,
         approve_download=args.approve_download,
         max_patients=args.max_patients,
+        organ_fraction=float(args.organ_fraction),
         download_dicom=download_dicom,
         tcga_project=args.tcga_project,
         tcia_collection=args.tcia_collection,

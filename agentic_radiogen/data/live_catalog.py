@@ -25,13 +25,13 @@ from agentic_radiogen.data.organ_gate_blacklist import (
 from agentic_radiogen.data.tcia_client import (
     TciaClient,
     TciaSeries,
+    format_series_metadata,
+    metadata_keyword_hits,
     prefer_volumetric_series_ranked,
 )
 from agentic_radiogen.imaging.organ_verify import verify_expected_organ
 from agentic_radiogen.imaging.radiomics_extract import extract_series_features
 from agentic_radiogen.util.progress import log, progress_enabled, progress_iter
-
-_MAX_SERIES_ATTEMPTS = 3
 
 _SEGM_LOG_FIELDS = (
     "patient_id",
@@ -97,9 +97,12 @@ class LiveCatalog:
         preferred_gdc_projects: list[str] | None = None,
         preferred_keywords: list[str] | None = None,
         matcher_backend: str | None = None,
+        organ_fraction: float | None = None,
     ) -> None:
         self.last_intermediate["max_genes"] = max_genes
         self.last_intermediate["min_altered"] = int(min_altered)
+        if organ_fraction is not None:
+            self.last_intermediate["organ_fraction"] = float(organ_fraction)
         if disease_query:
             self.last_intermediate["disease_query"] = disease_query
             self.last_question_text = str(disease_query)
@@ -663,8 +666,22 @@ class LiveCatalog:
             case_clinical["_tcia_series_uid"] = series.series_uid
             case_clinical["_tcia_image_count"] = int(series.image_count or 0)
             case_clinical["_tcia_series_description"] = series.series_description or ""
+            case_clinical["_tcia_body_part"] = series.body_part_examined or ""
             case_clinical["_tcia_series_candidates"] = [
                 s.series_uid for s in ranked if s.series_uid
+            ]
+            case_clinical["_tcia_series_candidate_meta"] = [
+                {
+                    "uid": s.series_uid,
+                    "desc": s.series_description or "",
+                    "body": s.body_part_examined or "",
+                    "protocol": s.protocol_name or "",
+                    "study": s.study_description or "",
+                    "n": int(s.image_count or 0),
+                    "keywords": metadata_keyword_hits(s),
+                }
+                for s in ranked
+                if s.series_uid
             ]
             records.append(
                 CatalogRecord(
@@ -683,7 +700,13 @@ class LiveCatalog:
             self._record_cache[rec.patient_id] = rec
         return records
 
-    def fetch_records(self, patient_ids: list[str]) -> list[CatalogRecord]:
+    def fetch_records(
+        self,
+        patient_ids: list[str],
+        *,
+        target_count: int | None = None,
+        organ_fraction: float | None = None,
+    ) -> list[CatalogRecord]:
         self.fetch_count += 1
         self.last_imaging_notes = []
         self.last_segmentation_log = []
@@ -693,6 +716,20 @@ class LiveCatalog:
             return []
         if self._record_cache.get(patient_ids[0]) is None:
             raise KeyError("query_metadata must run before fetch_records")
+        goal = (
+            int(target_count)
+            if target_count is not None and int(target_count) > 0
+            else len(patient_ids)
+        )
+        from agentic_radiogen.imaging.chest_qc import DEFAULT_ORGAN_FRACTION
+
+        org_frac = (
+            float(organ_fraction)
+            if organ_fraction is not None
+            else float(
+                self.last_intermediate.get("organ_fraction", DEFAULT_ORGAN_FRACTION)
+            )
+        )
         genes = list(next(iter(self._record_cache.values())).mutations)
         discover = not genes
         if discover:
@@ -741,10 +778,16 @@ class LiveCatalog:
             pid: {} for pid in patient_ids
         }
         log("[fetch] Genomics metadata ready", enabled=verbose)
+        log(
+            f"[fetch] --organ-fraction={org_frac:g}: try alternate series, "
+            f"else replace patient; target={goal}",
+            enabled=verbose,
+        )
 
         ok = 0
         failed = 0
         skipped = 0
+        content_dropped = 0
         fetched: list[CatalogRecord] = []
         iterator = progress_iter(
             patient_ids,
@@ -754,6 +797,8 @@ class LiveCatalog:
             enabled=verbose and self.download_dicom,
         )
         for pid in iterator:
+            if len(fetched) >= goal:
+                break
             rec = self._record_cache.get(pid)
             if rec is None:
                 raise KeyError(f"Unknown patient IDs: [{pid}]")
@@ -795,6 +840,13 @@ class LiveCatalog:
                         str(rec.clinical.get("_gdc_project") or ""),
                         str(rec.clinical.get("_tcia_collection") or ""),
                     )
+                    check_air_frac = _wants_chest_ct(
+                        q_disease,
+                        seg_disease,
+                        rec.disease,
+                        str(rec.clinical.get("_gdc_project") or ""),
+                        str(rec.clinical.get("_tcia_collection") or ""),
+                    )
                     candidate_uids = [
                         str(u)
                         for u in (
@@ -805,6 +857,52 @@ class LiveCatalog:
                     ]
                     if rec.series_uid and rec.series_uid not in candidate_uids:
                         candidate_uids.insert(0, rec.series_uid)
+                    meta_by_uid: dict[str, dict] = {}
+                    for row in rec.clinical.get("_tcia_series_candidate_meta") or []:
+                        if isinstance(row, dict) and row.get("uid"):
+                            meta_by_uid[str(row["uid"])] = row
+
+                    def _meta_line(uid: str) -> str:
+                        row = meta_by_uid.get(uid)
+                        if row:
+                            desc = str(row.get("desc") or "").strip() or "?"
+                            body = str(row.get("body") or "").strip() or "?"
+                            proto = str(row.get("protocol") or "").strip()
+                            n = int(row.get("n") or 0)
+                            kws = row.get("keywords") or []
+                            kw = ",".join(str(k) for k in kws) if kws else "none"
+                            bits = [
+                                f"desc={desc!r}",
+                                f"body={body!r}",
+                                f"n={n}",
+                                f"keywords=[{kw}]",
+                            ]
+                            if proto:
+                                bits.insert(1, f"protocol={proto!r}")
+                            return " ".join(bits)
+                        # Fallback: primary series fields only.
+                        if uid == (rec.series_uid or ""):
+                            probe = TciaSeries(
+                                patient_id=pid,
+                                series_uid=uid,
+                                modality=rec.modality or "CT",
+                                collection=str(
+                                    rec.clinical.get("_tcia_collection") or ""
+                                ),
+                                image_count=int(
+                                    rec.clinical.get("_tcia_image_count") or 0
+                                ),
+                                series_description=str(
+                                    rec.clinical.get("_tcia_series_description")
+                                    or ""
+                                ),
+                                body_part_examined=str(
+                                    rec.clinical.get("_tcia_body_part") or ""
+                                ),
+                            )
+                            return format_series_metadata(probe)
+                        return "desc=? body=? n=? keywords=[unknown]"
+
                     blacklist_path = self._organ_gate_blacklist_path()
                     failed_uids = load_failed_uids(blacklist_path)
                     if failed_uids:
@@ -812,12 +910,12 @@ class LiveCatalog:
                         candidate_uids = filter_uids(
                             candidate_uids, failed=failed_uids
                         )
-                        skipped = [u for u in before if u not in candidate_uids]
-                        if skipped:
+                        skipped_uids = [u for u in before if u not in candidate_uids]
+                        if skipped_uids:
                             # Purge leftover DICOM folders (e.g. failed before
                             # delete-on-fail existed, or a prior delete missed).
                             removed_names: list[str] = []
-                            for bad_uid in skipped:
+                            for bad_uid in skipped_uids:
                                 removed = remove_cached_series(
                                     bad_uid, cache_dir=self.tcia.cache_dir
                                 )
@@ -829,25 +927,87 @@ class LiveCatalog:
                                 else ""
                             )
                             log(
-                                f"[fetch] {pid}: skipping {len(skipped)} blacklisted "
+                                f"[fetch] {pid}: skipping {len(skipped_uids)} blacklisted "
                                 f"organ-gate UID(s) "
-                                f"({', '.join('…' + u[-12:] for u in skipped)})"
+                                f"({', '.join('…' + u[-12:] for u in skipped_uids)})"
                                 f"{purge_note}",
                                 enabled=verbose,
                             )
-                    candidate_uids = candidate_uids[:_MAX_SERIES_ATTEMPTS]
+                    # Metadata already dropped abd/WB/scout. Walk ranked list
+                    # one-by-one (chest-FOV labels first) until organ-fraction
+                    # passes; do not hard-cap away a later passing series.
                     if not candidate_uids:
                         raise RuntimeError(
                             f"No series candidates left for {pid} after organ-gate "
                             f"blacklist filter (see {blacklist_path})"
                         )
+                    if check_air_frac:
+                        log(
+                            f"[fetch] {pid}: trying {len(candidate_uids)} "
+                            f"metadata-ranked series one-by-one "
+                            f"(organ_fraction>={org_frac:g})",
+                            enabled=verbose,
+                        )
+                        for i, uid in enumerate(candidate_uids, start=1):
+                            log(
+                                f"[fetch] {pid}:   ranked#{i} uid=…{uid[-12:]} "
+                                f"{_meta_line(uid)}",
+                                enabled=verbose,
+                            )
 
                     series_dir: Path | None = None
                     last_organ_reason = ""
+                    from agentic_radiogen.imaging.chest_qc import (
+                        series_meets_organ_fraction,
+                    )
+
                     for attempt, uid in enumerate(candidate_uids, start=1):
                         series_dir = self.tcia.download_series(uid)
                         local_path = str(series_dir)
                         chosen_series_uid = uid
+                        meta_txt = _meta_line(uid)
+                        if check_air_frac:
+                            air_ok, air_frac = series_meets_organ_fraction(
+                                series_dir, organ_fraction=org_frac
+                            )
+                            if not air_ok:
+                                last_organ_reason = (
+                                    f"organ_fraction={air_frac:.3f} < {org_frac:g}"
+                                )
+                                more = (
+                                    "trying next ranked series"
+                                    if attempt < len(candidate_uids)
+                                    else "no more ranked series; will replace patient"
+                                )
+                                log(
+                                    f"[fetch] {pid}: --organ-fraction FAIL attempt "
+                                    f"{attempt}/{len(candidate_uids)} "
+                                    f"uid=…{uid[-12:]} {meta_txt} "
+                                    f"({last_organ_reason}); {more}",
+                                    enabled=verbose,
+                                )
+                                self.last_segmentation_log.append(
+                                    {
+                                        "patient_id": pid,
+                                        "image_path": str(Path(series_dir).resolve()),
+                                        "diagnosis": diagnosis,
+                                        "segmentation_model": "",
+                                        "models_attempted": "",
+                                        "mask_path": "",
+                                        "n_mask_voxels": "0",
+                                        "status": (
+                                            f"discarded: {last_organ_reason}; {meta_txt}"
+                                        ),
+                                    }
+                                )
+                                series_dir = None
+                                continue
+                            log(
+                                f"[fetch] {pid}: --organ-fraction PASS "
+                                f"({air_frac:.3f} >= {org_frac:g}) "
+                                f"uid=…{uid[-12:]} {meta_txt}",
+                                enabled=verbose,
+                            )
                         if organs and self.extract_radiomics:
                             gate = verify_expected_organ(
                                 series_dir, organ_keywords=organs
@@ -888,11 +1048,20 @@ class LiveCatalog:
                             )
                         break
                     else:
-                        raise RuntimeError(
-                            f"No series passed organ gate for {pid} "
-                            f"(expected={list(organs) or 'any'}; "
-                            f"last={last_organ_reason or 'n/a'})"
+                        content_dropped += 1
+                        self.last_imaging_notes.append(
+                            f"{pid}: no series met --organ-fraction={org_frac:g} "
+                            f"/ organ gate (last={last_organ_reason or 'n/a'}); "
+                            "replacing patient"
                         )
+                        log(
+                            f"[fetch] Discard {pid}: all {len(candidate_uids)} "
+                            f"metadata-ranked series failed "
+                            f"(organ_fraction={org_frac:g}); "
+                            "refilling from remaining pool",
+                            enabled=verbose,
+                        )
+                        continue
 
                     assert series_dir is not None
                     if self.extract_radiomics:
@@ -1003,6 +1172,14 @@ class LiveCatalog:
                     "_tcia_series_candidates": rec.clinical.get(
                         "_tcia_series_candidates"
                     ),
+                    "_tcia_series_candidate_meta": rec.clinical.get(
+                        "_tcia_series_candidate_meta"
+                    ),
+                    "_tcia_series_description": rec.clinical.get(
+                        "_tcia_series_description"
+                    ),
+                    "_tcia_body_part": rec.clinical.get("_tcia_body_part"),
+                    "_tcia_image_count": rec.clinical.get("_tcia_image_count"),
                 },
                 series_uid=chosen_series_uid,
                 radiomic_features=radiomic_features,
@@ -1016,15 +1193,21 @@ class LiveCatalog:
         self.last_intermediate = {
             **self.last_intermediate,
             "fetch_requested": len(patient_ids),
+            "fetch_target": goal,
+            "fetch_accepted": len(fetched),
             "radiomics_ok": ok,
             "radiomics_failed": failed,
             "imaging_skipped": skipped,
+            "organ_fraction": org_frac,
+            "organ_fraction_dropped": content_dropped,
             "segmentation_log_path": segm_log_path,
             "segmentation_log_n": len(self.last_segmentation_log),
         }
         log(
-            f"[fetch] Done: radiomics_ok={ok}, failed={failed}, skipped={skipped} "
-            f"(of {len(patient_ids)} patients)",
+            f"[fetch] Done: accepted={len(fetched)}/{goal}, radiomics_ok={ok}, "
+            f"failed={failed}, skipped={skipped}, "
+            f"organ_fraction_dropped={content_dropped} "
+            f"(candidates={len(patient_ids)}, organ_fraction={org_frac:g})",
             enabled=verbose,
         )
         if segm_log_path:

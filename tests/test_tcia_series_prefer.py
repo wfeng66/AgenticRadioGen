@@ -1,10 +1,29 @@
 from agentic_radiogen.data.tcia_client import (
     TciaSeries,
+    format_series_metadata,
     has_positive_chest_evidence,
     is_non_chest_series,
+    metadata_keyword_hits,
     prefer_volumetric_series,
     prefer_volumetric_series_ranked,
 )
+
+
+def test_metadata_keyword_hits_and_format() -> None:
+    s = TciaSeries(
+        "TCGA-34-5240",
+        "uid-chest",
+        "CT",
+        "TCGA-LUSC",
+        image_count=148,
+        series_description="LOW DOSE C- CHEST",
+        body_part_examined="LUNG",
+    )
+    hits = metadata_keyword_hits(s)
+    assert "chest" in hits and "lung" in hits
+    text = format_series_metadata(s)
+    assert "LOW DOSE C- CHEST" in text
+    assert "keywords=[chest,lung]" in text or "chest" in text
 
 
 def test_prefer_volumetric_over_scout() -> None:
@@ -231,7 +250,49 @@ def test_ranked_returns_multiple_chest_candidates() -> None:
     ranked = prefer_volumetric_series_ranked(
         [abd, thin_chest, thick_chest], chest_only=True
     )
-    assert [s.series_uid for s in ranked] == ["uid-thick", "uid-thin"]
+    # CHEST FOV first, then generic LUNG; ABD dropped. List kept for one-by-one try.
+    assert [s.series_uid for s in ranked] == ["uid-thin", "uid-thick"]
+
+
+def test_prefer_chest_desc_over_thicker_lung_windows_wb() -> None:
+    """TCGA-34-5240-style: thick LUNG WINDOWS torso loses to LOW DOSE C- CHEST."""
+    lung_windows = TciaSeries(
+        "TCGA-34-5240",
+        "uid-lw",
+        "CT",
+        "TCGA-LUSC",
+        image_count=348,
+        series_description="LUNG WINDOWS",
+        body_part_examined="LUNG",
+    )
+    whole_body = TciaSeries(
+        "TCGA-34-5240",
+        "uid-wb",
+        "CT",
+        "TCGA-LUSC",
+        image_count=267,
+        series_description="CT WHOLE BODY",
+        body_part_examined="LUNG",
+    )
+    chest = TciaSeries(
+        "TCGA-34-5240",
+        "uid-chest",
+        "CT",
+        "TCGA-LUSC",
+        image_count=148,
+        series_description="LOW DOSE C- CHEST",
+        body_part_examined="LUNG",
+    )
+    ranked = prefer_volumetric_series_ranked(
+        [lung_windows, whole_body, chest], chest_only=True
+    )
+    assert ranked[0].series_uid == "uid-chest"
+    assert "uid-lw" in {s.series_uid for s in ranked}
+    assert "uid-wb" not in {s.series_uid for s in ranked}
+    best = prefer_volumetric_series(
+        [lung_windows, whole_body, chest], chest_only=True
+    )
+    assert best is not None and best.series_uid == "uid-chest"
 
 
 def test_patient_series_lookup_preserves_full_metadata_without_modality_filter() -> None:
