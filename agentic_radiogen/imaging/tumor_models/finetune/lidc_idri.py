@@ -100,6 +100,7 @@ def discover_lidc_cases(
         # If somehow called on a cache dir, keep writing beside it, not under it.
         cache = root
     cache.mkdir(parents=True, exist_ok=True)
+    _require_dicom_deps()
     xml_index, xml_by_patient = _build_xml_indexes(root, verbose=verbose)
     prev_skips = _load_skip_log(cache)
     if prev_skips and verbose:
@@ -187,8 +188,34 @@ def discover_lidc_cases(
     )
     return cases
 
+def _require_dicom_deps() -> None:
+    """Fail once up front — missing pydicom must not become 900+ per-patient skips."""
+    missing: list[str] = []
+    try:
+        import pydicom  # noqa: F401
+    except ImportError:
+        missing.append("pydicom")
+    try:
+        import nibabel  # noqa: F401
+    except ImportError:
+        try:
+            import SimpleITK  # noqa: F401
+        except ImportError:
+            missing.append("nibabel or SimpleITK")
+    if missing:
+        raise ModuleNotFoundError(
+            "LIDC DICOM→NIfTI conversion needs: "
+            + ", ".join(missing)
+            + ". Install with: pip install pydicom nibabel  "
+            "(already listed in requirements.txt). "
+            "Do not delete _finetune_cache; fix the env and re-run."
+        )
+
+
 def _short_skip_reason(exc: BaseException, *, has_xml: bool) -> str:
     msg = str(exc)
+    if isinstance(exc, ModuleNotFoundError) or "No module named" in msg:
+        return f"missing dependency: {msg}"
     if "no CT series with LIDC XML" in msg or "no matching" in msg.lower():
         if has_xml:
             return "XML exists in manifest but could not pair to a CT series"

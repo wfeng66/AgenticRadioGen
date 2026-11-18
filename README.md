@@ -43,7 +43,10 @@ python -m venv .venv
 # Linux/macOS/WSL:
 source .venv/bin/activate
 
-# Core dependencies
+# GPU hosts: install CUDA torch first (example cu124), then project deps
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# Core + fine-tune / seg-model stack (torch, monai, nnunet, pyradiomics, …)
 pip install -r requirements.txt
 
 # Editable install (so `python -m agentic_radiogen` works from anywhere)
@@ -52,7 +55,7 @@ pip install -e .
 # Optional: tests
 pip install -r requirements-dev.txt
 
-# Optional: GPU imaging extras
+# Optional: TotalSegmentator and other heavy GPU extras
 pip install -r requirements-imaging-gpu.txt
 ```
 
@@ -61,7 +64,7 @@ Equivalent via `pyproject.toml`:
 ```bash
 pip install -e .
 pip install -e ".[dev]"
-pip install -e ".[imaging-gpu]"
+pip install -e ".[imaging-gpu]"   # TotalSegmentator only; torch/monai are in base now
 pip install -e ".[visualization]"
 ```
 

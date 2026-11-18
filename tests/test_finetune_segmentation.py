@@ -109,6 +109,23 @@ def test_lidc_series_key_overlap() -> None:
     assert _normalize_series_token(a.name) == _normalize_series_token(b.name)
 
 
+def test_lidc_requires_pydicom_upfront(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune import lidc_idri
+
+    (tmp_path / "LIDC-IDRI-0001").mkdir()
+    (tmp_path / "LIDC-IDRI-0002").mkdir()
+    real_import = __import__
+
+    def _fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if name == "pydicom" or name.startswith("pydicom."):
+            raise ImportError("No module named 'pydicom'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", _fake_import)
+    with pytest.raises(ModuleNotFoundError, match="pydicom"):
+        lidc_idri.discover_lidc_cases(tmp_path, cache_dir=tmp_path / "_finetune_cache", verbose=False)
+
+
 def test_find_plans_pkl_next_to_fold_ckpt(tmp_path: Path) -> None:
     from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
         find_plans_pkl,
@@ -122,6 +139,22 @@ def test_find_plans_pkl_next_to_fold_ckpt(tmp_path: Path) -> None:
     ckpt = fold / "model_final_checkpoint.model"
     ckpt.write_bytes(b"y")
     assert find_plans_pkl(ckpt) == plans
+
+
+def test_torch_dice_ce_loss_runs() -> None:
+    import torch
+
+    from agentic_radiogen.imaging.tumor_models.finetune.torch_loop import (
+        _TorchDiceCELoss,
+    )
+
+    loss_fn = _TorchDiceCELoss()
+    logits = torch.randn(2, 2, 4, 4, 4)
+    target = torch.zeros(2, 1, 4, 4, 4)
+    target[:, :, 1:3, 1:3, 1:3] = 1
+    val = loss_fn(logits, target)
+    assert torch.isfinite(val)
+    assert val.ndim == 0
 
 
 def test_soft_load_reports_low_overlap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

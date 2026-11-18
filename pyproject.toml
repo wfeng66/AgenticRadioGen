@@ -12,29 +12,30 @@ dependencies = [
     "pandas>=2.1",
     "pydantic>=2.6",
     "pydicom>=2.4",
+    "pyradiomics>=3.0.1",
+    "SimpleITK>=2.3",
     "scikit-learn>=1.4",
     "scipy>=1.12",
     "tqdm>=4.66",
     "nibabel>=5.0",
     "Pillow>=10.0",
+    # Imaging / fine-tune (CUDA: install torch from pytorch.org first)
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "monai[nibabel,itk,fire]>=1.3",
+    "einops>=0.7",
+    "nnunet>=1.7.1",
+    "nnunetv2",
+    "scikit-image>=0.22",
+    "huggingface_hub>=0.20",
+    "gdown>=5.0",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "nibabel>=5.0", "matplotlib>=3.8"]
 imaging-gpu = [
-    "torch>=2.0",
-    "torchvision>=0.15",
     "totalsegmentator",
-    "nibabel>=5.0",
-    "nnunet>=1.7.1",
-    "nnunetv2",
-    "monai[nibabel,itk,fire]>=1.3",
-    "einops>=0.7",
-    "huggingface_hub>=0.20",
-    "gdown>=5.0",
-    "scikit-image>=0.22",
-    "matplotlib>=3.8",
-    "Pillow>=10.0",
 ]
 visualization = ["matplotlib>=3.8"]
 

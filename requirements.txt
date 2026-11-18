@@ -1,7 +1,12 @@
-# Core runtime dependencies for agentic-radiogen
+# Core + imaging/fine-tune dependencies for agentic-radiogen
 # Install: pip install -r requirements.txt
-# Or editable: pip install -e .
+# Editable:  pip install -e .
+#
+# CUDA PyTorch (recommended before this file on GPU hosts):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# CPU-only hosts can rely on the torch pins below from PyPI.
 
+# --- core ---
 numpy>=1.26
 pandas>=2.1
 pydantic>=2.6
@@ -11,7 +16,20 @@ SimpleITK>=2.3
 scikit-learn>=1.4
 scipy>=1.12
 tqdm>=4.66
-
-# Used by DICOM/NIfTI I/O, LIDC XML→mask cache, and radiomics paths
 nibabel>=5.0
 Pillow>=10.0
+
+# --- deep learning (scripts/finetune_segmentation.py, seg models) ---
+torch>=2.0
+torchvision>=0.15
+monai[nibabel,itk,fire]>=1.3
+einops>=0.7
+# nnU-Net: Task006 Zenodo weights are v1; AutoPET / newer packages use v2
+nnunet>=1.7.1
+nnunetv2
+
+# --- imaging helpers ---
+scikit-image>=0.22
+huggingface_hub>=0.20
+gdown>=5.0
+matplotlib>=3.8

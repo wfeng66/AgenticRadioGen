@@ -107,28 +107,28 @@ def run_torch_finetune(
     except ImportError as exc:
         raise RuntimeError("PyTorch is required (pip install torch)") from exc
 
-    try:
-        import monai
-        from monai.losses import DiceCELoss
-        from monai.networks.nets import UNet
-    except ImportError as exc:
-        raise RuntimeError(
-            "MONAI is required for fine-tune epochs (pip install 'monai[nibabel]')"
-        ) from exc
-
     device = torch.device(
         cfg.device if cfg.device != "cuda" or torch.cuda.is_available() else "cpu"
     )
+    monai_ver = "n/a"
+    try:
+        import monai
+
+        monai_ver = monai.__version__
+    except ImportError:
+        monai = None  # type: ignore[assignment]
+
     log(
         f"[finetune] backend={backend_name} mode={mode} device={device} "
-        f"monai={monai.__version__} epochs={cfg.epochs} "
+        f"monai={monai_ver} epochs={cfg.epochs} "
         f"n_train={len(train_cases)} n_eval={len(eval_cases)}",
         enabled=True,
     )
 
     patch_size = _PATCH
     intensity = None
-    if str(backend_name).lower() in {"nnunet", "nnunetv1", "nnunet-v1"}:
+    backend_l = str(backend_name).lower()
+    if backend_l in {"nnunet", "nnunetv1", "nnunet-v1"}:
         from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
             load_nnunet_v1_network,
         )
@@ -144,6 +144,14 @@ def run_torch_finetune(
             enabled=True,
         )
     else:
+        if monai is None:
+            raise RuntimeError(
+                "MONAI is required for the MONAI fine-tune backend. Install with:\n"
+                "  pip install -r requirements.txt\n"
+                "or: pip install 'monai[nibabel]'"
+            )
+        from monai.networks.nets import UNet
+
         model = UNet(
             spatial_dims=3,
             in_channels=1,
@@ -154,7 +162,7 @@ def run_torch_finetune(
         ).to(device)
         soft_load(model, pretrained, map_location=device)
 
-    loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
+    loss_fn = _build_dice_ce_loss(monai)
     optim = torch.optim.Adam(model.parameters(), lr=float(cfg.lr))
 
     train_loader = DataLoader(
@@ -373,6 +381,41 @@ def _batch_metrics(
             )
         )
     return average_metrics(rows)
+
+
+def _build_dice_ce_loss(monai_mod) -> Any:
+    """Prefer MONAI DiceCELoss; fall back to a torch-only Dice+CE for nnU-Net runs."""
+    if monai_mod is not None:
+        from monai.losses import DiceCELoss
+
+        return DiceCELoss(to_onehot_y=True, softmax=True)
+    return _TorchDiceCELoss()
+
+
+class _TorchDiceCELoss:
+    """Minimal Dice + CE when MONAI is not installed (nnU-Net backend)."""
+
+    def __call__(self, logits, target):
+        import torch
+        import torch.nn.functional as F
+
+        # logits: (B,C,…)  target: (B,1,…) float {0,1}
+        if target.ndim == logits.ndim and target.shape[1] == 1:
+            tgt = target[:, 0].long()
+        else:
+            tgt = target.long()
+        ce = F.cross_entropy(logits, tgt)
+        probs = torch.softmax(logits, dim=1)
+        # one-hot for dice on foreground class 1
+        n_class = logits.shape[1]
+        tgt_oh = F.one_hot(tgt.clamp(0, n_class - 1), num_classes=n_class)
+        # (B,Z,Y,X,C) → (B,C,Z,Y,X)
+        tgt_oh = tgt_oh.permute(0, -1, *range(1, tgt_oh.ndim - 1)).float()
+        dims = tuple(range(2, probs.ndim))
+        inter = (probs * tgt_oh).sum(dim=dims)
+        denom = probs.sum(dim=dims) + tgt_oh.sum(dim=dims)
+        dice = 1.0 - ((2.0 * inter + 1e-5) / (denom + 1e-5)).mean()
+        return ce + dice
 
 
 def soft_load(model, ckpt_path: Path, *, map_location) -> None:
