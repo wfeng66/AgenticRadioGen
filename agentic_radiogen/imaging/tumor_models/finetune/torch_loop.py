@@ -163,7 +163,19 @@ def run_torch_finetune(
         soft_load(model, pretrained, map_location=device)
 
     loss_fn = _build_dice_ce_loss(monai)
-    optim = torch.optim.Adam(model.parameters(), lr=float(cfg.lr))
+    # Fine-tune defaults: low LR + weight decay so pretrained weights are not wiped.
+    lr = float(cfg.lr)
+    if backend_l in {"nnunet", "nnunetv1", "nnunet-v1"} and abs(lr - 1e-4) < 1e-15:
+        lr = 1e-5
+        log(
+            f"[finetune] nnU-Net fine-tune LR lowered {cfg.lr} → {lr} "
+            "(pass --lr to override)",
+            enabled=True,
+        )
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=max(1, int(cfg.epochs)), eta_min=lr * 0.1
+    )
 
     train_loader = DataLoader(
         NiftiSegDataset(
@@ -171,6 +183,7 @@ def run_torch_finetune(
             patch_size=patch_size,
             training=True,
             intensity=intensity,
+            fg_oversample=0.67,
         ),
         batch_size=max(1, int(cfg.batch_size)),
         shuffle=True,
@@ -184,6 +197,7 @@ def run_torch_finetune(
                 patch_size=patch_size,
                 training=False,
                 intensity=intensity,
+                fg_oversample=1.0,  # always crop on nodule for fair eval
             ),
             batch_size=1,
             shuffle=False,
@@ -192,22 +206,45 @@ def run_torch_finetune(
 
     history: list[dict[str, Any]] = []
     baseline: dict[str, float] | None = None
+    out = Path(cfg.out_ckpt)
+    out.parent.mkdir(parents=True, exist_ok=True)
     if mode == "evl" and eval_loader is not None:
         baseline = evaluate_loader(model, eval_loader, loss_fn, device)
         log(format_metrics("[finetune] baseline (before fine-tune) eval", baseline), enabled=True)
         history.append({"epoch": 0, "phase": "baseline", "eval": baseline})
+        # Keep pretrained weights as the starting "best" so FT cannot regress the ckpt.
+        _save_ckpt(
+            out,
+            model=model,
+            cfg=cfg,
+            epoch=0,
+            pretrained=pretrained,
+            train_metrics=None,
+            eval_metrics=baseline,
+            baseline=baseline,
+            mode=mode,
+            backend_name=backend_name,
+        )
+        log(
+            f"[finetune] saved baseline checkpoint (eval_dice="
+            f"{float(baseline.get('dice', float('nan'))):.4f}) → {out}",
+            enabled=True,
+        )
 
-    out = Path(cfg.out_ckpt)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    best_score = -1.0
+    best_score = (
+        float(baseline["dice"])
+        if baseline is not None and np.isfinite(baseline.get("dice", float("nan")))
+        else -1.0
+    )
     best_epoch = 0
     last_train: dict[str, float] = {}
-    last_eval: dict[str, float] | None = None
+    last_eval: dict[str, float] | None = baseline
 
     for epoch in range(1, int(cfg.epochs) + 1):
         train_m = train_one_epoch(model, train_loader, loss_fn, optim, device)
+        scheduler.step()
         last_train = train_m
-        row: dict[str, Any] = {"epoch": epoch, "train": train_m}
+        row: dict[str, Any] = {"epoch": epoch, "train": train_m, "lr": lr}
 
         if mode == "evl" and eval_loader is not None:
             eval_m = evaluate_loader(model, eval_loader, loss_fn, device)
@@ -219,8 +256,8 @@ def run_torch_finetune(
                 + format_metrics("eval", eval_m),
                 enabled=True,
             )
-            score = float(eval_m.get("dice", 0.0))
-            if score >= best_score:
+            score = float(eval_m.get("dice", float("nan")))
+            if np.isfinite(score) and score > best_score:
                 best_score = score
                 best_epoch = epoch
                 _save_ckpt(
@@ -237,6 +274,15 @@ def run_torch_finetune(
                 )
                 log(
                     f"[finetune] new best checkpoint (eval_dice={best_score:.4f}) → {out}",
+                    enabled=True,
+                )
+            elif np.isfinite(score) and baseline is not None and score < float(
+                baseline.get("dice", best_score)
+            ):
+                log(
+                    f"[finetune] epoch {epoch}: eval_dice={score:.4f} < baseline "
+                    f"{float(baseline.get('dice', float('nan'))):.4f} "
+                    "(keeping best ckpt)",
                     enabled=True,
                 )
         else:
@@ -315,6 +361,7 @@ def train_one_epoch(model, loader, loss_fn, optim, device) -> dict[str, float]:
             logits = logits[0]
         loss = loss_fn(logits, y)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
         optim.step()
         losses.append(float(loss.item()))
         # Train: overlap metrics only (surface distances are expensive / noisy on crops).
@@ -513,7 +560,7 @@ def _work_dir(cfg: FineTuneConfig) -> Path:
 
 
 class NiftiSegDataset:
-    """Minimal random-crop NIfTI dataset (torch Dataset duck-type)."""
+    """NIfTI dataset with nnU-Net-style foreground-aware patch sampling."""
 
     def __init__(
         self,
@@ -522,11 +569,13 @@ class NiftiSegDataset:
         patch_size: tuple[int, int, int],
         training: bool = True,
         intensity: dict[str, float] | None = None,
+        fg_oversample: float = 0.67,
     ) -> None:
         self.cases = cases
         self.patch_size = patch_size
         self.training = training
         self.intensity = intensity
+        self.fg_oversample = float(fg_oversample)
 
     def __len__(self) -> int:
         return len(self.cases)
@@ -552,7 +601,11 @@ class NiftiSegDataset:
         else:
             image = _zscore(image)
         image_t, label_t = _crop_or_pad(
-            image, label, self.patch_size, random_crop=self.training
+            image,
+            label,
+            self.patch_size,
+            training=self.training,
+            fg_oversample=self.fg_oversample,
         )
         return {
             "image": torch.from_numpy(image_t[None]).float(),
@@ -608,23 +661,62 @@ def _crop_or_pad(
     label: np.ndarray,
     patch: tuple[int, int, int],
     *,
-    random_crop: bool,
+    training: bool,
+    fg_oversample: float = 0.67,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Crop/pad a patch; prefer crops that contain tumor (LIDC nodules are tiny)."""
     z, y, x = image.shape
     pz, py, px = patch
     out_i = np.zeros(patch, dtype=np.float32)
     out_l = np.zeros(patch, dtype=np.float32)
 
-    def _start(size: int, win: int) -> int:
-        if size <= win:
-            return 0
-        if random_crop:
-            return int(np.random.randint(0, size - win + 1))
-        return max(0, (size - win) // 2)
+    fg = np.argwhere(label > 0.5)
+    use_fg = fg.shape[0] > 0 and (
+        (not training and fg_oversample >= 1.0 - 1e-6)
+        or (training and float(np.random.rand()) < fg_oversample)
+        or (not training and float(np.random.rand()) < fg_oversample)
+    )
 
-    z0, y0, x0 = _start(z, pz), _start(y, py), _start(x, px)
+    if use_fg:
+        if training:
+            # Place a random FG voxel uniformly inside the patch window.
+            pick = fg[int(np.random.randint(0, fg.shape[0]))]
+            z0 = _fg_window_start(int(pick[0]), pz, z, jitter=True)
+            y0 = _fg_window_start(int(pick[1]), py, y, jitter=True)
+            x0 = _fg_window_start(int(pick[2]), px, x, jitter=True)
+        else:
+            # Eval: center on FG centroid so metrics reflect real nodules.
+            center = fg.mean(axis=0)
+            z0 = _fg_window_start(int(round(center[0])), pz, z, jitter=False)
+            y0 = _fg_window_start(int(round(center[1])), py, y, jitter=False)
+            x0 = _fg_window_start(int(round(center[2])), px, x, jitter=False)
+    else:
+
+        def _start(size: int, win: int) -> int:
+            if size <= win:
+                return 0
+            if training:
+                return int(np.random.randint(0, size - win + 1))
+            return max(0, (size - win) // 2)
+
+        z0, y0, x0 = _start(z, pz), _start(y, py), _start(x, px)
+
     z1, y1, x1 = min(z0 + pz, z), min(y0 + py, y), min(x0 + px, x)
     sl_z, sl_y, sl_x = z1 - z0, y1 - y0, x1 - x0
     out_i[:sl_z, :sl_y, :sl_x] = image[z0:z1, y0:y1, x0:x1]
     out_l[:sl_z, :sl_y, :sl_x] = label[z0:z1, y0:y1, x0:x1]
     return out_i, out_l
+
+
+def _fg_window_start(coord: int, win: int, size: int, *, jitter: bool) -> int:
+    """Start index so ``coord`` lies inside ``[start, start+win)`` (clipped)."""
+    if size <= win:
+        return 0
+    # Valid starts that keep coord in the window: [coord-win+1, coord]
+    lo = max(0, coord - win + 1)
+    hi = min(coord, size - win)
+    if hi < lo:
+        return int(np.clip(coord - win // 2, 0, size - win))
+    if jitter:
+        return int(np.random.randint(lo, hi + 1))
+    return int(np.clip(coord - win // 2, 0, size - win))

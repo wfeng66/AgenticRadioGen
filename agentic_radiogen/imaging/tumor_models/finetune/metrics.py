@@ -54,22 +54,33 @@ def binary_seg_metrics(
     fn = float(np.logical_and(np.logical_not(p_flat), t_flat).sum())
     tn = float(np.logical_and(np.logical_not(p_flat), np.logical_not(t_flat)).sum())
 
-    dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
-    iou = (tp + eps) / (tp + fp + fn + eps)
-    precision = (tp + eps) / (tp + fp + eps)
-    recall = (tp + eps) / (tp + fn + eps)  # sensitivity / TPR
-    specificity = (tn + eps) / (tn + fp + eps)
-    accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
-    f2 = (5.0 * tp + eps) / (5.0 * tp + 4.0 * fn + fp + eps)
-
     vp = float(p_flat.sum())
     vt = float(t_flat.sum())
-    # Relative volume difference; undefined if GT is empty.
-    if vt <= 0:
-        rvd_signed = float("nan") if vp > 0 else 0.0
-        rvd = float("nan") if vp > 0 else 0.0
-        vol_sim = float("nan") if vp > 0 else 1.0
+
+    # Empty GT patches: do NOT score Dice=1 (that inflated "baseline" when
+    # center crops missed the nodule). Skip via NaN in epoch means.
+    if vt <= 0 and vp <= 0:
+        dice = iou = precision = recall = f2 = float("nan")
+        specificity = 1.0
+        accuracy = 1.0
+        rvd_signed = 0.0
+        rvd = 0.0
+        vol_sim = 1.0
+    elif vt <= 0 and vp > 0:
+        dice = iou = precision = recall = f2 = 0.0
+        specificity = (tn + eps) / (tn + fp + eps)
+        accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
+        rvd_signed = float("nan")
+        rvd = float("nan")
+        vol_sim = float("nan")
     else:
+        dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
+        iou = (tp + eps) / (tp + fp + fn + eps)
+        precision = (tp + eps) / (tp + fp + eps)
+        recall = (tp + eps) / (tp + fn + eps)
+        specificity = (tn + eps) / (tn + fp + eps)
+        accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
+        f2 = (5.0 * tp + eps) / (5.0 * tp + 4.0 * fn + fp + eps)
         rvd_signed = (vp - vt) / vt
         rvd = abs(rvd_signed)
         vol_sim = 1.0 - min(rvd, 1.0)

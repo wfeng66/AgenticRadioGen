@@ -117,7 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--fold", type=int, default=0, help="Reserved (default 0).")
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate (nnU-Net backend auto-lowers 1e-4 → 1e-5 unless overridden).",
+    )
     p.add_argument(
         "--val-frac",
         type=float,

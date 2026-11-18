@@ -302,6 +302,32 @@ def test_binary_seg_metrics_empty_pred_is_nan_not_sentinel() -> None:
     assert avg["dice"] == pytest.approx((m["dice"] + 0.5) / 2.0)
 
 
+def test_binary_seg_metrics_empty_empty_is_nan() -> None:
+    empty = np.zeros((8, 8, 8), dtype=bool)
+    m = binary_seg_metrics(empty, empty, spacing_zyx=(1.0, 1.0, 1.0))
+    assert np.isnan(m["dice"]) and np.isnan(m["iou"])
+
+
+def test_fg_crop_keeps_nodule_in_patch() -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.torch_loop import _crop_or_pad
+
+    image = np.zeros((40, 80, 80), dtype=np.float32)
+    label = np.zeros_like(image)
+    label[5, 10, 10] = 1.0  # nodule far from volume center
+    img_c, lab_c = _crop_or_pad(
+        image, label, (16, 32, 32), training=False, fg_oversample=1.0
+    )
+    assert lab_c.sum() >= 1.0
+    # Training FG oversample should usually keep the voxel too.
+    hits = 0
+    for _ in range(20):
+        _, lab_t = _crop_or_pad(
+            image, label, (16, 32, 32), training=True, fg_oversample=1.0
+        )
+        hits += int(lab_t.sum() >= 1.0)
+    assert hits == 20
+
+
 def test_binary_seg_metrics_shift_has_surface_error() -> None:
     gt = np.zeros((16, 16, 16), dtype=bool)
     gt[4:10, 4:10, 4:10] = True
