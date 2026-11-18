@@ -1,10 +1,26 @@
-# Optional GPU radiomics / TotalSegmentator path
+# Optional GPU imaging / segmentation / fine-tune stack
+# Install: pip install -r requirements-imaging-gpu.txt
 -r requirements.txt
-torch
+
+# Deep learning
+torch>=2.0
+torchvision>=0.15
+
+# TotalSegmentator organ / nodule paths
 totalsegmentator
-nibabel
-# Optional tumor models (AutoPET nnU-Net v2, MONAI lung nodule detection)
+
+# nnU-Net: Task006 Zenodo weights are v1; AutoPET / newer packages use v2
+nnunet>=1.7.1
 nnunetv2
-monai
-huggingface_hub
-gdown
+
+# MONAI bundles (lung nodule, VISTA-3D) + fine-tune UNet / DiceCE
+monai[nibabel,itk,fire]>=1.3
+einops>=0.7
+huggingface_hub>=0.20
+gdown>=5.0
+
+# LIDC ROI rasterization fallback + surface metrics helpers
+scikit-image>=0.22
+
+# Visualization scripts (CT / mask overlays)
+matplotlib>=3.8

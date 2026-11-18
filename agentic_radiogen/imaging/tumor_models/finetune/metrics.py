@@ -64,10 +64,15 @@ def binary_seg_metrics(
 
     vp = float(p_flat.sum())
     vt = float(t_flat.sum())
-    # Relative volume difference (signed and absolute); GT volume in denominator.
-    rvd_signed = (vp - vt) / (vt + eps)
-    rvd = abs(rvd_signed)
-    vol_sim = 1.0 - min(rvd, 1.0)  # 1 = perfect volume match (capped)
+    # Relative volume difference; undefined if GT is empty.
+    if vt <= 0:
+        rvd_signed = float("nan") if vp > 0 else 0.0
+        rvd = float("nan") if vp > 0 else 0.0
+        vol_sim = float("nan") if vp > 0 else 1.0
+    else:
+        rvd_signed = (vp - vt) / vt
+        rvd = abs(rvd_signed)
+        vol_sim = 1.0 - min(rvd, 1.0)
 
     out: dict[str, float] = {
         "dice": float(dice),
@@ -108,8 +113,8 @@ def _surface_metrics(
     if not pred.any() and not target.any():
         return {"hd": 0.0, "hd95": 0.0, "assd": 0.0}
     if not pred.any() or not target.any():
-        # One empty → treat as very large / undefined; use a large finite sentinel.
-        return {"hd": 1e6, "hd95": 1e6, "assd": 1e6}
+        # One empty → undefined (avoid 1e6 sentinels that explode epoch means).
+        return {"hd": float("nan"), "hd95": float("nan"), "assd": float("nan")}
 
     try:
         from scipy import ndimage
@@ -122,7 +127,7 @@ def _surface_metrics(
     pred_surf = _binary_surface(pred)
     gt_surf = _binary_surface(target)
     if not pred_surf.any() or not gt_surf.any():
-        return {"hd": 1e6, "hd95": 1e6, "assd": 1e6}
+        return {"hd": float("nan"), "hd95": float("nan"), "assd": float("nan")}
 
     # Distance from every voxel to the *other* surface (edt on inverted surface).
     dt_gt = ndimage.distance_transform_edt(~gt_surf, sampling=spacing)
@@ -130,7 +135,7 @@ def _surface_metrics(
     d_pred_to_gt = dt_gt[pred_surf]
     d_gt_to_pred = dt_pred[gt_surf]
     if d_pred_to_gt.size == 0 or d_gt_to_pred.size == 0:
-        return {"hd": 1e6, "hd95": 1e6, "assd": 1e6}
+        return {"hd": float("nan"), "hd95": float("nan"), "assd": float("nan")}
 
     all_d = np.concatenate([d_pred_to_gt, d_gt_to_pred])
     hd = float(all_d.max())

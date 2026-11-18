@@ -11,3 +11,7 @@ SimpleITK>=2.3
 scikit-learn>=1.4
 scipy>=1.12
 tqdm>=4.66
+
+# Used by DICOM/NIfTI I/O, LIDC XML→mask cache, and radiomics paths
+nibabel>=5.0
+Pillow>=10.0

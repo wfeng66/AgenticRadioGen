@@ -41,7 +41,12 @@ _SKIP_LOG_NAME = "_skip_log.json"
 
 
 def looks_like_lidc_root(root: Path) -> bool:
+    """True for a real LIDC DICOM tree — never for ``_finetune_cache`` NIfTI stores."""
     if not root.is_dir():
+        return False
+    # Cache dirs contain LIDC-IDRI-* folders of NIfTI pairs only; treating them as
+    # data roots caused nested ``_finetune_cache/_finetune_cache`` and mass skips.
+    if root.name.lower() == "_finetune_cache" or _finetune_cache_marker(root):
         return False
     hits = 0
     for child in root.iterdir():
@@ -49,7 +54,27 @@ def looks_like_lidc_root(root: Path) -> bool:
             hits += 1
             if hits >= 2:
                 return True
-    return hits == 1 and any(_PATIENT_RE.match(p.name) for p in root.iterdir() if p.is_dir())
+    return hits == 1 and any(
+        _PATIENT_RE.match(p.name) for p in root.iterdir() if p.is_dir()
+    )
+
+
+def _finetune_cache_marker(root: Path) -> bool:
+    """Heuristic: folder is a NIfTI conversion cache, not a DICOM collection."""
+    if (root / _SKIP_LOG_NAME).is_file():
+        return True
+    # Sample a few patient-like children: cache has image.nii.gz, DICOM has studies.
+    checked = 0
+    nifti_patients = 0
+    for child in root.iterdir():
+        if not child.is_dir() or not _PATIENT_RE.match(child.name):
+            continue
+        checked += 1
+        if (child / "image.nii.gz").is_file() or (child / "label.nii.gz").is_file():
+            nifti_patients += 1
+        if checked >= 5:
+            break
+    return checked > 0 and nifti_patients == checked
 
 
 def discover_lidc_cases(
@@ -64,7 +89,16 @@ def discover_lidc_cases(
     if not looks_like_lidc_root(root):
         return []
 
-    cache = (cache_dir or (root / "_finetune_cache")).expanduser().resolve()
+    if cache_dir is not None:
+        cache = Path(cache_dir).expanduser().resolve()
+    else:
+        cache = (root / "_finetune_cache").resolve()
+    # Never nest cache inside an existing cache root.
+    if cache.name.lower() == "_finetune_cache" and root.name.lower() == "_finetune_cache":
+        cache = root
+    elif "_finetune_cache" in root.parts and cache_dir is None:
+        # If somehow called on a cache dir, keep writing beside it, not under it.
+        cache = root
     cache.mkdir(parents=True, exist_ok=True)
     xml_index, xml_by_patient = _build_xml_indexes(root, verbose=verbose)
     prev_skips = _load_skip_log(cache)
@@ -185,25 +219,51 @@ def _ensure_patient_pair(
     image_path = out_dir / "image.nii.gz"
     label_path = out_dir / "label.nii.gz"
 
+    # Always prefer a valid existing NIfTI cache (even for previous skips).
+    if image_path.is_file() and label_path.is_file() and _cached_label_is_valid(label_path):
+        if force_retry:
+            log(
+                f"[finetune:lidc] retry {patient.name}: valid cache already present; "
+                f"keeping cache_hit",
+                enabled=verbose,
+            )
+        return (
+            CasePair(case_id=patient.name, image=image_path, label=label_path),
+            "cache_hit",
+        )
+
     if force_retry:
-        _clear_patient_cache(out_dir)
         log(
             f"[finetune:lidc] retry {patient.name}: was skipped previously; "
-            f"re-checking series/XML (ignoring old cache)",
+            f"re-checking series/XML",
             enabled=verbose,
         )
-    elif image_path.is_file() and label_path.is_file():
-        if _cached_label_is_valid(label_path):
-            return (
-                CasePair(case_id=patient.name, image=image_path, label=label_path),
-                "cache_hit",
-            )
+    elif image_path.is_file() or label_path.is_file():
         log(
             f"[finetune:lidc] revalidate {patient.name}: cached label empty/invalid; "
             f"rebuilding",
             enabled=verbose,
         )
         _clear_patient_cache(out_dir)
+
+    # Patient folder may already be a NIfTI pair (e.g. pre-converted).
+    local_img = patient / "image.nii.gz"
+    local_lab = patient / "label.nii.gz"
+    if (
+        local_img.is_file()
+        and local_lab.is_file()
+        and _cached_label_is_valid(local_lab)
+        and patient.resolve() != out_dir.resolve()
+    ):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not image_path.is_file():
+            image_path.write_bytes(local_img.read_bytes())
+        if not label_path.is_file():
+            label_path.write_bytes(local_lab.read_bytes())
+        return (
+            CasePair(case_id=patient.name, image=image_path, label=label_path),
+            "converted",
+        )
 
     series_dir, xml_path = _select_series_and_xml(
         patient, xml_index=xml_index, patient_xmls=patient_xmls
@@ -331,7 +391,7 @@ def _select_series_and_xml(
     series_list = _iter_series_dirs(patient)
     scored: list[tuple[int, Path, Path | None]] = []
     for series in series_list:
-        n_dcm = sum(1 for p in series.iterdir() if p.is_file() and _is_dicom_name(p))
+        n_dcm = _count_dicom(series)
         if n_dcm < _MIN_SLICES:
             continue
         xml = _first_xml(series)
@@ -345,26 +405,71 @@ def _select_series_and_xml(
     if not scored:
         return None, None
     scored.sort(key=lambda t: t[0], reverse=True)
-    _, series, xml = scored[0]
-    return series, xml
+    annotated = [(s, x) for _, s, x in scored if x is not None]
+    if annotated:
+        return annotated[0]
+    # Folder-name match failed but patient has XML(s): pair by shared SOP UIDs.
+    if patient_xmls:
+        hit = _match_series_by_sop_overlap(
+            [s for _, s, _ in scored], patient_xmls
+        )
+        if hit is not None:
+            return hit
+    return None, None
+
+
+def _count_dicom(folder: Path) -> int:
+    try:
+        return sum(1 for p in folder.iterdir() if p.is_file() and _is_dicom_name(p))
+    except OSError:
+        return 0
+
+
+def _dir_has_dicom(folder: Path) -> bool:
+    return _count_dicom(folder) >= _MIN_SLICES
 
 
 def _iter_series_dirs(patient: Path) -> list[Path]:
-    """Yield series folders: patient/study/series (depth 2) or nested DICOM dirs."""
+    """Yield series folders: patient/study/series (depth 2–3) or nested DICOM dirs."""
     out: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
+    if _dir_has_dicom(patient):
+        _add(patient)
     for study in sorted(p for p in patient.iterdir() if p.is_dir()):
         children = [p for p in study.iterdir() if p.is_dir()]
-        if children:
-            out.extend(sorted(children))
-        else:
-            # Study folder itself may hold DICOM.
-            out.append(study)
+        if not children:
+            _add(study)
+            continue
+        for series in sorted(children):
+            grand = [p for p in series.iterdir() if p.is_dir()]
+            if grand and not _dir_has_dicom(series):
+                for g in sorted(grand):
+                    _add(g)
+            else:
+                _add(series)
     return out
 
 
 def _is_dicom_name(path: Path) -> bool:
     name = path.name.lower()
-    return name.endswith(".dcm") or path.suffix == "" or name.endswith(".dicom")
+    if name.endswith((".xml", ".txt", ".json", ".nii", ".gz", ".png", ".jpg")):
+        return False
+    return (
+        name.endswith(".dcm")
+        or name.endswith(".dicom")
+        or path.suffix == ""
+        or bool(re.match(r"^\d+-\d+", name))  # TCIA style ``1-001.dcm`` / ``1-001``
+    )
 
 
 def _first_xml(folder: Path) -> Path | None:
@@ -529,6 +634,83 @@ def _match_xml_for_patient_series(
         if best is None or score > best[0]:
             best = (score, xml)
     return best[1] if best is not None else None
+
+
+def _xml_sop_uids(xml_path: Path) -> set[str]:
+    """SOP Instance UIDs referenced by inclusion ROIs in a LIDC XML."""
+    try:
+        tree = ET.parse(xml_path)
+    except Exception:
+        return set()
+    root = tree.getroot()
+    out: set[str] = set()
+    for roi in root.iter(f"{_NS}roi"):
+        sop = (roi.findtext(f"{_NS}imageSOP_UID") or "").strip()
+        if sop:
+            out.add(sop)
+    # Also catch un-namespaced exports.
+    if not out:
+        for roi in root.iter("roi"):
+            sop = (roi.findtext("imageSOP_UID") or "").strip()
+            if sop:
+                out.add(sop)
+    return out
+
+
+def _series_sop_uids_sample(series_dir: Path, *, limit: int = 64) -> set[str]:
+    """Read a sample of SOPInstanceUIDs from DICOM headers (pixels skipped)."""
+    try:
+        import pydicom
+        from pydicom.errors import InvalidDicomError
+    except ImportError:
+        return set()
+    files = [p for p in series_dir.iterdir() if p.is_file() and _is_dicom_name(p)]
+    files = files[: max(limit, _MIN_SLICES)]
+    out: set[str] = set()
+    for path in files:
+        try:
+            ds = pydicom.dcmread(
+                str(path),
+                stop_before_pixels=True,
+                force=True,
+                specific_tags=["SOPInstanceUID", "Modality"],
+            )
+        except (InvalidDicomError, Exception):
+            continue
+        mod = str(getattr(ds, "Modality", "CT") or "CT").upper()
+        if mod not in {"CT", "DX", ""}:
+            continue
+        sop = str(getattr(ds, "SOPInstanceUID", "") or "").strip()
+        if sop:
+            out.add(sop)
+    return out
+
+
+def _match_series_by_sop_overlap(
+    series_dirs: list[Path], patient_xmls: list[Path]
+) -> tuple[Path, Path] | None:
+    """Pick (series, xml) with the largest shared SOP UID set."""
+    xml_sops: list[tuple[Path, set[str]]] = []
+    for xml in patient_xmls:
+        sops = _xml_sop_uids(xml)
+        if sops:
+            xml_sops.append((xml, sops))
+    if not xml_sops:
+        return None
+    best: tuple[int, Path, Path] | None = None
+    for series in series_dirs:
+        series_sops = _series_sop_uids_sample(series)
+        if not series_sops:
+            continue
+        for xml, xsops in xml_sops:
+            n = len(series_sops & xsops)
+            if n <= 0:
+                continue
+            if best is None or n > best[0]:
+                best = (n, series, xml)
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def _load_series_with_sop(

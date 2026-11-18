@@ -109,6 +109,67 @@ def test_lidc_series_key_overlap() -> None:
     assert _normalize_series_token(a.name) == _normalize_series_token(b.name)
 
 
+def test_find_plans_pkl_next_to_fold_ckpt(tmp_path: Path) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
+        find_plans_pkl,
+    )
+
+    trainer = tmp_path / "nnUNetTrainerV2__nnUNetPlansv2.1"
+    fold = trainer / "fold_0"
+    fold.mkdir(parents=True)
+    plans = trainer / "plans.pkl"
+    plans.write_bytes(b"x")
+    ckpt = fold / "model_final_checkpoint.model"
+    ckpt.write_bytes(b"y")
+    assert find_plans_pkl(ckpt) == plans
+
+
+def test_soft_load_reports_low_overlap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+    from torch import nn
+
+    from agentic_radiogen.imaging.tumor_models.finetune import torch_loop
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.a = nn.Linear(2, 2)
+
+    model = Tiny()
+    ckpt = tmp_path / "x.pt"
+    # Completely different parameter names → 0% overlap.
+    torch.save({"state_dict": {"conv.weight": torch.zeros(1, 1)}}, ckpt)
+    logs: list[str] = []
+    monkeypatch.setattr(
+        torch_loop,
+        "log",
+        lambda msg, enabled=True: logs.append(str(msg)),
+    )
+    torch_loop.soft_load(model, ckpt, map_location="cpu")
+    assert any("shape_matched=0" in m or "0.0%" in m for m in logs)
+    assert any("WARNING" in m and "overlap" in m.lower() for m in logs)
+
+
+def test_lidc_xml_sop_extract(tmp_path: Path) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import _xml_sop_uids
+
+    xml = tmp_path / "ann.xml"
+    xml.write_text(
+        """<?xml version="1.0"?>
+        <LidcReadMessage xmlns="http://www.nih.gov">
+          <readingSession><unblindedReadNodule>
+            <roi><inclusion>TRUE</inclusion>
+              <imageSOP_UID>1.2.3.4</imageSOP_UID>
+              <edgeMap><xCoord>1</xCoord><yCoord>2</yCoord></edgeMap>
+            </roi>
+          </unblindedReadNodule></readingSession>
+        </LidcReadMessage>
+        """,
+        encoding="utf-8",
+    )
+    assert _xml_sop_uids(xml) == {"1.2.3.4"}
+
+
 def test_looks_like_lidc_root(tmp_path: Path) -> None:
     from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import (
         looks_like_lidc_root,
@@ -118,6 +179,23 @@ def test_looks_like_lidc_root(tmp_path: Path) -> None:
     (tmp_path / "LIDC-IDRI-0002").mkdir()
     assert looks_like_lidc_root(tmp_path) is True
     assert looks_like_lidc_root(tmp_path / "missing") is False
+
+
+def test_finetune_cache_is_not_lidc_root(tmp_path: Path) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import (
+        looks_like_lidc_root,
+    )
+    from agentic_radiogen.imaging.tumor_models.finetune.datasets import _search_roots
+
+    cache = tmp_path / "_finetune_cache"
+    for pid in ("LIDC-IDRI-0001", "LIDC-IDRI-0002"):
+        d = cache / pid
+        d.mkdir(parents=True)
+        (d / "image.nii.gz").write_bytes(b"x")
+        (d / "label.nii.gz").write_bytes(b"y")
+    assert looks_like_lidc_root(cache) is False
+    roots = _search_roots("ntcia", tmp_path)
+    assert all(p.name != "_finetune_cache" for p in roots)
 
 
 def test_skip_log_roundtrip_and_force_clears_cache(tmp_path: Path) -> None:
@@ -174,6 +252,21 @@ def test_binary_seg_metrics_perfect() -> None:
     assert m["hd"] == pytest.approx(0.0, abs=1e-5)
     assert m["hd95"] == pytest.approx(0.0, abs=1e-5)
     assert m["assd"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_binary_seg_metrics_empty_pred_is_nan_not_sentinel() -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.metrics import average_metrics
+
+    gt = np.zeros((8, 8, 8), dtype=bool)
+    gt[2:5, 2:5, 2:5] = True
+    pred = np.zeros_like(gt)
+    m = binary_seg_metrics(pred, gt, spacing_zyx=(1.0, 1.0, 1.0))
+    assert m["dice"] < 0.1
+    assert np.isnan(m["hd"]) and np.isnan(m["hd95"]) and np.isnan(m["assd"])
+    assert np.isfinite(m["rvd"])  # GT nonempty → RVD defined (pred empty → ~1)
+    avg = average_metrics([m, {"dice": 0.5, "hd": 2.0, "hd95": 1.5, "assd": 1.0, "rvd": 0.1}])
+    assert avg["hd"] == pytest.approx(2.0)
+    assert avg["dice"] == pytest.approx((m["dice"] + 0.5) / 2.0)
 
 
 def test_binary_seg_metrics_shift_has_surface_error() -> None:

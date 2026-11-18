@@ -126,21 +126,44 @@ def run_torch_finetune(
         enabled=True,
     )
 
-    model = UNet(
-        spatial_dims=3,
-        in_channels=1,
-        out_channels=2,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
-    ).to(device)
-    soft_load(model, pretrained, map_location=device)
+    patch_size = _PATCH
+    intensity = None
+    if str(backend_name).lower() in {"nnunet", "nnunetv1", "nnunet-v1"}:
+        from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
+            load_nnunet_v1_network,
+        )
+
+        model, net_meta = load_nnunet_v1_network(
+            pretrained, device=device, verbose=True
+        )
+        patch_size = tuple(net_meta.get("patch_size") or _PATCH)
+        intensity = net_meta.get("intensity")
+        log(
+            f"[finetune] nnU-Net patch_size={patch_size} "
+            f"(native Generic_UNet; not MONAI soft-load)",
+            enabled=True,
+        )
+    else:
+        model = UNet(
+            spatial_dims=3,
+            in_channels=1,
+            out_channels=2,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+        ).to(device)
+        soft_load(model, pretrained, map_location=device)
 
     loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
     optim = torch.optim.Adam(model.parameters(), lr=float(cfg.lr))
 
     train_loader = DataLoader(
-        NiftiSegDataset(train_cases, patch_size=_PATCH, training=True),
+        NiftiSegDataset(
+            train_cases,
+            patch_size=patch_size,
+            training=True,
+            intensity=intensity,
+        ),
         batch_size=max(1, int(cfg.batch_size)),
         shuffle=True,
         num_workers=max(0, int(cfg.num_workers)),
@@ -148,7 +171,12 @@ def run_torch_finetune(
     eval_loader = None
     if eval_cases:
         eval_loader = DataLoader(
-            NiftiSegDataset(eval_cases, patch_size=_PATCH, training=False),
+            NiftiSegDataset(
+                eval_cases,
+                patch_size=patch_size,
+                training=False,
+                intensity=intensity,
+            ),
             batch_size=1,
             shuffle=False,
             num_workers=0,
@@ -275,6 +303,8 @@ def train_one_epoch(model, loader, loss_fn, optim, device) -> dict[str, float]:
         y = batch["label"].to(device)
         optim.zero_grad(set_to_none=True)
         logits = model(x)
+        if isinstance(logits, (list, tuple)):
+            logits = logits[0]
         loss = loss_fn(logits, y)
         loss.backward()
         optim.step()
@@ -297,6 +327,8 @@ def evaluate_loader(model, loader, loss_fn, device) -> dict[str, float]:
             x = batch["image"].to(device)
             y = batch["label"].to(device)
             logits = model(x)
+            if isinstance(logits, (list, tuple)):
+                logits = logits[0]
             loss = loss_fn(logits, y)
             losses.append(float(loss.item()))
             spacing = batch.get("spacing_zyx")
@@ -320,6 +352,10 @@ def _batch_metrics(
 ) -> dict[str, float]:
     import torch
 
+    # Generic_UNet with deep supervision can return a list; we disable DS, but
+    # still accept list/tuple and take the full-resolution head.
+    if isinstance(logits, (list, tuple)):
+        logits = logits[0]
     pred = torch.argmax(logits, dim=1).detach().cpu().numpy() > 0
     # y is (B,1,Z,Y,X) float mask from DiceCELoss setup
     target = y.detach().cpu().numpy() > 0.5
@@ -368,12 +404,29 @@ def soft_load(model, ckpt_path: Path, *, map_location) -> None:
     for k, v in blob.items():
         nk = k[len("module.") :] if k.startswith("module.") else k
         cleaned[nk] = v
+    model_sd = model.state_dict()
+    shape_ok = {
+        k: v
+        for k, v in cleaned.items()
+        if k in model_sd and tuple(model_sd[k].shape) == tuple(v.shape)
+    }
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    n_model = len(model_sd)
+    n_matched = len(shape_ok)
+    frac = float(n_matched) / float(max(n_model, 1))
     log(
-        f"[finetune] Loaded overlapping weights from {ckpt_path} "
-        f"(missing={len(missing)} unexpected={len(unexpected)})",
+        f"[finetune] Soft-loaded {ckpt_path} into {type(model).__name__}: "
+        f"shape_matched={n_matched}/{n_model} ({frac:.1%}) "
+        f"missing={len(missing)} unexpected={len(unexpected)}",
         enabled=True,
     )
+    if frac < 0.5:
+        log(
+            "[finetune] WARNING: pretrained overlap <50% — architecture mismatch "
+            "(e.g. nnU-Net weights into MONAI UNet). Baseline metrics are NOT the "
+            "pretrained model; use backend=nnunet so Generic_UNet is rebuilt from plans.pkl.",
+            enabled=True,
+        )
 
 
 def _save_ckpt(
@@ -425,16 +478,22 @@ class NiftiSegDataset:
         *,
         patch_size: tuple[int, int, int],
         training: bool = True,
+        intensity: dict[str, float] | None = None,
     ) -> None:
         self.cases = cases
         self.patch_size = patch_size
         self.training = training
+        self.intensity = intensity
 
     def __len__(self) -> int:
         return len(self.cases)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         import torch
+
+        from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
+            normalize_ct_volume,
+        )
 
         case = self.cases[idx]
         image, spacing = _load_nifti_with_spacing(case.image)
@@ -445,7 +504,10 @@ class NiftiSegDataset:
                 f"image {image.shape} vs label {label.shape}"
             )
         label = (label > 0).astype(np.float32)
-        image = _zscore(image)
+        if self.intensity is not None:
+            image = normalize_ct_volume(image, self.intensity)
+        else:
+            image = _zscore(image)
         image_t, label_t = _crop_or_pad(
             image, label, self.patch_size, random_crop=self.training
         )

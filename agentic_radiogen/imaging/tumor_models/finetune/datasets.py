@@ -99,12 +99,13 @@ def discover_cases(
     )
     if want_lidc:
         max_cases = _max_cases_env()
-        for base in search_roots:
-            if not looks_like_lidc_root(base):
-                continue
+        # Prefer a single real DICOM root; keep one shared cache under ``root``.
+        lidc_bases = [b for b in search_roots if looks_like_lidc_root(b)]
+        shared_cache = cache_dir or (root / "_finetune_cache")
+        for base in lidc_bases:
             for case in discover_lidc_cases(
                 base,
-                cache_dir=cache_dir or (base / "_finetune_cache"),
+                cache_dir=shared_cache,
                 max_cases=max_cases,
                 verbose=verbose,
             ):
@@ -112,9 +113,25 @@ def discover_cases(
                     continue
                 seen.add(case.case_id)
                 cases.append(case)
+        # If DICOM pairing failed but a prior conversion cache exists, use it.
+        if not cases:
+            cached = _from_lidc_nifti_cache(shared_cache)
+            if cached and verbose:
+                log(
+                    f"[finetune] DICOM/XML pairing yielded 0 cases; "
+                    f"reusing {len(cached)} NIfTI pair(s) from {shared_cache}",
+                    enabled=True,
+                )
+            for case in cached:
+                if case.case_id in seen:
+                    continue
+                seen.add(case.case_id)
+                cases.append(case)
 
     if not cases:
         for base in search_roots:
+            if base.name.lower() == "_finetune_cache":
+                continue
             for finder in (_from_nnunet_raw, _from_flat_pairs, _from_case_folders):
                 for case in finder(base):
                     if case.case_id in seen:
@@ -154,6 +171,10 @@ def _search_roots(dataset: str, root: Path) -> list[Path]:
         if not child.is_dir():
             continue
         low = child.name.lower().replace("-", "_")
+        # Never treat conversion cache as a second LIDC data root (caused
+        # nested ``_finetune_cache/_finetune_cache`` and 100% false skips).
+        if low == "_finetune_cache" or child.name.lower() == "_finetune_cache":
+            continue
         if low in {"lidc_idri", "lidc-idri", "lidcidri"} or looks_like_lidc_root(child):
             roots.append(child)
         if dataset in {"ntcia", "nsclc", "nsclc-radiogenomics", "nsclc-radiomics"}:
@@ -273,6 +294,32 @@ def _from_case_folders(root: Path) -> list[CasePair]:
 
 
 _PATIENT_RE_SKIP = re.compile(r"^LIDC-IDRI-\d+$", re.IGNORECASE)
+
+
+def _from_lidc_nifti_cache(cache: Path) -> list[CasePair]:
+    """Load previously converted ``_finetune_cache/LIDC-IDRI-*/{image,label}.nii.gz``.
+
+    Skips nested ``_finetune_cache`` children and empty/tiny label stubs.
+    """
+    cache = Path(cache)
+    if not cache.is_dir():
+        return []
+    pairs: list[CasePair] = []
+    for case_dir in sorted(cache.iterdir()):
+        if not case_dir.is_dir() or not _PATIENT_RE_SKIP.match(case_dir.name):
+            continue
+        img = case_dir / "image.nii.gz"
+        lab = case_dir / "label.nii.gz"
+        if not (img.is_file() and lab.is_file()):
+            continue
+        # Reject clearly empty / stub labels (header-only or tiny).
+        try:
+            if lab.stat().st_size < 200 or img.stat().st_size < 200:
+                continue
+        except OSError:
+            continue
+        pairs.append(CasePair(case_id=case_dir.name, image=img, label=lab))
+    return pairs
 
 
 def _first_existing(folder: Path, names: tuple[str, ...]) -> Path | None:

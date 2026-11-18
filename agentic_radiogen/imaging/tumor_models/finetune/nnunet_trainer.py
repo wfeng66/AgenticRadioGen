@@ -1,8 +1,8 @@
 """Fine-tune nnU-Net catalog checkpoints via the shared torch epoch loop.
 
-Pretrained nnU-Net weights are soft-loaded into a 3D UNet when keys overlap;
-otherwise training starts from the overlapping subset / random init. ``--mode``
-and ``--epoch`` behave the same as the MONAI backend.
+Rebuilds the native nnU-Net v1 ``Generic_UNet`` from ``plans.pkl`` next to the
+checkpoint (soft-loading into MONAI UNet is invalid and yields ~0 Dice).
+``--mode`` and ``--epoch`` behave the same as the MONAI backend.
 """
 
 from __future__ import annotations
