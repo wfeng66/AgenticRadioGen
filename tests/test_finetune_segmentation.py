@@ -92,13 +92,21 @@ def test_normalize_mode_aliases() -> None:
 
 
 def test_lidc_series_key_overlap() -> None:
-    from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import _series_keys
+    from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import (
+        _normalize_series_token,
+        _series_keys,
+    )
 
     dicom = Path("LIDC-IDRI-0001/2000-01-01-30178/3000566-03192")
     manifest = Path(
         "LIDC-IDRI-0001/01-01-2000-NA-NA-30178/3000566.000000-NA-03192"
     )
     assert set(_series_keys(dicom)) & set(_series_keys(manifest))
+    # Descriptive TCIA names that previously failed to match:
+    a = Path("x/4-1.25 STANDARD-54861")
+    b = Path("x/4.000000-1.25 STANDARD-54861")
+    assert set(_series_keys(a)) & set(_series_keys(b))
+    assert _normalize_series_token(a.name) == _normalize_series_token(b.name)
 
 
 def test_looks_like_lidc_root(tmp_path: Path) -> None:
@@ -110,6 +118,28 @@ def test_looks_like_lidc_root(tmp_path: Path) -> None:
     (tmp_path / "LIDC-IDRI-0002").mkdir()
     assert looks_like_lidc_root(tmp_path) is True
     assert looks_like_lidc_root(tmp_path / "missing") is False
+
+
+def test_skip_log_roundtrip_and_force_clears_cache(tmp_path: Path) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune.lidc_idri import (
+        _clear_patient_cache,
+        _load_skip_log,
+        _save_skip_log,
+    )
+
+    cache = tmp_path / "_finetune_cache"
+    cache.mkdir()
+    _save_skip_log(cache, {"LIDC-IDRI-0069": "no XML annotation in manifest"})
+    loaded = _load_skip_log(cache)
+    assert "LIDC-IDRI-0069" in loaded
+
+    out = cache / "LIDC-IDRI-0069"
+    out.mkdir()
+    (out / "image.nii.gz").write_bytes(b"x")
+    (out / "label.nii.gz").write_bytes(b"y")
+    _clear_patient_cache(out)
+    assert not (out / "image.nii.gz").is_file()
+    assert not (out / "label.nii.gz").is_file()
 
 
 def test_split_tune_only_uses_all() -> None:
