@@ -191,9 +191,8 @@ def run_torch_finetune(
         shuffle=True,
         num_workers=max(0, int(cfg.num_workers)),
     )
-    # Two holdout protocols: nodule-centered patch vs geometric volume-center patch.
+    # Dual holdout protocols: FG-centered patch + full-volume sliding window.
     eval_loader_fg = None
-    eval_loader_center = None
     if eval_cases:
         eval_loader_fg = DataLoader(
             NiftiSegDataset(
@@ -207,18 +206,6 @@ def run_torch_finetune(
             shuffle=False,
             num_workers=0,
         )
-        eval_loader_center = DataLoader(
-            NiftiSegDataset(
-                eval_cases,
-                patch_size=patch_size,
-                training=False,
-                intensity=intensity,
-                fg_oversample=0.0,
-            ),
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-        )
     # Epoch model-selection uses FG-centered (tumor always in patch).
     eval_loader = eval_loader_fg
 
@@ -227,11 +214,21 @@ def run_torch_finetune(
     baseline_both: dict[str, dict[str, float]] | None = None
     out = Path(cfg.out_ckpt)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if mode == "evl" and eval_loader_fg is not None and eval_loader_center is not None:
+    if mode == "evl" and eval_loader_fg is not None and eval_cases:
+        log(
+            "[finetune] Running dual baseline: fg_centered + full_volume "
+            "(sliding-window whole scan)…",
+            enabled=True,
+        )
         baseline_both = {
             "fg_centered": evaluate_loader(model, eval_loader_fg, loss_fn, device),
-            "volume_center": evaluate_loader(
-                model, eval_loader_center, loss_fn, device
+            "full_volume": evaluate_full_volume(
+                model,
+                eval_cases,
+                loss_fn=loss_fn,
+                device=device,
+                patch_size=patch_size,
+                intensity=intensity,
             ),
         }
         baseline = baseline_both["fg_centered"]
@@ -244,8 +241,8 @@ def run_torch_finetune(
         )
         log(
             format_metrics(
-                "[finetune] baseline volume_center (catalog, before fine-tune)",
-                baseline_both["volume_center"],
+                "[finetune] baseline full_volume (catalog, before fine-tune)",
+                baseline_both["full_volume"],
             ),
             enabled=True,
         )
@@ -273,7 +270,7 @@ def run_torch_finetune(
         log(
             f"[finetune] saved catalog-baseline snapshot "
             f"(fg_dice={float(baseline_both['fg_centered'].get('dice', float('nan'))):.4f}, "
-            f"center_dice={float(baseline_both['volume_center'].get('dice', float('nan'))):.4f}) "
+            f"full_dice={float(baseline_both['full_volume'].get('dice', float('nan'))):.4f}) "
             f"→ {out} (download unchanged: {catalog})",
             enabled=True,
         )
@@ -378,18 +375,23 @@ def run_torch_finetune(
         history.append(row)
 
     final_both: dict[str, dict[str, float]] | None = None
-    if (
-        mode == "evl"
-        and eval_loader_fg is not None
-        and eval_loader_center is not None
-        and out.is_file()
-    ):
+    if mode == "evl" and eval_loader_fg is not None and eval_cases and out.is_file():
         # Reload best checkpoint (may be catalog baseline if FT never improved).
         soft_load(model, out, map_location=device)
+        log(
+            "[finetune] Running dual final_test on best ckpt: "
+            "fg_centered + full_volume…",
+            enabled=True,
+        )
         final_both = {
             "fg_centered": evaluate_loader(model, eval_loader_fg, loss_fn, device),
-            "volume_center": evaluate_loader(
-                model, eval_loader_center, loss_fn, device
+            "full_volume": evaluate_full_volume(
+                model,
+                eval_cases,
+                loss_fn=loss_fn,
+                device=device,
+                patch_size=patch_size,
+                intensity=intensity,
             ),
         }
         log(
@@ -401,8 +403,8 @@ def run_torch_finetune(
         )
         log(
             format_metrics(
-                "[finetune] final_test volume_center (best ckpt)",
-                final_both["volume_center"],
+                "[finetune] final_test full_volume (best ckpt)",
+                final_both["full_volume"],
             ),
             enabled=True,
         )
@@ -443,12 +445,12 @@ def run_torch_finetune(
         if baseline_both is not None:
             notes += (
                 f"; baseline_fg={baseline_both['fg_centered'].get('dice', 0.0):.6f}"
-                f"; baseline_center={baseline_both['volume_center'].get('dice', 0.0):.6f}"
+                f"; baseline_full={baseline_both['full_volume'].get('dice', 0.0):.6f}"
             )
         if final_both is not None:
             notes += (
                 f"; final_fg={final_both['fg_centered'].get('dice', 0.0):.6f}"
-                f"; final_center={final_both['volume_center'].get('dice', 0.0):.6f}"
+                f"; final_full={final_both['full_volume'].get('dice', 0.0):.6f}"
             )
     else:
         notes += f"; final_train_dice={best_score:.6f}"
@@ -524,6 +526,169 @@ def evaluate_loader(model, loader, loss_fn, device) -> dict[str, float]:
     return out
 
 
+def evaluate_full_volume(
+    model,
+    cases: list[CasePair],
+    *,
+    loss_fn,
+    device,
+    patch_size: tuple[int, int, int],
+    intensity: dict[str, float] | None = None,
+    overlap: float = 0.5,
+) -> dict[str, float]:
+    """Whole-scan metrics via sliding-window inference (nnU-Net-style)."""
+    import torch
+
+    from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
+        normalize_ct_volume,
+    )
+
+    model.eval()
+    losses: list[float] = []
+    metric_rows: list[dict[str, float]] = []
+    with torch.no_grad():
+        for case in cases:
+            image, spacing = _load_nifti_with_spacing(case.image)
+            label, _ = _load_nifti_with_spacing(case.label)
+            if label.shape != image.shape:
+                raise ValueError(
+                    f"Shape mismatch for {case.case_id}: "
+                    f"image {image.shape} vs label {label.shape}"
+                )
+            label = (label > 0).astype(np.float32)
+            if intensity is not None:
+                image = normalize_ct_volume(image, intensity)
+            else:
+                image = _zscore(image)
+
+            x = torch.from_numpy(image[None, None]).float().to(device)
+            y = torch.from_numpy(label[None, None]).float().to(device)
+            logits = sliding_window_inference(
+                model, x, patch_size=patch_size, overlap=overlap
+            )
+            if isinstance(logits, (list, tuple)):
+                logits = logits[0]
+            try:
+                loss = loss_fn(logits, y)
+                losses.append(float(loss.item()))
+            except Exception:
+                # Very large volumes may OOM on full DiceCE; metrics still computed.
+                pass
+            metric_rows.append(
+                _batch_metrics(
+                    logits, y, spacing_zyx=spacing, compute_surface=True
+                )
+            )
+            del x, y, logits
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    out = average_metrics(metric_rows)
+    out["loss"] = float(np.mean(losses)) if losses else float("nan")
+    return out
+
+
+def sliding_window_inference(
+    model,
+    x,
+    *,
+    patch_size: tuple[int, int, int],
+    overlap: float = 0.5,
+):
+    """Slide ``patch_size`` over ``x`` (1,1,Z,Y,X), stitch logits with overlap weights.
+
+    Mirrors nnU-Net / MONAI sliding-window: overlapping patches, weighted average
+    of logits, then caller applies argmax / loss on the full volume.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if x.ndim != 5:
+        raise ValueError(f"Expected x shape (B,C,Z,Y,X); got {tuple(x.shape)}")
+    if int(x.shape[0]) != 1:
+        raise ValueError("sliding_window_inference currently supports batch size 1")
+
+    pz, py, px = (int(v) for v in patch_size)
+    _, _, zz, yy, xx = x.shape
+    # Pad so each axis is at least the patch size.
+    pad_z = max(0, pz - zz)
+    pad_y = max(0, py - yy)
+    pad_x = max(0, px - xx)
+    if pad_z or pad_y or pad_x:
+        x = F.pad(x, (0, pad_x, 0, pad_y, 0, pad_z))
+    _, _, zz_p, yy_p, xx_p = x.shape
+
+    step_z = max(1, int(round(pz * (1.0 - overlap))))
+    step_y = max(1, int(round(py * (1.0 - overlap))))
+    step_x = max(1, int(round(px * (1.0 - overlap))))
+
+    # Probe channel count.
+    with torch.no_grad():
+        probe = model(x[:, :, :pz, :py, :px])
+        if isinstance(probe, (list, tuple)):
+            probe = probe[0]
+        n_class = int(probe.shape[1])
+        del probe
+
+    acc = torch.zeros((1, n_class, zz_p, yy_p, xx_p), device=x.device, dtype=torch.float32)
+    weight = torch.zeros((1, 1, zz_p, yy_p, xx_p), device=x.device, dtype=torch.float32)
+    win = _gaussian_patch_weight((pz, py, px), device=x.device, dtype=torch.float32)
+
+    z_starts = list(range(0, max(zz_p - pz, 0) + 1, step_z))
+    y_starts = list(range(0, max(yy_p - py, 0) + 1, step_y))
+    x_starts = list(range(0, max(xx_p - px, 0) + 1, step_x))
+    if not z_starts or z_starts[-1] != zz_p - pz:
+        z_starts.append(max(0, zz_p - pz))
+    if not y_starts or y_starts[-1] != yy_p - py:
+        y_starts.append(max(0, yy_p - py))
+    if not x_starts or x_starts[-1] != xx_p - px:
+        x_starts.append(max(0, xx_p - px))
+    # De-dupe while preserving order.
+    z_starts = list(dict.fromkeys(z_starts))
+    y_starts = list(dict.fromkeys(y_starts))
+    x_starts = list(dict.fromkeys(x_starts))
+
+    for z0 in z_starts:
+        for y0 in y_starts:
+            for x0 in x_starts:
+                patch = x[:, :, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+                logits = model(patch)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+                acc[:, :, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += logits * win
+                weight[:, :, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += win
+
+    weight = torch.clamp(weight, min=1e-8)
+    logits_full = acc / weight
+    # Crop back to original size (before pad).
+    return logits_full[:, :, :zz, :yy, :xx]
+
+
+def _gaussian_patch_weight(
+    patch_size: tuple[int, int, int],
+    *,
+    device,
+    dtype,
+):
+    """Importance mask peaking at patch center (reduces stitching seams)."""
+    import torch
+
+    pz, py, px = patch_size
+    def _1d(n: int):
+        if n <= 1:
+            return torch.ones(n, device=device, dtype=dtype)
+        t = torch.linspace(-1.0, 1.0, n, device=device, dtype=dtype)
+        # sigma ~ 0.125 of half-width in normalized coords (MONAI-like).
+        return torch.exp(-0.5 * (t / 0.125) ** 2)
+
+    wz = _1d(pz)[:, None, None]
+    wy = _1d(py)[None, :, None]
+    wx = _1d(px)[None, None, :]
+    w = wz * wy * wx
+    w = w / w.max().clamp_min(1e-8)
+    return w[None, None]
+
+
 def _batch_metrics(
     logits,
     y,
@@ -568,7 +733,7 @@ def _log_dual_eval_comparison(
     log("[finetune] === Final comparison: catalog baseline vs best fine-tuned ckpt ===", enabled=True)
     log(
         "[finetune] protocols: fg_centered = patch on GT nodule; "
-        "volume_center = geometric center crop (may miss small nodules)",
+        "full_volume = sliding-window inference on the whole scan",
         enabled=True,
     )
     header = (
@@ -576,7 +741,7 @@ def _log_dual_eval_comparison(
     )
     log(f"[finetune] {header}", enabled=True)
     log(f"[finetune] {'-' * len(header)}", enabled=True)
-    for method in ("fg_centered", "volume_center"):
+    for method in ("fg_centered", "full_volume"):
         b = baseline_both.get(method) or {}
         f = final_both.get(method) or {}
         for k in keys:

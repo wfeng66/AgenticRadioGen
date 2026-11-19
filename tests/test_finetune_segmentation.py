@@ -123,7 +123,7 @@ def test_dual_eval_comparison_log(capsys: pytest.CaptureFixture[str], monkeypatc
             "dice": 0.2, "iou": 0.1, "precision": 0.5, "recall": 0.3,
             "specificity": 0.99, "rvd": 1.0, "hd95": 5.0, "hd": 6.0, "assd": 2.0, "loss": 0.5,
         },
-        "volume_center": {
+        "full_volume": {
             "dice": 0.7, "iou": 0.6, "precision": 0.9, "recall": 0.6,
             "specificity": 0.99, "rvd": 0.2, "hd95": 2.0, "hd": 3.0, "assd": 1.0, "loss": 0.4,
         },
@@ -133,7 +133,7 @@ def test_dual_eval_comparison_log(capsys: pytest.CaptureFixture[str], monkeypatc
             "dice": 0.3, "iou": 0.2, "precision": 0.4, "recall": 0.4,
             "specificity": 0.98, "rvd": 0.8, "hd95": 4.0, "hd": 5.0, "assd": 1.5, "loss": 0.45,
         },
-        "volume_center": {
+        "full_volume": {
             "dice": 0.65, "iou": 0.55, "precision": 0.85, "recall": 0.55,
             "specificity": 0.99, "rvd": 0.3, "hd95": 3.0, "hd": 4.0, "assd": 1.2, "loss": 0.42,
         },
@@ -141,10 +141,38 @@ def test_dual_eval_comparison_log(capsys: pytest.CaptureFixture[str], monkeypatc
     torch_loop._log_dual_eval_comparison(baseline, final)
     joined = "\n".join(lines)
     assert "Final comparison" in joined
-    assert "fg_centered" in joined and "volume_center" in joined
+    assert "fg_centered" in joined and "full_volume" in joined
+    assert "sliding-window" in joined
     assert "+0.1000" in joined  # fg dice 0.2 → 0.3
     for metric in ("iou", "precision", "recall", "specificity", "rvd", "hd95", "hd", "assd", "loss"):
         assert metric in joined
+
+
+def test_sliding_window_covers_full_volume() -> None:
+    import torch
+    from torch import nn
+
+    from agentic_radiogen.imaging.tumor_models.finetune.torch_loop import (
+        sliding_window_inference,
+    )
+
+    class ConstNet(nn.Module):
+        def forward(self, x):  # type: ignore[no-untyped-def]
+            # 2-class logits: channel 1 high in the whole patch.
+            b, _, z, y, xx = x.shape
+            out = torch.zeros(b, 2, z, y, xx, device=x.device, dtype=x.dtype)
+            out[:, 1] = 2.0
+            out[:, 0] = -2.0
+            return out
+
+    model = ConstNet()
+    vol = torch.zeros(1, 1, 20, 30, 28)
+    logits = sliding_window_inference(
+        model, vol, patch_size=(8, 12, 10), overlap=0.5
+    )
+    assert logits.shape == (1, 2, 20, 30, 28)
+    pred = torch.argmax(logits, dim=1)
+    assert int(pred.sum()) == 20 * 30 * 28
 
 
 def test_pristine_catalog_copy_and_out_ckpt_guard(tmp_path: Path) -> None:
