@@ -65,14 +65,22 @@ def run_torch_finetune(
     *,
     pretrained: Path,
     backend_name: str,
+    train_init: Path | None = None,
 ) -> FineTuneResult:
-    """Fine-tune a 3D UNet with soft-loaded ``pretrained`` weights."""
+    """Fine-tune from catalog ``pretrained`` (baseline) then optional ``train_init``.
+
+    ``pretrained`` must be the immutable catalog download (``.pristine``). Baseline
+    metrics always use those weights. Fine-tuning starts from ``train_init`` when
+    set (e.g. ``--in-ckpt``), otherwise from the same catalog weights.
+    """
     mode = normalize_mode(cfg.mode)
     train_cases, eval_cases = split_for_mode(
         cases, mode=mode, val_frac=cfg.val_frac, seed=cfg.seed
     )
     work = _work_dir(cfg)
     work.mkdir(parents=True, exist_ok=True)
+    catalog = Path(pretrained).expanduser().resolve()
+    init_path = Path(train_init or catalog).expanduser().resolve()
 
     if cfg.dry_run:
         out = Path(cfg.out_ckpt)
@@ -86,7 +94,9 @@ def run_torch_finetune(
             "n_train": len(train_cases),
             "n_eval": len(eval_cases),
             "epochs": int(cfg.epochs),
-            "pretrained": str(pretrained),
+            "pretrained_catalog": str(catalog),
+            "train_init": str(init_path),
+            "pretrained": str(catalog),
         }
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return FineTuneResult(
@@ -128,19 +138,24 @@ def run_torch_finetune(
     patch_size = _PATCH
     intensity = None
     backend_l = str(backend_name).lower()
+    log(
+        f"[finetune] baseline_weights={catalog} | train_init={init_path}",
+        enabled=True,
+    )
     if backend_l in {"nnunet", "nnunetv1", "nnunet-v1"}:
         from agentic_radiogen.imaging.tumor_models.finetune.nnunet_weights import (
             load_nnunet_v1_network,
         )
 
+        # Always build + load catalog first so baseline is the downloaded model.
         model, net_meta = load_nnunet_v1_network(
-            pretrained, device=device, verbose=True
+            catalog, device=device, verbose=True
         )
         patch_size = tuple(net_meta.get("patch_size") or _PATCH)
         intensity = net_meta.get("intensity")
         log(
             f"[finetune] nnU-Net patch_size={patch_size} "
-            f"(native Generic_UNet; not MONAI soft-load)",
+            f"(native Generic_UNet; catalog baseline)",
             enabled=True,
         )
     else:
@@ -160,22 +175,9 @@ def run_torch_finetune(
             strides=(2, 2, 2, 2),
             num_res_units=2,
         ).to(device)
-        soft_load(model, pretrained, map_location=device)
+        soft_load(model, catalog, map_location=device)
 
     loss_fn = _build_dice_ce_loss(monai)
-    # Fine-tune defaults: low LR + weight decay so pretrained weights are not wiped.
-    lr = float(cfg.lr)
-    if backend_l in {"nnunet", "nnunetv1", "nnunet-v1"} and abs(lr - 1e-4) < 1e-15:
-        lr = 1e-5
-        log(
-            f"[finetune] nnU-Net fine-tune LR lowered {cfg.lr} → {lr} "
-            "(pass --lr to override)",
-            enabled=True,
-        )
-    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=max(1, int(cfg.epochs)), eta_min=lr * 0.1
-    )
 
     train_loader = DataLoader(
         NiftiSegDataset(
@@ -189,47 +191,114 @@ def run_torch_finetune(
         shuffle=True,
         num_workers=max(0, int(cfg.num_workers)),
     )
-    eval_loader = None
+    # Two holdout protocols: nodule-centered patch vs geometric volume-center patch.
+    eval_loader_fg = None
+    eval_loader_center = None
     if eval_cases:
-        eval_loader = DataLoader(
+        eval_loader_fg = DataLoader(
             NiftiSegDataset(
                 eval_cases,
                 patch_size=patch_size,
                 training=False,
                 intensity=intensity,
-                fg_oversample=1.0,  # always crop on nodule for fair eval
+                fg_oversample=1.0,
             ),
             batch_size=1,
             shuffle=False,
             num_workers=0,
         )
+        eval_loader_center = DataLoader(
+            NiftiSegDataset(
+                eval_cases,
+                patch_size=patch_size,
+                training=False,
+                intensity=intensity,
+                fg_oversample=0.0,
+            ),
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+        )
+    # Epoch model-selection uses FG-centered (tumor always in patch).
+    eval_loader = eval_loader_fg
 
     history: list[dict[str, Any]] = []
     baseline: dict[str, float] | None = None
+    baseline_both: dict[str, dict[str, float]] | None = None
     out = Path(cfg.out_ckpt)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if mode == "evl" and eval_loader is not None:
-        baseline = evaluate_loader(model, eval_loader, loss_fn, device)
-        log(format_metrics("[finetune] baseline (before fine-tune) eval", baseline), enabled=True)
-        history.append({"epoch": 0, "phase": "baseline", "eval": baseline})
-        # Keep pretrained weights as the starting "best" so FT cannot regress the ckpt.
+    if mode == "evl" and eval_loader_fg is not None and eval_loader_center is not None:
+        baseline_both = {
+            "fg_centered": evaluate_loader(model, eval_loader_fg, loss_fn, device),
+            "volume_center": evaluate_loader(
+                model, eval_loader_center, loss_fn, device
+            ),
+        }
+        baseline = baseline_both["fg_centered"]
+        log(
+            format_metrics(
+                "[finetune] baseline fg_centered (catalog, before fine-tune)",
+                baseline_both["fg_centered"],
+            ),
+            enabled=True,
+        )
+        log(
+            format_metrics(
+                "[finetune] baseline volume_center (catalog, before fine-tune)",
+                baseline_both["volume_center"],
+            ),
+            enabled=True,
+        )
+        history.append(
+            {
+                "epoch": 0,
+                "phase": "baseline",
+                "eval": baseline_both,
+                "weights": str(catalog),
+            }
+        )
+        # Snapshot catalog weights into out_ckpt (not the download tree).
         _save_ckpt(
             out,
             model=model,
             cfg=cfg,
             epoch=0,
-            pretrained=pretrained,
+            pretrained=catalog,
             train_metrics=None,
             eval_metrics=baseline,
-            baseline=baseline,
+            baseline=baseline_both,
             mode=mode,
             backend_name=backend_name,
         )
         log(
-            f"[finetune] saved baseline checkpoint (eval_dice="
-            f"{float(baseline.get('dice', float('nan'))):.4f}) → {out}",
+            f"[finetune] saved catalog-baseline snapshot "
+            f"(fg_dice={float(baseline_both['fg_centered'].get('dice', float('nan'))):.4f}, "
+            f"center_dice={float(baseline_both['volume_center'].get('dice', float('nan'))):.4f}) "
+            f"→ {out} (download unchanged: {catalog})",
             enabled=True,
         )
+
+    # Optional: continue FT from a previous out_ckpt AFTER catalog baseline.
+    if init_path != catalog:
+        log(
+            f"[finetune] Loading train_init for fine-tune (after catalog baseline) → {init_path}",
+            enabled=True,
+        )
+        soft_load(model, init_path, map_location=device)
+
+    # Fine-tune defaults: low LR + weight decay so pretrained weights are not wiped.
+    lr = float(cfg.lr)
+    if backend_l in {"nnunet", "nnunetv1", "nnunet-v1"} and abs(lr - 1e-4) < 1e-15:
+        lr = 1e-5
+        log(
+            f"[finetune] nnU-Net fine-tune LR lowered {cfg.lr} → {lr} "
+            "(pass --lr to override)",
+            enabled=True,
+        )
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=max(1, int(cfg.epochs)), eta_min=lr * 0.1
+    )
 
     best_score = (
         float(baseline["dice"])
@@ -265,7 +334,7 @@ def run_torch_finetune(
                     model=model,
                     cfg=cfg,
                     epoch=epoch,
-                    pretrained=pretrained,
+                    pretrained=catalog,
                     train_metrics=train_m,
                     eval_metrics=eval_m,
                     baseline=baseline,
@@ -296,7 +365,7 @@ def run_torch_finetune(
                 model=model,
                 cfg=cfg,
                 epoch=epoch,
-                pretrained=pretrained,
+                pretrained=catalog,
                 train_metrics=train_m,
                 eval_metrics=None,
                 baseline=None,
@@ -308,26 +377,79 @@ def run_torch_finetune(
 
         history.append(row)
 
-    (work / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    final_both: dict[str, dict[str, float]] | None = None
+    if (
+        mode == "evl"
+        and eval_loader_fg is not None
+        and eval_loader_center is not None
+        and out.is_file()
+    ):
+        # Reload best checkpoint (may be catalog baseline if FT never improved).
+        soft_load(model, out, map_location=device)
+        final_both = {
+            "fg_centered": evaluate_loader(model, eval_loader_fg, loss_fn, device),
+            "volume_center": evaluate_loader(
+                model, eval_loader_center, loss_fn, device
+            ),
+        }
+        log(
+            format_metrics(
+                "[finetune] final_test fg_centered (best ckpt)",
+                final_both["fg_centered"],
+            ),
+            enabled=True,
+        )
+        log(
+            format_metrics(
+                "[finetune] final_test volume_center (best ckpt)",
+                final_both["volume_center"],
+            ),
+            enabled=True,
+        )
+        history.append(
+            {
+                "epoch": best_epoch,
+                "phase": "final_test",
+                "eval": final_both,
+                "weights": str(out),
+            }
+        )
+        if baseline_both is not None:
+            _log_dual_eval_comparison(baseline_both, final_both)
+
+    (work / "history.json").write_text(
+        json.dumps(history, indent=2, default=str), encoding="utf-8"
+    )
     if not out.is_file():
         _save_ckpt(
             out,
             model=model,
             cfg=cfg,
             epoch=int(cfg.epochs),
-            pretrained=pretrained,
+            pretrained=catalog,
             train_metrics=last_train,
             eval_metrics=last_eval,
-            baseline=baseline,
+            baseline=baseline_both if baseline_both is not None else baseline,
             mode=mode,
             backend_name=backend_name,
         )
 
-    notes = f"mode={mode}; best_epoch={best_epoch}"
+    notes = (
+        f"mode={mode}; best_epoch={best_epoch}; "
+        f"catalog={catalog}; train_init={init_path}"
+    )
     if mode == "evl":
-        notes += f"; best_eval_dice={best_score:.6f}"
-        if baseline is not None:
-            notes += f"; baseline_eval_dice={baseline.get('dice', 0.0):.6f}"
+        notes += f"; best_eval_dice_fg={best_score:.6f}"
+        if baseline_both is not None:
+            notes += (
+                f"; baseline_fg={baseline_both['fg_centered'].get('dice', 0.0):.6f}"
+                f"; baseline_center={baseline_both['volume_center'].get('dice', 0.0):.6f}"
+            )
+        if final_both is not None:
+            notes += (
+                f"; final_fg={final_both['fg_centered'].get('dice', 0.0):.6f}"
+                f"; final_center={final_both['volume_center'].get('dice', 0.0):.6f}"
+            )
     else:
         notes += f"; final_train_dice={best_score:.6f}"
 
@@ -341,8 +463,12 @@ def run_torch_finetune(
         mode=mode,
         notes=notes,
         history=history,
-        baseline_metrics=baseline,
-        best_metrics=last_eval if mode == "evl" else last_train,
+        baseline_metrics=baseline_both if baseline_both is not None else baseline,
+        best_metrics=(
+            final_both
+            if final_both is not None
+            else (last_eval if mode == "evl" else last_train)
+        ),
     )
 
 
@@ -428,6 +554,47 @@ def _batch_metrics(
             )
         )
     return average_metrics(rows)
+
+
+def _log_dual_eval_comparison(
+    baseline_both: dict[str, dict[str, float]],
+    final_both: dict[str, dict[str, float]],
+) -> None:
+    """Print baseline vs best-ckpt for fg_centered and volume_center protocols."""
+    from agentic_radiogen.imaging.tumor_models.finetune.metrics import _LOG_KEYS
+
+    # Full overlap / volume / surface suite (not dice-only).
+    keys = tuple(k for k in _LOG_KEYS if k != "loss") + ("loss",)
+    log("[finetune] === Final comparison: catalog baseline vs best fine-tuned ckpt ===", enabled=True)
+    log(
+        "[finetune] protocols: fg_centered = patch on GT nodule; "
+        "volume_center = geometric center crop (may miss small nodules)",
+        enabled=True,
+    )
+    header = (
+        f"{'method':<16} {'metric':<12} {'baseline':>10} {'finetuned':>10} {'delta':>10}"
+    )
+    log(f"[finetune] {header}", enabled=True)
+    log(f"[finetune] {'-' * len(header)}", enabled=True)
+    for method in ("fg_centered", "volume_center"):
+        b = baseline_both.get(method) or {}
+        f = final_both.get(method) or {}
+        for k in keys:
+            bv = float(b.get(k, float("nan")))
+            fv = float(f.get(k, float("nan")))
+            if np.isfinite(bv) and np.isfinite(fv):
+                delta = fv - bv
+                log(
+                    f"[finetune] {method:<16} {k:<12} {bv:10.4f} {fv:10.4f} {delta:+10.4f}",
+                    enabled=True,
+                )
+            else:
+                b_s = f"{bv:.4f}" if np.isfinite(bv) else "nan"
+                f_s = f"{fv:.4f}" if np.isfinite(fv) else "nan"
+                log(
+                    f"[finetune] {method:<16} {k:<12} {b_s:>10} {f_s:>10} {'n/a':>10}",
+                    enabled=True,
+                )
 
 
 def _build_dice_ce_loss(monai_mod) -> Any:

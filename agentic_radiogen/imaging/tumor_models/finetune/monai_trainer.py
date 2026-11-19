@@ -9,7 +9,11 @@ from agentic_radiogen.imaging.tumor_models.finetune.base import (
     FineTuneConfig,
     FineTuneResult,
 )
-from agentic_radiogen.imaging.tumor_models.finetune.resolve import resolve_in_checkpoint
+from agentic_radiogen.imaging.tumor_models.finetune.resolve import (
+    assert_out_ckpt_safe,
+    resolve_catalog_pretrained,
+    resolve_train_init_checkpoint,
+)
 from agentic_radiogen.imaging.tumor_models.finetune.torch_loop import run_torch_finetune
 
 
@@ -17,7 +21,7 @@ class MonaiFineTuneTrainer:
     name = "monai"
 
     def resolve_pretrained(self, cfg: FineTuneConfig) -> Path:
-        return resolve_in_checkpoint(cfg)
+        return resolve_catalog_pretrained(cfg)
 
     def run(self, cfg: FineTuneConfig, cases: list[CasePair]) -> FineTuneResult:
         from agentic_radiogen.imaging.tumor_models.finetune.torch_loop import (
@@ -30,7 +34,13 @@ class MonaiFineTuneTrainer:
             raise ValueError(f"Need ≥1 labeled cases; got {len(cases)}")
         if mode == "evl" and len(cases) < 2:
             raise ValueError("mode=evl needs ≥2 labeled cases for a holdout split")
-        pretrained = self.resolve_pretrained(cfg)
+        catalog = resolve_catalog_pretrained(cfg)
+        train_init = resolve_train_init_checkpoint(cfg, catalog=catalog)
+        assert_out_ckpt_safe(cfg.out_ckpt, catalog)
         return run_torch_finetune(
-            cfg, cases, pretrained=pretrained, backend_name=self.name
+            cfg,
+            cases,
+            pretrained=catalog,
+            train_init=train_init,
+            backend_name=self.name,
         )

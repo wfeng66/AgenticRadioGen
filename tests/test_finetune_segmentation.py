@@ -109,6 +109,88 @@ def test_lidc_series_key_overlap() -> None:
     assert _normalize_series_token(a.name) == _normalize_series_token(b.name)
 
 
+def test_dual_eval_comparison_log(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentic_radiogen.imaging.tumor_models.finetune import torch_loop
+
+    lines: list[str] = []
+    monkeypatch.setattr(
+        torch_loop,
+        "log",
+        lambda msg, enabled=True: lines.append(str(msg)),
+    )
+    baseline = {
+        "fg_centered": {
+            "dice": 0.2, "iou": 0.1, "precision": 0.5, "recall": 0.3,
+            "specificity": 0.99, "rvd": 1.0, "hd95": 5.0, "hd": 6.0, "assd": 2.0, "loss": 0.5,
+        },
+        "volume_center": {
+            "dice": 0.7, "iou": 0.6, "precision": 0.9, "recall": 0.6,
+            "specificity": 0.99, "rvd": 0.2, "hd95": 2.0, "hd": 3.0, "assd": 1.0, "loss": 0.4,
+        },
+    }
+    final = {
+        "fg_centered": {
+            "dice": 0.3, "iou": 0.2, "precision": 0.4, "recall": 0.4,
+            "specificity": 0.98, "rvd": 0.8, "hd95": 4.0, "hd": 5.0, "assd": 1.5, "loss": 0.45,
+        },
+        "volume_center": {
+            "dice": 0.65, "iou": 0.55, "precision": 0.85, "recall": 0.55,
+            "specificity": 0.99, "rvd": 0.3, "hd95": 3.0, "hd": 4.0, "assd": 1.2, "loss": 0.42,
+        },
+    }
+    torch_loop._log_dual_eval_comparison(baseline, final)
+    joined = "\n".join(lines)
+    assert "Final comparison" in joined
+    assert "fg_centered" in joined and "volume_center" in joined
+    assert "+0.1000" in joined  # fg dice 0.2 → 0.3
+    for metric in ("iou", "precision", "recall", "specificity", "rvd", "hd95", "hd", "assd", "loss"):
+        assert metric in joined
+
+
+def test_pristine_catalog_copy_and_out_ckpt_guard(tmp_path: Path) -> None:
+    import torch
+
+    from agentic_radiogen.imaging.tumor_models.finetune.resolve import (
+        assert_out_ckpt_safe,
+        ensure_pristine_catalog_checkpoint,
+        _is_agentic_finetune_checkpoint,
+    )
+
+    fold = tmp_path / "fold_0"
+    fold.mkdir()
+    (tmp_path / "plans.pkl").write_bytes(b"plans")
+    raw = fold / "model_final_checkpoint.model"
+    # Minimal nnU-Net-like blob (not our FT format).
+    torch.save({"state_dict": {"w": torch.zeros(1)}, "epoch": 0}, raw)
+    pristine = ensure_pristine_catalog_checkpoint(raw, verbose=False)
+    assert pristine.is_file()
+    assert pristine.name.endswith(".pristine")
+    assert raw.is_file()
+    # Second call reuses the same pristine file.
+    assert ensure_pristine_catalog_checkpoint(raw, verbose=False) == pristine
+
+    with pytest.raises(ValueError, match="catalog"):
+        assert_out_ckpt_safe(pristine, pristine)
+    with pytest.raises(ValueError, match="catalog model directory"):
+        assert_out_ckpt_safe(fold / "oops.model", pristine)
+    # Fine-tune outs elsewhere are fine.
+    assert_out_ckpt_safe(tmp_path / "outputs" / "ft.model", pristine)
+
+    ft = tmp_path / "outputs" / "ft.model"
+    ft.parent.mkdir(parents=True)
+    torch.save(
+        {
+            "state_dict": {"w": torch.zeros(1)},
+            "backend": "nnunet",
+            "dataset": "ntcia",
+            "pretrained": str(pristine),
+        },
+        ft,
+    )
+    assert _is_agentic_finetune_checkpoint(ft) is True
+    assert _is_agentic_finetune_checkpoint(raw) is False
+
+
 def test_lidc_requires_pydicom_upfront(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agentic_radiogen.imaging.tumor_models.finetune import lidc_idri
 

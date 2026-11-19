@@ -172,21 +172,30 @@ def _read_sitk_image(path: Path):
 def _load_pet_in_ct_space(
     ct_path: Path, pet_path: Path, ct_volume: np.ndarray
 ) -> np.ndarray:
-    """Resample PET onto the CT physical grid, rejecting unverified DICOM frames."""
+    """Resample PET onto the CT physical grid via DICOM/NIfTI geometry.
+
+    Matching ``FrameOfReferenceUID`` values are preferred. Same-study hybrid
+    PET/CT on TCIA often ships distinct FoR UIDs while still sharing patient
+    coordinates (origin/direction/spacing); those pairs are fused with a
+    warning rather than rejected.
+    """
     import SimpleITK as sitk
 
     ct_image, ct_frame_uid, ct_is_dicom = _read_sitk_image(ct_path)
     pet_image, pet_frame_uid, pet_is_dicom = _read_sitk_image(pet_path)
     if ct_is_dicom and pet_is_dicom:
         if not ct_frame_uid or not pet_frame_uid:
-            raise ValueError(
-                "Cannot align PET and CT DICOM series: FrameOfReferenceUID is "
-                "missing from one or both series"
+            print(
+                "WARNING: PET/CT FrameOfReferenceUID missing on one or both "
+                "series; resampling with DICOM geometry only",
+                file=sys.stderr,
             )
-        if ct_frame_uid != pet_frame_uid:
-            raise ValueError(
-                "Cannot align PET and CT DICOM series with different "
-                "FrameOfReferenceUID values"
+        elif ct_frame_uid != pet_frame_uid:
+            print(
+                "WARNING: PET/CT FrameOfReferenceUID values differ; resampling "
+                "with DICOM geometry (identity transform). Overlay may be "
+                "misaligned if the series are not in the same patient space.",
+                file=sys.stderr,
             )
 
     ct_sitk_volume = np.asarray(sitk.GetArrayFromImage(ct_image), dtype=np.float32)
@@ -498,7 +507,10 @@ def visualize(
         try:
             pet_volume = _load_pet_in_ct_space(image_path, pet_image_path, volume)
         except (ImportError, ValueError, RuntimeError) as exc:
-            raise SystemExit(f"Cannot display PET with CT: {exc}") from exc
+            print(
+                f"WARNING: Cannot display PET with CT ({exc}); showing CT/mask only",
+                file=sys.stderr,
+            )
     mask = _load_mask(mask_path, volume.shape)
     n_vox = int(mask.sum())
     nonempty = np.where(mask.reshape(mask.shape[0], -1).sum(axis=1) > 0)[0]

@@ -86,8 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Optional checkpoint to continue fine-tuning from. "
-            "When omitted, the downloaded / catalog pretrained weights are used."
+            "Optional prior fine-tune checkpoint to CONTINUE training from. "
+            "Baseline metrics always use the immutable catalog download "
+            "(data_cache/.../*.pristine), never this file. "
+            "When omitted, fine-tune also starts from the catalog weights."
         ),
     )
     p.add_argument(

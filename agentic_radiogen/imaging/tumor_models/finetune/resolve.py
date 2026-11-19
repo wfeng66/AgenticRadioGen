@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from agentic_radiogen.imaging.tumor_models.finetune.base import FineTuneConfig
@@ -11,6 +12,9 @@ from agentic_radiogen.imaging.tumor_models.registry import (
     get_model,
 )
 from agentic_radiogen.util.progress import log
+
+# Sidecar copy of the Zenodo/catalog download; baseline always loads this.
+_PRISTINE_SUFFIX = ".pristine"
 
 # Short CLI names → catalog model_id (or trainer backend key).
 MODEL_ALIASES: dict[str, str] = {
@@ -60,23 +64,155 @@ def trainer_backend(spec: TumorModelSpec) -> str:
     )
 
 
+def resolve_catalog_pretrained(
+    cfg: FineTuneConfig,
+    *,
+    verbose: bool = True,
+) -> Path:
+    """Always the downloaded catalog weights (never ``--out-ckpt`` / prior FT).
+
+    Writes a one-time ``*.pristine`` sibling copy and returns that path so the
+    original download stays untouched and baseline is reproducible.
+    """
+    spec = resolve_spec(cfg.model)
+    raw = _ensure_pretrained(spec, allow_download=cfg.allow_download, verbose=verbose)
+    path = ensure_pristine_catalog_checkpoint(raw, verbose=verbose)
+    log(
+        f"[finetune] Catalog pretrained (baseline source, immutable) → {path}",
+        enabled=verbose,
+    )
+    return path
+
+
+def resolve_train_init_checkpoint(
+    cfg: FineTuneConfig,
+    *,
+    catalog: Path,
+    verbose: bool = True,
+) -> Path:
+    """Weights used to *start fine-tuning* (catalog by default).
+
+    ``--in-ckpt`` continues from a prior fine-tune; baseline still uses ``catalog``.
+    """
+    if cfg.in_ckpt is None:
+        return catalog
+    path = Path(cfg.in_ckpt).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"--in-ckpt not found: {path}")
+    if path == Path(catalog).resolve():
+        return catalog
+    if _looks_like_catalog_tree(path) and path.name.endswith(_PRISTINE_SUFFIX):
+        return path
+    log(
+        f"[finetune] Train init from --in-ckpt (baseline still uses catalog) → {path}",
+        enabled=verbose,
+    )
+    return path
+
+
 def resolve_in_checkpoint(
     cfg: FineTuneConfig,
     *,
     verbose: bool = True,
 ) -> Path:
-    """Prefer ``--in-ckpt``; otherwise load the catalog pretrained weights."""
-    if cfg.in_ckpt is not None:
-        path = Path(cfg.in_ckpt).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"--in-ckpt not found: {path}")
-        log(f"[finetune] Continuing from --in-ckpt → {path}", enabled=verbose)
-        return path
+    """Backward-compatible: catalog pristine weights (ignores prior FT outs).
 
-    spec = resolve_spec(cfg.model)
-    path = _ensure_pretrained(spec, allow_download=cfg.allow_download, verbose=verbose)
-    log(f"[finetune] Using pretrained checkpoint → {path}", enabled=verbose)
-    return path
+    Prefer :func:`resolve_catalog_pretrained` + :func:`resolve_train_init_checkpoint`.
+    """
+    return resolve_catalog_pretrained(cfg, verbose=verbose)
+
+
+def ensure_pristine_catalog_checkpoint(
+    ckpt_path: Path,
+    *,
+    verbose: bool = True,
+) -> Path:
+    """Copy catalog weights once to ``<name>.pristine`` and prefer that file.
+
+    Refuses to treat an AgenticRadioGen fine-tune dump as the catalog source.
+    """
+    ckpt_path = Path(ckpt_path).expanduser().resolve()
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"Catalog checkpoint missing: {ckpt_path}")
+    if _is_agentic_finetune_checkpoint(ckpt_path):
+        raise RuntimeError(
+            f"Catalog path looks like a fine-tuned AgenticRadioGen checkpoint "
+            f"(not the original nnU-Net download): {ckpt_path}. "
+            "Delete/re-download Task006 under data_cache/seg_models/nnunet_msd_lung/ "
+            "and re-run. Fine-tuned weights belong under outputs/finetune/ only."
+        )
+    pristine = ckpt_path.with_name(ckpt_path.name + _PRISTINE_SUFFIX)
+    if not pristine.is_file():
+        shutil.copy2(ckpt_path, pristine)
+        log(
+            f"[finetune] Saved immutable catalog copy → {pristine} "
+            f"(original left unchanged at {ckpt_path})",
+            enabled=verbose,
+        )
+    elif _is_agentic_finetune_checkpoint(pristine):
+        raise RuntimeError(
+            f"Corrupt pristine catalog copy (looks fine-tuned): {pristine}. "
+            "Remove it and re-run so it is recreated from the Zenodo download."
+        )
+    return pristine
+
+
+def assert_out_ckpt_safe(out_ckpt: Path, catalog: Path) -> None:
+    """Refuse to overwrite catalog / pristine downloads with fine-tuned weights."""
+    out = Path(out_ckpt).expanduser().resolve()
+    cat = Path(catalog).expanduser().resolve()
+    protected = {cat}
+    if cat.name.endswith(_PRISTINE_SUFFIX):
+        protected.add(Path(str(cat)[: -len(_PRISTINE_SUFFIX)]))
+    else:
+        protected.add(cat.with_name(cat.name + _PRISTINE_SUFFIX))
+    if out in protected:
+        raise ValueError(
+            f"--out-ckpt must not overwrite catalog weights ({out}). "
+            "Write fine-tuned checkpoints under outputs/finetune/ (or another path "
+            "outside data_cache/seg_models/)."
+        )
+    # Block writes into the same fold/ or trainer/ directory as the download
+    # (not the entire ancestor tree — project roots often sit above data_cache/).
+    fold_dir = cat.parent.resolve()
+    trainer_dir = (
+        fold_dir.parent
+        if fold_dir.name.startswith("fold_")
+        else fold_dir
+    )
+    out_parent = out.parent.resolve()
+    if out_parent == fold_dir or out_parent == trainer_dir.resolve():
+        raise ValueError(
+            f"--out-ckpt {out} is inside the catalog model directory "
+            f"({out_parent}). Use a path under outputs/finetune/ instead."
+        )
+
+
+def _is_agentic_finetune_checkpoint(path: Path) -> bool:
+    """True when file is our torch.save dump (has backend/dataset), not nnU-Net v1."""
+    try:
+        import torch
+
+        try:
+            blob = torch.load(str(path), map_location="cpu", weights_only=False)
+        except TypeError:
+            blob = torch.load(str(path), map_location="cpu")
+    except Exception:
+        return False
+    if not isinstance(blob, dict):
+        return False
+    # Our _save_ckpt payload.
+    return (
+        "state_dict" in blob
+        and "backend" in blob
+        and "dataset" in blob
+        and "pretrained" in blob
+    )
+
+
+def _looks_like_catalog_tree(path: Path) -> bool:
+    p = path if path.is_dir() else path.parent
+    return (p / "plans.pkl").is_file() or (p.parent / "plans.pkl").is_file()
 
 
 def _ensure_pretrained(

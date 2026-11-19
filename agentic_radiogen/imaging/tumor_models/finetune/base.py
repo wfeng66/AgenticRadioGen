@@ -54,8 +54,9 @@ class FineTuneResult:
     mode: str = "tune-only"
     notes: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
-    baseline_metrics: dict[str, float] | None = None
-    best_metrics: dict[str, float] | None = None
+    # Flat metrics dict, or dual-protocol map {fg_centered|volume_center: metrics}.
+    baseline_metrics: dict[str, Any] | None = None
+    best_metrics: dict[str, Any] | None = None
 
 
 class FineTuneTrainer(Protocol):

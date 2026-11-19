@@ -124,11 +124,12 @@ python scripts/visualize_segmentation.py \
   --mpr
 ```
 
-For two DICOM series, the viewer verifies their `FrameOfReferenceUID` and
-resamples PET onto the CT physical grid before overlaying. It refuses to fuse
-DICOM series with missing or different frame identifiers. Use `--no-auto-pet`
-to skip lookup/download and view CT only. If TCIA has no PT series for the CT
-study, the viewer reports that and continues with CT.
+For two DICOM series, the viewer resamples PET onto the CT physical grid
+before overlaying. Matching `FrameOfReferenceUID` values are preferred; if
+they are missing or differ (common for same-study hybrid PET/CT on TCIA), it
+warns and still fuses via DICOM geometry. Use `--no-auto-pet` to skip
+lookup/download and view CT only. If TCIA has no PT series for the CT study,
+or PET alignment fails, the viewer reports that and continues with CT.
 
 ---
 

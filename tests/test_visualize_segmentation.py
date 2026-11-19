@@ -171,10 +171,17 @@ def test_pet_is_resampled_to_ct_physical_grid(tmp_path):
     np.testing.assert_allclose(aligned, pet_array)
 
 
-def test_pet_dicom_with_different_frame_uid_is_rejected(tmp_path, monkeypatch):
+def test_pet_dicom_with_different_frame_uid_warns_and_resamples(
+    tmp_path, monkeypatch, capsys
+):
     sitk = pytest.importorskip("SimpleITK")
-    ct_image = sitk.GetImageFromArray(np.zeros((2, 3, 4), dtype=np.float32))
-    pet_image = sitk.GetImageFromArray(np.ones((2, 3, 4), dtype=np.float32))
+    ct_array = np.zeros((2, 3, 4), dtype=np.float32)
+    pet_array = np.ones((2, 3, 4), dtype=np.float32)
+    ct_image = sitk.GetImageFromArray(ct_array)
+    pet_image = sitk.GetImageFromArray(pet_array)
+    for image in (ct_image, pet_image):
+        image.SetSpacing((1.0, 1.0, 1.0))
+        image.SetOrigin((0.0, 0.0, 0.0))
     images = {
         tmp_path / "ct": (ct_image, "frame-ct", True),
         tmp_path / "pet": (pet_image, "frame-pet", True),
@@ -185,10 +192,12 @@ def test_pet_dicom_with_different_frame_uid_is_rejected(tmp_path, monkeypatch):
         lambda path: images[path],
     )
 
-    with pytest.raises(ValueError, match="different FrameOfReferenceUID"):
-        visualize_segmentation._load_pet_in_ct_space(
-            tmp_path / "ct", tmp_path / "pet", np.zeros((2, 3, 4))
-        )
+    aligned = visualize_segmentation._load_pet_in_ct_space(
+        tmp_path / "ct", tmp_path / "pet", ct_array
+    )
+
+    np.testing.assert_allclose(aligned, pet_array)
+    assert "FrameOfReferenceUID values differ" in capsys.readouterr().err
 
 
 def test_pet_auto_discovery_downloads_largest_series_from_ct_study(
